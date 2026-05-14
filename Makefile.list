@@ -70,6 +70,13 @@ SOURCES   = interface_c.cpp \
             utils.cpp \
             utils_config.cpp \
 
+# Translation units that must be compiled by nvcc when HAVE_CUDA=1 because they
+# instantiate forall<Cuda>/parallel_reduce_sum<Cuda> templates (whose bodies use
+# kernel-launch `<<<...>>>` syntax). Empty at Tier 0; populated as Tier 1+ classes
+# grow their evalmany<Cuda> methods. The same .cpp compiles cleanly with $(CXX)
+# when HAVE_CUDA=0 — the Cuda-policy template instantiations are __CUDACC__-gated.
+CUDA_TUS  =
+
 # ancient Torus code
 TORUSSRC  = CHB.cc \
             Fit.cc \

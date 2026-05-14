@@ -5,8 +5,10 @@
 */
 #pragma once
 #include "coord.h"
+#include "gpu_device.h"  // AGAMA_DEVICE_INLINE
 #include <vector>
 #include <utility>
+#include <cmath>
 
 namespace math {
 
@@ -45,8 +47,32 @@ void sphHarmArray(const unsigned int lmax, const unsigned int m, const double ta
     \param[in]  needSine - whether to compute sines as well (if false then only cosines are computed);
     \param[out] outputArray - pointer to an existing array of length m (if needSine==false)
     or 2m (if needSine==true) that will store the output values.
+
+    Defined inline in the header (and tagged AGAMA_DEVICE_INLINE) so it is callable
+    from both CPU code and __device__ kernels. The recurrence is from
+    Num.Rec. 3rd ed. section 5.4: given alpha = 2 sin^2(phi/2) and beta = sin(phi),
+    successive multiples are cos((k+1)phi) = cos(k phi) - (alpha cos(k phi) + beta sin(k phi)).
 */
-void trigMultiAngle(const double phi, const unsigned int m, const bool needSine, double* outputArray);
+AGAMA_DEVICE_INLINE
+void trigMultiAngle(const double phi, const unsigned int m, const bool needSine, double* outputArray)
+{
+    if(m < 1) return;
+    // sin/cos called separately (not via math::sincos) so the body is device-portable.
+    // nvcc's optimizer fuses these into a single sincos under -O2.
+    const double sinphi  = std::sin(phi);
+    const double sinphi2 = std::sin(phi * 0.5);
+    const double alpha   = 2.0 * sinphi2 * sinphi2;  // 2 sin^2(phi/2) = 1 - cos(phi)
+    const double beta    = sinphi;
+    double cosphi1 = 1.0, sinphi1 = 0.0;
+    for(unsigned int k = 0; k < m; ++k) {
+        const double cosphi = cosphi1 - (alpha * cosphi1 + beta * sinphi1);
+        const double sinphi_k = sinphi1 - (alpha * sinphi1 - beta * cosphi1);
+        outputArray[k] = cosphi;
+        if(needSine) outputArray[k + m] = sinphi_k;
+        cosphi1 = cosphi;
+        sinphi1 = sinphi_k;
+    }
+}
 
 /** Indexing scheme for spherical-harmonic transformation.
     It defines the maximum order of expansion in theta (lmax) and phi (mmax),

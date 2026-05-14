@@ -131,25 +131,7 @@ void sphHarmArray(const unsigned int lmax, const unsigned int m, const double ta
     }
 }
 
-void trigMultiAngle(const double phi, const unsigned int m, const bool needSine, double* outputArray)
-{
-    if(m<1)
-        return;
-    // accurate recurrence relation from section 5.4 of Num.Rec.3rd ed.
-    double alpha, beta, sinphi, cosphi, sinphi1=0, cosphi1=1;
-    sincos(phi, sinphi, cosphi);
-    sincos(phi/2, alpha, beta);
-    alpha *= alpha*2;
-    beta = sinphi;
-    for(unsigned int k=0; k<m; k++) {
-        cosphi = cosphi1 - (alpha * cosphi1 + beta * sinphi1);
-        sinphi = sinphi1 - (alpha * sinphi1 - beta * cosphi1);
-        outputArray[k] = cosphi;
-        if(needSine) outputArray[k+m] = sinphi;
-        cosphi1 = cosphi;
-        sinphi1 = sinphi;
-    }
-}
+// trigMultiAngle moved to math_sphharm.h as AGAMA_DEVICE_INLINE inline free function.
 
 // ------ indexing scheme for spherical harmonics, encoding its symmetry properties ------ //
 

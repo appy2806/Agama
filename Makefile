@@ -6,6 +6,39 @@ include Makefile.local
 # and contains the list of source files and folders
 include Makefile.list
 
+# ===========================================================================
+# HAVE_CUDA=1: enable the CUDA backend. Single GPU arch per build — set
+# CUDA_ARCH=sm_NN to match your card (default sm_86 for RTX 30xx; sm_80 A100;
+# sm_89 L40/RTX 40xx; sm_75 RTX 20xx baseline; sm_90 H100).
+# CUDA_HOME defaults to the active conda env if set, else /usr/local/cuda.
+# The kernel-launch syntax in src/gpu_policy.h is gated on __CUDACC__, so only
+# TUs that explicitly need it are routed through nvcc (see CUDA_TUS in
+# Makefile.list). The rest of the library compiles with $(CXX) as usual.
+# ===========================================================================
+ifdef HAVE_CUDA
+CUDA_HOME    ?= $(if $(CONDA_PREFIX),$(CONDA_PREFIX),/usr/local/cuda)
+CUDA_ARCH    ?= sm_86
+NVCC         ?= $(CUDA_HOME)/bin/nvcc
+CUDA_INCDIR  ?= $(CUDA_HOME)/targets/x86_64-linux/include
+CUDA_LIBDIR  ?= $(CUDA_HOME)/lib
+
+COMPILE_FLAGS_ALL += -DHAVE_CUDA -I$(CUDA_INCDIR)
+LINK_FLAGS_ALL    += -L$(CUDA_LIBDIR) -lcudart
+
+# nvcc flags for any .cpp routed through nvcc. -x cu treats input as CUDA.
+# --expt-extended-lambda enables `[=] AGAMA_DEVICE` lambdas.
+# --expt-relaxed-constexpr lets constexpr host functions be called from device.
+# Host-side flags (fPIC, OpenMP, -O2) are forwarded via -Xcompiler.
+NVCC_FLAGS_ALL = -arch=$(CUDA_ARCH) --std=c++14 \
+                 --expt-extended-lambda --expt-relaxed-constexpr \
+                 -DHAVE_CUDA -I$(SRCDIR) \
+                 -Xcompiler "-fPIC -fopenmp -O2 -Wall"
+# -x cu must be placed IMMEDIATELY before a .cpp source to force CUDA compilation.
+# It applies to all subsequent inputs until another -x directive, so we wrap each
+# CUDA source with `-x cu source.cpp -x none`. Naming files .cu would avoid this
+# but the migration design intent (CLAUDE.md) is .cpp-only across CPU/GPU.
+endif
+
 LIBNAME_SHARED = agama.so
 LIBNAME_STATIC = agama.a
 OBJECTS  = $(patsubst %.cpp,$(OBJDIR)/%.o,$(SOURCES))
@@ -64,6 +97,17 @@ $(OBJDIR)/%.o:  $(SRCDIR)/%.cpp Makefile.local
 
 $(OBJDIR)/%.o:  $(TORUSDIR)/%.cc Makefile.local
 	$(CXX) -c $(COMPILE_FLAGS_ALL) $(COMPILE_FLAGS_LIB) -o "$@" "$<"
+
+# GPU-policy smoke test. Compiled through nvcc so that the kernel-launch syntax
+# in src/gpu_policy.h is parseable. The smoke test is header-only against
+# gpu_policy.h so it does NOT link agama.so — only libcudart.
+ifdef HAVE_CUDA
+all: $(EXEDIR)/test_gpu_policy.exe
+
+$(EXEDIR)/test_gpu_policy.exe: $(TESTSDIR)/test_gpu_policy.cpp
+	@mkdir -p $(EXEDIR)
+	$(NVCC) $(NVCC_FLAGS_ALL) -x cu "$<" -o "$@" -L$(CUDA_LIBDIR) -lcudart
+endif
 
 clean:
 	rm -f $(OBJDIR)/*.o $(OBJDIR)/*.d $(EXEDIR)/*.exe $(LIBNAME_SHARED) $(EXEDIR)/$(LIBNAME_SHARED) $(LIBNAME_STATIC)

@@ -823,13 +823,18 @@ class MyBuildExt(CmdBuildExt):
         if subprocess.call(make) != 0 or not os.path.isfile(sharedname):
             raise CompileError("Compilation failed")
         if not os.path.isdir(self.build_lib): return  # this occurs when running setup.py build_ext
-        # copy the shared library and executables to the folder where the package is being built
-        distutils.file_util.copy_file('Makefile.local', os.path.join(self.build_lib, 'agama'))
-        distutils.file_util.copy_file(sharedname, os.path.join(self.build_lib, 'agama'))
-        distutils.file_util.copy_file(staticname, os.path.join(self.build_lib, 'agama'))
-        distutils.dir_util.copy_tree('exe', os.path.join(self.build_lib, 'agama', 'exe'))
+        # copy the shared library and executables to the folder where the package is being built.
+        # NOTE: the distribution name is 'agama_migrate' (see distutils.core.setup() below) so the
+        # files land in build_lib/agama_migrate/. The C-extension .so keeps its original name
+        # (agama.so / agama.pyd) and the package's __init__.py imports it via `from .agama import *`.
+        # Python's import machinery rewrites __name__ to 'agama_migrate.agama' on load, so there is
+        # no collision with a separately-installed upstream `agama` package in site-packages.
+        distutils.file_util.copy_file('Makefile.local', os.path.join(self.build_lib, 'agama_migrate'))
+        distutils.file_util.copy_file(sharedname, os.path.join(self.build_lib, 'agama_migrate'))
+        distutils.file_util.copy_file(staticname, os.path.join(self.build_lib, 'agama_migrate'))
+        distutils.dir_util.copy_tree('exe', os.path.join(self.build_lib, 'agama_migrate', 'exe'))
         if os.path.isdir(EXTRAS_DIR):  # this contains third-party libraries built in the process
-            distutils.dir_util.copy_tree(EXTRAS_DIR, os.path.join(self.build_lib, 'agama', EXTRAS_DIR), verbose=False)
+            distutils.dir_util.copy_tree(EXTRAS_DIR, os.path.join(self.build_lib, 'agama_migrate', EXTRAS_DIR), verbose=False)
 
 class MyTest(Command):
     description  = 'run tests'
@@ -853,19 +858,23 @@ if sys.version_info[0]==3 and sys.version_info[1]>=10 and 'install' in sys.argv:
     say('If you are scared by a deprecation warning about running "setup.py install", try "pip install ." instead\n')
 
 distutils.core.setup(
-    name             = 'agama',
+    # IMPORTANT: distribution renamed to 'agama_migrate' for the GPU-unification fork so that
+    # `pip install .` from this checkout does NOT overwrite a separately-installed upstream
+    # `agama` package in site-packages. To use this build from Python: `import agama_migrate`.
+    # The upstream-style `import agama` continues to resolve to the production install (if any).
+    name             = 'agama_migrate',
     version          = '1.0',
-    description      = 'Action-based galaxy modelling architecture',
-    author           = 'Eugene Vasiliev',
+    description      = 'Action-based galaxy modelling architecture (GPU-unification fork)',
+    author           = 'Eugene Vasiliev | Arpit Arora',
     author_email     = 'eugvas@protonmail.com',
     license          = 'GPL,MIT,BSD',
     url              = 'https://github.com/GalacticDynamics-Oxford/Agama',
     download_url     = 'https://github.com/GalacticDynamics-Oxford/Agama/archive/master.zip',
     long_description = open('README').read(),
     requires         = ['setuptools','wheel','numpy'],
-    packages         = ['agama'],
-    package_dir      = {'agama': '.'},
-    package_data     = {'agama': allFiles('data','doc','py','src','tests') +
+    packages         = ['agama_migrate'],
+    package_dir      = {'agama_migrate': '.'},
+    package_data     = {'agama_migrate': allFiles('data','doc','py','src','tests') +
         ['Makefile', 'Makefile.msvc', 'Makefile.list', 'Makefile.local.template', 'Doxyfile', 'INSTALL', 'LICENSE', 'NEWS', 'README'] },
     ext_modules      = [distutils.extension.Extension('', [])],
     cmdclass         = {'build_ext': MyBuildExt, 'test': MyTest},

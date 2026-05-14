@@ -16,3 +16,9 @@ xcode/*
 *.a
 .DS_Store
 Makefile.local
+
+# Local bookkeeping for the GPU migration (not for upstream).
+# Tracked locally on disk; never committed.
+CLAUDE.md
+project_report.md
+pending_tasks.md
