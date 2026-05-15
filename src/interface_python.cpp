@@ -56,6 +56,7 @@
 #include "math_spline.h"
 #include "particles_io.h"
 #include "potential_analytic.h"
+#include "potential_gpu.h"   // evalPotentialGPU<T>, POT_GPU_* result codes (Tier 1 Python boundary)
 #include "potential_composite.h"
 #include "potential_factory.h"
 #include "potential_multipole.h"
@@ -3028,10 +3029,150 @@ public:
     }
 };
 
+/// Templated device-path implementation for `pot.potential(xyz, device=..., dtype=...)`.
+/// Returns NULL on error (with a Python exception set), or the output numpy array on success.
+/// Caller must already have validated the device kwarg presence and parsed `device_str`.
+template<typename T>
+static PyObject* Potential_potential_device_impl(
+    const potential::BasePotential& pot,
+    PyObject* xyz_obj,
+    const char* device_str,
+    int npy_typenum)  // NPY_DOUBLE or NPY_FLOAT
+{
+    // Coerce input to the chosen dtype + C-contiguous Nx3 (or 1D-length-3 single point).
+    // FORCECAST is required to allow lossy down-casts like float64->float32; the user
+    // explicitly asked for dtype=np.float32 so the cast is intentional.
+    PyArrayObject* in_arr = (PyArrayObject*)
+        PyArray_FROMANY(xyz_obj, npy_typenum, 1, 2,
+                        NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
+    if(!in_arr) {
+        // numpy may have set a more specific error; only override if it didn't.
+        if(!PyErr_Occurred())
+            PyErr_SetString(PyExc_TypeError,
+                "potential(device=...): input must be a Nx3 array or a 3-element 1D array");
+        return NULL;
+    }
+    bool single_point = false;
+    npy_intp N = 0;
+    if(PyArray_NDIM(in_arr) == 1 && PyArray_DIM(in_arr, 0) == 3) {
+        single_point = true; N = 1;
+    } else if(PyArray_NDIM(in_arr) == 2 && PyArray_DIM(in_arr, 1) == 3) {
+        N = PyArray_DIM(in_arr, 0);
+    } else {
+        Py_DECREF(in_arr);
+        PyErr_SetString(PyExc_TypeError,
+            "potential(device=...): input must be a Nx3 array or a 3-element 1D array");
+        return NULL;
+    }
+    const T* in_data = static_cast<const T*>(PyArray_DATA(in_arr));
+
+    // Working buffer for xyz scaled into internal units (length 3*N).
+    // Allocated fresh so we never modify the user's input.
+    std::vector<T> xyz_internal(N * 3);
+    const T L = static_cast<T>(conv->lengthUnit);
+    for(npy_intp i = 0; i < N * 3; i++)
+        xyz_internal[i] = in_data[i] * L;
+    Py_DECREF(in_arr);
+
+    // Output array (1D length-N, or 0D scalar for single_point).
+    npy_intp out_dims[1] = { N };
+    PyObject* out_obj = single_point
+        ? PyArray_EMPTY(0, NULL, npy_typenum, 0)
+        : PyArray_EMPTY(1, out_dims, npy_typenum, 0);
+    if(!out_obj)
+        return NULL;
+    T* out_data = static_cast<T*>(PyArray_DATA((PyArrayObject*)out_obj));
+
+    // Dispatch into the GPU-routed code (potential_gpu.cpp). Releases GIL for the
+    // duration; the underlying forall<Cuda> launch is blocking via cudaStreamSynchronize.
+    int rc;
+    Py_BEGIN_ALLOW_THREADS
+    rc = potential::evalPotentialGPU<T>(pot, N, xyz_internal.data(), out_data, device_str);
+    Py_END_ALLOW_THREADS
+
+    if(rc != potential::POT_GPU_OK) {
+        Py_DECREF(out_obj);
+        switch(rc) {
+            case potential::POT_GPU_EBADDEV:
+                PyErr_Format(PyExc_ValueError,
+                    "potential(device='%s'): unknown device; use 'cpu', 'openmp', or 'cuda'",
+                    device_str);
+                break;
+            case potential::POT_GPU_ENOTBUILT:
+                PyErr_SetString(PyExc_RuntimeError,
+                    "potential(device='cuda'): library built without CUDA support; "
+                    "recompile with HAVE_CUDA=1");
+                break;
+            case potential::POT_GPU_EUNSUPP:
+                PyErr_Format(PyExc_NotImplementedError,
+                    "potential(device='%s'): not supported for potential type '%s'",
+                    device_str, pot.name().c_str());
+                break;
+            default:
+                PyErr_Format(PyExc_RuntimeError,
+                    "potential(device='%s'): unknown error (rc=%d)", device_str, rc);
+                break;
+        }
+        return NULL;
+    }
+
+    // Convert Phi from internal units (where Phi has units of velocity^2) to user units.
+    const T invV2 = static_cast<T>(1.0 / pow_2(conv->velocityUnit));
+    for(npy_intp i = 0; i < N; i++)
+        out_data[i] *= invV2;
+    return out_obj;
+}
+
 PyObject* Potential_potential(PyObject* self, PyObject* args, PyObject* namedArgs)
 {
     if(!Potential_isCorrect(self))
         return NULL;
+
+    // If a `device` kwarg is present, take the new templated batch path
+    // (potential_gpu.cpp). Otherwise fall through to the legacy OpenMP-parallelized
+    // CPU loop (FncPotentialPotential / BatchFunction).
+    if(namedArgs) {
+        PyObject* device_obj = PyDict_GetItemString(namedArgs, "device");
+        if(device_obj) {
+            const char* device_str = PyUnicode_AsUTF8(device_obj);
+            if(!device_str) {
+                PyErr_SetString(PyExc_TypeError,
+                    "potential(device=...): device must be a string");
+                return NULL;
+            }
+            // Parse optional `dtype` kwarg; defaults to numpy.float64 (Pythonic default).
+            int npy_typenum = NPY_DOUBLE;
+            PyObject* dtype_obj = PyDict_GetItemString(namedArgs, "dtype");
+            if(dtype_obj) {
+                PyArray_Descr* descr = NULL;
+                if(!PyArray_DescrConverter(dtype_obj, &descr)) {
+                    PyErr_SetString(PyExc_TypeError,
+                        "potential(dtype=...): not a valid numpy dtype");
+                    return NULL;
+                }
+                npy_typenum = descr->type_num;
+                Py_DECREF(descr);
+                if(npy_typenum != NPY_DOUBLE && npy_typenum != NPY_FLOAT) {
+                    PyErr_SetString(PyExc_TypeError,
+                        "potential(dtype=...): only numpy.float64 (default) and "
+                        "numpy.float32 are supported on the device path");
+                    return NULL;
+                }
+            }
+            // The positional xyz argument: args is a tuple (xyz,) or (xyz, ...).
+            // We accept either a single positional arg or treat args itself as the input
+            // (matches the existing FncPotentialPotential behavior).
+            PyObject* xyz_obj = args;
+            if(PyTuple_Check(args) && PyTuple_Size(args) == 1)
+                xyz_obj = PyTuple_GET_ITEM(args, 0);
+            const potential::BasePotential& pot = *((PotentialObject*)self)->pot;
+            return npy_typenum == NPY_FLOAT
+                ? Potential_potential_device_impl<float >(pot, xyz_obj, device_str, NPY_FLOAT)
+                : Potential_potential_device_impl<double>(pot, xyz_obj, device_str, NPY_DOUBLE);
+        }
+    }
+
+    // Legacy path: existing OpenMP-parallelized CPU loop, fp64 output.
     return FncPotentialPotential(args, namedArgs, *((PotentialObject*)self)->pot).run(/*chunk*/1024);
 }
 

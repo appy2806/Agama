@@ -79,15 +79,17 @@ public:
     virtual double enclosedMass(const double radius) const;
     virtual double totalMass() const { return mass; }
 
-    /** Tier 1 batch evaluator: Phi at N Cartesian positions via plummer_phi leaf. */
-    template<class Policy>
-    inline void evalmanyCar(Policy pol, std::size_t N,
-        const coord::PosCar* in, /*out*/ double* phi) const
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via plummer_phi leaf.
+        xyz: packed input length 3*N (x0,y0,z0, x1,y1,z1, ...); phi: output length N.
+        Templated on precision T (float or double) and execution policy. */
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi) const
     {
-        const double m = mass, b = scaleRadius;
+        const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
-            const coord::PosCar p = in[i];
-            const double r = std::sqrt(pow_2(p.x) + pow_2(p.y) + pow_2(p.z));
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
             phi[i] = plummer_phi(m, b, r);
         });
     }
@@ -116,14 +118,14 @@ public:
     double getRadius() const { return scaleRadius; }
 
     /** Tier 1 batch evaluator: Phi at N Cartesian positions via isochrone_phi leaf. */
-    template<class Policy>
-    inline void evalmanyCar(Policy pol, std::size_t N,
-        const coord::PosCar* in, /*out*/ double* phi) const
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi) const
     {
-        const double m = mass, b = scaleRadius;
+        const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
-            const coord::PosCar p = in[i];
-            const double r = std::sqrt(pow_2(p.x) + pow_2(p.y) + pow_2(p.z));
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
             phi[i] = isochrone_phi(m, b, r);
         });
     }
@@ -149,20 +151,18 @@ public:
         Single source: the lambda body calls the inline `nfw_phi` leaf, which is
         the same body that `evalDeriv` uses for the potential output. Policy may be
         agama::Serial, agama::OpenMP, or (with HAVE_CUDA=1 + nvcc TU) agama::Cuda.
-        For the Cuda policy, `in[]` and `phi[]` must be device pointers.
+        For the Cuda policy, `xyz[]` and `phi[]` must be device pointers.
 
-        Note: this method is inline-in-header because templates must be visible at
-        instantiation. When a nvcc-compiled TU instantiates `evalmanyCar<Cuda>`,
-        the captured lambda becomes a __global__ kernel; the host-compiled TU that
-        contains the (CPU) implementation of `NFW::evalDeriv` is not affected. */
-    template<class Policy>
-    inline void evalmanyCar(Policy pol, std::size_t N,
-        const coord::PosCar* in, /*out*/ double* phi) const
+        xyz: packed input length 3*N (x0,y0,z0, x1,y1,z1, ...); phi: output length N.
+        Templated on precision T (float or double) and execution policy. */
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi) const
     {
-        const double m = mass, rs = scaleRadius;  // capture-by-value into device lambda
+        const T m = static_cast<T>(mass), rs = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
-            const coord::PosCar p = in[i];
-            const double r = std::sqrt(pow_2(p.x) + pow_2(p.y) + pow_2(p.z));
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
             phi[i] = nfw_phi(m, rs, r);
         });
     }
@@ -192,15 +192,15 @@ public:
 
     /** Tier 1 batch evaluator: Phi at N Cartesian positions via miyamoto_nagai_phi leaf.
         Computes R = sqrt(x^2+y^2) directly (axisymmetric Phi has no phi dependence). */
-    template<class Policy>
-    inline void evalmanyCar(Policy pol, std::size_t N,
-        const coord::PosCar* in, /*out*/ double* phi) const
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi) const
     {
-        const double m = mass, a = scaleRadius, b = scaleHeight;
+        const T m = static_cast<T>(mass), a = static_cast<T>(scaleRadius), b = static_cast<T>(scaleHeight);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
-            const coord::PosCar p = in[i];
-            const double R = std::sqrt(pow_2(p.x) + pow_2(p.y));
-            phi[i] = miyamoto_nagai_phi(m, a, b, R, p.z);
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T R = std::sqrt(x*x + y*y);
+            phi[i] = miyamoto_nagai_phi(m, a, b, R, z);
         });
     }
 private:
@@ -258,14 +258,15 @@ public:
     virtual double totalMass() const { return INFINITY; }
 
     /** Tier 1 batch evaluator: Phi at N Cartesian positions via logarithmic_phi leaf. */
-    template<class Policy>
-    inline void evalmanyCar(Policy pol, std::size_t N,
-        const coord::PosCar* in, /*out*/ double* phi) const
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi) const
     {
-        const double v2 = v0squared, c2 = coreRadius2, pp = p2, qq = q2, L2 = lengthUnit2;
+        const T v2 = static_cast<T>(v0squared), c2 = static_cast<T>(coreRadius2);
+        const T pp = static_cast<T>(p2), qq = static_cast<T>(q2), L2 = static_cast<T>(lengthUnit2);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
-            const coord::PosCar p = in[i];
-            phi[i] = logarithmic_phi(v2, c2, pp, qq, L2, p.x, p.y, p.z);
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            phi[i] = logarithmic_phi(v2, c2, pp, qq, L2, x, y, z);
         });
     }
 private:
@@ -292,14 +293,14 @@ public:
     virtual double totalMass() const { return INFINITY; }
 
     /** Tier 1 batch evaluator: Phi at N Cartesian positions via harmonic_phi leaf. */
-    template<class Policy>
-    inline void evalmanyCar(Policy pol, std::size_t N,
-        const coord::PosCar* in, /*out*/ double* phi) const
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi) const
     {
-        const double w2 = Omega2, pp = p2, qq = q2;
+        const T w2 = static_cast<T>(Omega2), pp = static_cast<T>(p2), qq = static_cast<T>(q2);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
-            const coord::PosCar p = in[i];
-            phi[i] = harmonic_phi(w2, pp, qq, p.x, p.y, p.z);
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            phi[i] = harmonic_phi(w2, pp, qq, x, y, z);
         });
     }
 private:

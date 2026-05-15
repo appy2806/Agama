@@ -49,6 +49,7 @@ SOURCES   = interface_c.cpp \
             orbit.cpp \
             orbit_variational.cpp \
             potential_analytic.cpp \
+            potential_gpu.cpp \
             potential_base.cpp \
             potential_composite.cpp \
             potential_cylspline.cpp \
@@ -75,7 +76,7 @@ SOURCES   = interface_c.cpp \
 # kernel-launch `<<<...>>>` syntax). Empty at Tier 0; populated as Tier 1+ classes
 # grow their evalmany<Cuda> methods. The same .cpp compiles cleanly with $(CXX)
 # when HAVE_CUDA=0 — the Cuda-policy template instantiations are __CUDACC__-gated.
-CUDA_TUS  =
+CUDA_TUS  = potential_gpu
 
 # ancient Torus code
 TORUSSRC  = CHB.cc \

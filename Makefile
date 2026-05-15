@@ -98,6 +98,19 @@ $(OBJDIR)/%.o:  $(SRCDIR)/%.cpp Makefile.local
 $(OBJDIR)/%.o:  $(TORUSDIR)/%.cc Makefile.local
 	$(CXX) -c $(COMPILE_FLAGS_ALL) $(COMPILE_FLAGS_LIB) -o "$@" "$<"
 
+# Per-file nvcc override for any TU listed in CUDA_TUS. The explicit rule
+# below takes precedence over the generic $(OBJDIR)/%.o pattern; only emitted
+# when HAVE_CUDA is set (otherwise the pattern rule routes through $(CXX)
+# and the file compiles CPU-only with all Cuda-policy branches gated off).
+ifdef HAVE_CUDA
+define CUDA_TU_RULE
+$(OBJDIR)/$(1).o:  $(SRCDIR)/$(1).cpp Makefile.local
+	@mkdir -p $(OBJDIR)
+	$(NVCC) $(NVCC_FLAGS_ALL) -c -x cu "$$<" -o "$$@"
+endef
+$(foreach tu,$(CUDA_TUS),$(eval $(call CUDA_TU_RULE,$(tu))))
+endif
+
 # GPU-policy smoke test. Compiled through nvcc so that the kernel-launch syntax
 # in src/gpu_policy.h is parseable. Links against agama.so for the Tier 1+ class
 # parity checks (NFW.evalmanyCar, etc.) — the class vtable lives in agama.so.
