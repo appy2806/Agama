@@ -11,8 +11,9 @@
 // forall<Cuda>/parallel_reduce_sum<Cuda> is parseable.
 
 #include "gpu_policy.h"
-#include "math_sphharm.h"   // for math::trigMultiAngle (Tier 0 device-inline leaf)
-#include "coord.h"          // toPos<Car,Cyl>, toPos<Car,Sph> (Tier 0 Phase 2 device-inline)
+#include "math_sphharm.h"        // for math::trigMultiAngle (Tier 0 device-inline leaf)
+#include "coord.h"               // toPos<Car,Cyl>, toPos<Car,Sph> (Tier 0 Phase 2 device-inline)
+#include "potential_analytic.h"  // potential::NFW + nfw_phi leaf (Tier 1 worked example)
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -190,6 +191,63 @@ int main() {
     const double COORD_TOL = 1e-13;
     bool ok_coord = (max_coord_err <= COORD_TOL);
 
+    // ----- potential::NFW Serial vs Cuda parity (Tier 1 worked example) -----
+    // Exercises the full Tier-1 pattern end-to-end:
+    //   * nfw_phi(mass, rs, r) leaf math, inline in potential_analytic.h, AGAMA_DEVICE_INLINE
+    //   * NFW::evalmanyCar<Policy> template method, inline in potential_analytic.h
+    // The Cuda instantiation is generated here in this nvcc-compiled TU; the host
+    // CPU implementation of NFW::evalDeriv (used by the existing virtual eval) lives
+    // in potential_analytic.o linked from agama.so. Both paths must produce the same
+    // potential value.
+    {
+        potential::NFW nfw(1.0, 1.0);  // M = 1, r_s = 1 (test units)
+        const std::size_t NN = 1024;
+        std::vector<coord::PosCar> in_h(NN);
+        std::vector<double> phi_s(NN);
+        for(std::size_t i = 0; i < NN; ++i) {
+            // off-axis, off-origin spread across many decades of r
+            const double xi = 0.05 * static_cast<double>(i + 1);
+            in_h[i] = coord::PosCar(0.1 + xi, 0.07 - 0.3 * xi, 0.02 + 0.5 * xi);
+        }
+        // Serial reference via the new templated batch method.
+        nfw.evalmanyCar(agama::Serial{}, NN, in_h.data(), phi_s.data());
+
+        // Cross-check the leaf against the existing CPU virtual: for a few points,
+        // pot.value(pos) (which goes through evalCar -> evalDeriv in the .cpp) must
+        // agree with phi_s to ULP. This is the "leaf and virtual evaluate the same math".
+        double max_virt_err = 0.0;
+        for(std::size_t i = 0; i < 8; ++i) {
+            const double phi_virt = nfw.value(in_h[i]);
+            max_virt_err = std::max(max_virt_err, std::fabs(phi_virt - phi_s[i]));
+        }
+
+        // Cuda path — device pointers via device_array.
+        device_array<coord::PosCar> d_in(NN);
+        d_in.from_host(in_h.data(), NN);
+        device_array<double> d_phi(NN);
+        nfw.evalmanyCar(agama::Cuda{}, NN, d_in.data(), d_phi.data());
+        std::vector<double> phi_c(NN);
+        d_phi.to_host(phi_c.data(), NN);
+
+        double max_nfw_err = 0.0;
+        for(std::size_t i = 0; i < NN; ++i)
+            max_nfw_err = std::max(max_nfw_err, std::fabs(phi_s[i] - phi_c[i]));
+        // fp64 sin/cos/log differ host vs device by ~1 ULP per call; the NFW formula
+        // has one log + a handful of muls/adds, so 1e-13 (~1000 ULPs) is the same
+        // loose-but-meaningful threshold used elsewhere.
+        const double NFW_TOL = 1e-13;
+        bool ok_nfw      = (max_nfw_err  <= NFW_TOL);
+        bool ok_nfw_virt = (max_virt_err <= NFW_TOL);
+        std::printf("[CUDA]  NFW.evalmanyCar Serial vs Cuda  (N=%zu): max |err| = %.3e, tol = %.1e -> %s\n",
+            NN, max_nfw_err, NFW_TOL, ok_nfw ? "OK" : "FAIL");
+        std::printf("[CUDA]  NFW leaf vs evalDeriv virtual  (8 pts): max |err| = %.3e, tol = %.1e -> %s\n",
+            max_virt_err, NFW_TOL, ok_nfw_virt ? "OK" : "FAIL");
+        if(!(ok_nfw && ok_nfw_virt)) {
+            std::fprintf(stderr, "FAIL (NFW)\n");
+            return 1;
+        }
+    }
+
     // ----- math::trigMultiAngle on Cuda (Tier 0 worked example) -----
     // Each thread handles one phi sample, writes its 2*MM trig values into a
     // device buffer. We compare bit-for-bit with the Serial reference above.
@@ -268,6 +326,86 @@ int main() {
     run_trig(1u << 14, 16, "small ");   //  16K threads × 16 ops
     run_trig(1u << 18, 16, "medium");   // 256K
     run_trig(1u << 20, 16, "large ");   //   1M
+
+    // ============================================================
+    // Tier 1 NFW timing: fp64 via NFW::evalmanyCar<Policy> (class method); fp32 via
+    // the nfw_phi<float> leaf called directly inside a forall lambda (no class API
+    // for fp32 yet — see CLAUDE.md, "Coefficient storage is always fp64"). Both
+    // measure end-to-end Phi(x,y,z) at N points. Output is device-resident for the
+    // Cuda path (the pull-one-back below forces kernel completion).
+    // ============================================================
+    std::printf("\n=== Tier 1 NFW: Phi(xyz) timings (Serial / OpenMP / Cuda) ===\n");
+    auto run_nfw = [&](std::size_t N, const char* sizename) {
+        potential::NFW pot(1.0, 1.0);
+
+        // --- fp64 path via the class template method ---
+        std::vector<coord::PosCar> in64_h(N);
+        for(std::size_t i = 0; i < N; ++i) {
+            const double xi = 1e-3 + 1e-5 * static_cast<double>(i);  // log-spread radii
+            in64_h[i] = coord::PosCar(0.1 + xi, 0.07 - 0.3 * xi, 0.02 + 0.5 * xi);
+        }
+        std::vector<double> phi64_s(N), phi64_o(N);
+        double t64s = time_ms_min(TRIALS, [&]{ pot.evalmanyCar(Serial{}, N, in64_h.data(), phi64_s.data()); });
+        double t64o = time_ms_min(TRIALS, [&]{ pot.evalmanyCar(OpenMP{}, N, in64_h.data(), phi64_o.data()); });
+        device_array<coord::PosCar> d_in64(N);
+        d_in64.from_host(in64_h.data(), N);
+        device_array<double> d_phi64(N);
+        double t64c = time_ms_min(TRIALS, [&]{
+            pot.evalmanyCar(Cuda{}, N, d_in64.data(), d_phi64.data());
+            double tmp; cudaMemcpy(&tmp, d_phi64.data(), sizeof(double), cudaMemcpyDeviceToHost);
+        });
+
+        // --- fp32 path via the free-function leaf nfw_phi<float> ---
+        // input xyz packed as float; mass/scaleRadius captured as float.
+        std::vector<float> in32_h(N * 3), phi32_s(N), phi32_o(N);
+        for(std::size_t i = 0; i < N; ++i) {
+            in32_h[i*3+0] = static_cast<float>(in64_h[i].x);
+            in32_h[i*3+1] = static_cast<float>(in64_h[i].y);
+            in32_h[i*3+2] = static_cast<float>(in64_h[i].z);
+        }
+        const float m32 = 1.0f, rs32 = 1.0f;
+        const float* in32p = in32_h.data();
+        float* phi32sp = phi32_s.data();
+        float* phi32op = phi32_o.data();
+        double t32s = time_ms_min(TRIALS, [&]{
+            forall(Serial{}, N, [=](std::size_t i){
+                const float r = std::sqrt(in32p[i*3+0]*in32p[i*3+0] +
+                                          in32p[i*3+1]*in32p[i*3+1] +
+                                          in32p[i*3+2]*in32p[i*3+2]);
+                phi32sp[i] = potential::nfw_phi(m32, rs32, r);
+            });
+        });
+        double t32o = time_ms_min(TRIALS, [&]{
+            forall(OpenMP{}, N, [=](std::size_t i){
+                const float r = std::sqrt(in32p[i*3+0]*in32p[i*3+0] +
+                                          in32p[i*3+1]*in32p[i*3+1] +
+                                          in32p[i*3+2]*in32p[i*3+2]);
+                phi32op[i] = potential::nfw_phi(m32, rs32, r);
+            });
+        });
+        device_array<float> d_in32(N * 3);
+        d_in32.from_host(in32_h.data(), N * 3);
+        device_array<float> d_phi32(N);
+        const float* d_in32p = d_in32.data();
+        float*       d_phi32p = d_phi32.data();
+        double t32c = time_ms_min(TRIALS, [&]{
+            forall(Cuda{}, N, [=] AGAMA_DEVICE (std::size_t i){
+                const float r = std::sqrt(d_in32p[i*3+0]*d_in32p[i*3+0] +
+                                          d_in32p[i*3+1]*d_in32p[i*3+1] +
+                                          d_in32p[i*3+2]*d_in32p[i*3+2]);
+                d_phi32p[i] = potential::nfw_phi(m32, rs32, r);
+            });
+            float tmp; cudaMemcpy(&tmp, d_phi32p, sizeof(float), cudaMemcpyDeviceToHost);
+        });
+
+        std::printf("  NFW fp64  N=%-8zu  %s : Serial %8.3f ms   OpenMP %8.3f ms (%5.1fx)   Cuda %8.3f ms (%6.1fx vs Serial, %5.1fx vs OpenMP)\n",
+            N, sizename, t64s, t64o, t64s / t64o, t64c, t64s / t64c, t64o / t64c);
+        std::printf("  NFW fp32  N=%-8zu  %s : Serial %8.3f ms   OpenMP %8.3f ms (%5.1fx)   Cuda %8.3f ms (%6.1fx vs Serial, %5.1fx vs OpenMP)\n",
+            N, sizename, t32s, t32o, t32s / t32o, t32c, t32s / t32c, t32o / t32c);
+    };
+    run_nfw(1u << 18, "small ");   // 262K — kernel-launch + H2D-bound regime
+    run_nfw(1u << 20, "medium");   //   1M
+    run_nfw(1u << 22, "large ");   //   4M — bandwidth-bound regime
 
     return 0;
 #else

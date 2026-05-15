@@ -99,14 +99,14 @@ $(OBJDIR)/%.o:  $(TORUSDIR)/%.cc Makefile.local
 	$(CXX) -c $(COMPILE_FLAGS_ALL) $(COMPILE_FLAGS_LIB) -o "$@" "$<"
 
 # GPU-policy smoke test. Compiled through nvcc so that the kernel-launch syntax
-# in src/gpu_policy.h is parseable. The smoke test is header-only against
-# gpu_policy.h so it does NOT link agama.so — only libcudart.
+# in src/gpu_policy.h is parseable. Links against agama.so for the Tier 1+ class
+# parity checks (NFW.evalmanyCar, etc.) — the class vtable lives in agama.so.
 ifdef HAVE_CUDA
 all: $(EXEDIR)/test_gpu_policy.exe
 
-$(EXEDIR)/test_gpu_policy.exe: $(TESTSDIR)/test_gpu_policy.cpp
+$(EXEDIR)/test_gpu_policy.exe: $(TESTSDIR)/test_gpu_policy.cpp $(LIBNAME_SHARED)
 	@mkdir -p $(EXEDIR)
-	$(NVCC) $(NVCC_FLAGS_ALL) -x cu "$<" -o "$@" -L$(CUDA_LIBDIR) -lcudart
+	$(NVCC) $(NVCC_FLAGS_ALL) -x cu "$<" -o "$@" -L. -l:$(LIBNAME_SHARED) -L$(CUDA_LIBDIR) -lcudart -Xlinker -rpath -Xlinker '$$ORIGIN'
 endif
 
 clean:

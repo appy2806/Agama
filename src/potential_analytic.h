@@ -5,8 +5,26 @@
 */
 #pragma once
 #include "potential_base.h"
+#include "gpu_policy.h"   // agama::forall for templated batch evaluators (Tier 1)
+#include <cmath>          // std::sqrt, std::log
 
 namespace potential{
+
+/** Tier 1 leaf math: NFW potential at spherical radius r.
+    Same Pade-approximated body that NFW::evalDeriv uses for the potential output;
+    promoted to a header-inline free function tagged AGAMA_DEVICE_INLINE so it is
+    callable from both CPU and CUDA TUs. POD-only inputs by value -> works inside
+    a captured-by-copy device lambda. */
+template<typename T>
+AGAMA_DEVICE_INLINE T nfw_phi(T mass, T scaleRadius, T r) {
+    T rrel = r / scaleRadius;
+    T ln_over_r = r == T(INFINITY) ? T(0) :
+        rrel > T(0.016) ? std::log(T(1) + rrel) / r :
+        // accurate (14 digits) asymptotic Pade(2,3) expansion at r->0
+        (T(1) + rrel * (T(1) + T(11.0/60.0) * rrel)) /
+        (T(1) + rrel * (T(1.5) + rrel * (T(0.6) + rrel * T(0.05)))) / scaleRadius;
+    return -mass * ln_over_r;
+}
 
 /** Spherical Plummer potential:
     \f$  \Phi(r) = - M / \sqrt{r^2 + b^2}  \f$. */
@@ -58,6 +76,28 @@ public:
     virtual std::string name() const { return myName(); }
     static std::string myName() { return "NFW"; }
     virtual double totalMass() const { return INFINITY; }
+
+    /** Tier 1 batch evaluator: NFW potential at N Cartesian positions.
+        Single source: the lambda body calls the inline `nfw_phi` leaf, which is
+        the same body that `evalDeriv` uses for the potential output. Policy may be
+        agama::Serial, agama::OpenMP, or (with HAVE_CUDA=1 + nvcc TU) agama::Cuda.
+        For the Cuda policy, `in[]` and `phi[]` must be device pointers.
+
+        Note: this method is inline-in-header because templates must be visible at
+        instantiation. When a nvcc-compiled TU instantiates `evalmanyCar<Cuda>`,
+        the captured lambda becomes a __global__ kernel; the host-compiled TU that
+        contains the (CPU) implementation of `NFW::evalDeriv` is not affected. */
+    template<class Policy>
+    inline void evalmanyCar(Policy pol, std::size_t N,
+        const coord::PosCar* in, /*out*/ double* phi) const
+    {
+        const double m = mass, rs = scaleRadius;  // capture-by-value into device lambda
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const coord::PosCar p = in[i];
+            const double r = std::sqrt(pow_2(p.x) + pow_2(p.y) + pow_2(p.z));
+            phi[i] = nfw_phi(m, rs, r);
+        });
+    }
 private:
     const double mass;         ///< normalization factor  (M);  equals to mass enclosed within ~5.3r_s
     const double scaleRadius;  ///< scale radius of the NFW model  (r_s)
