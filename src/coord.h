@@ -36,8 +36,10 @@ The fundamental routines operating on these structures are the following:
 */
 #pragma once
 
+#include <cmath>          // std::sqrt — needed by inline cross-coord toPos
 #include "gpu_device.h"   // AGAMA_DEVICE_INLINE macro
 #include "math_base.h"
+#include "math_core.h"    // math::sincos, math::atan2 (inline, device-callable)
 
 /** Classes and routines for representing position/velocity points,
     gradients and hessians of scalar functions (e.g., gravitational potential),
@@ -191,8 +193,8 @@ template<typename CoordT> struct PosT;
 /// position in cartesian coordinates
 template<> struct PosT<Car>{
     double x, y, z;   ///< three cartesian coordinates
-    PosT() {}
-    PosT(double _x, double _y, double _z) : x(_x), y(_y), z(_z) {}
+    AGAMA_DEVICE_INLINE PosT() {}
+    AGAMA_DEVICE_INLINE PosT(double _x, double _y, double _z) : x(_x), y(_y), z(_z) {}
 };
 /// an alias to templated type specialization of position in cartesian coordinates
 typedef struct PosT<Car> PosCar;
@@ -202,8 +204,8 @@ template<> struct PosT<Cyl>{
     double R;   ///< cylindrical radius = sqrt(x^2+y^2)
     double z;   ///< z coordinate
     double phi; ///< azimuthal angle in x-y plane [0:2pi)
-    PosT() {}
-    PosT(double _R, double _z, double _phi) : R(_R), z(_z), phi(_phi) {}
+    AGAMA_DEVICE_INLINE PosT() {}
+    AGAMA_DEVICE_INLINE PosT(double _R, double _z, double _phi) : R(_R), z(_z), phi(_phi) {}
 };
 typedef struct PosT<Cyl> PosCyl;
 
@@ -213,8 +215,8 @@ template<> struct PosT<Sph>{
     double theta; ///< polar angle [0:pi] - 0 means along z axis in positive direction,
                   ///< pi is along z in negative direction, pi/2 is in x-y plane
     double phi;   ///< azimuthal angle in x-y plane [0:2pi)
-    PosT() {}
-    PosT(double _r, double _theta, double _phi) : r(_r), theta(_theta), phi(_phi) {}
+    AGAMA_DEVICE_INLINE PosT() {}
+    AGAMA_DEVICE_INLINE PosT(double _r, double _theta, double _phi) : r(_r), theta(_theta), phi(_phi) {}
 };
 typedef struct PosT<Sph> PosSph;
 
@@ -793,6 +795,43 @@ template<> AGAMA_DEVICE_INLINE PosSph    toPos   <Sph,Sph>(const PosSph&    p, c
 template<> AGAMA_DEVICE_INLINE PosVelCar toPosVel<Car,Car>(const PosVelCar& p, const Car) { return p; }
 template<> AGAMA_DEVICE_INLINE PosVelCyl toPosVel<Cyl,Cyl>(const PosVelCyl& p, const Cyl) { return p; }
 template<> AGAMA_DEVICE_INLINE PosVelSph toPosVel<Sph,Sph>(const PosVelSph& p, const Sph) { return p; }
+
+/// multiply two numbers, replacing {anything including INFINITY} * 0 with 0;
+/// preserves the nan2num(x*y) semantics AGAMA uses on the CPU path, without the
+/// two comparisons inside isFinite. Defined here (not just in coord.cpp) so it
+/// is reachable from device kernels invoking the inline cross-coord toPos below.
+AGAMA_DEVICE_INLINE double mul(double x, double y) { return y==0 ? 0 : x*y; }
+
+/** cross-coord pure-position transforms — bodies promoted from coord.cpp so they
+    are callable from CUDA kernels. ProlSph/Axi transforms stay in the .cpp because
+    they throw on invalid input (device-error-handling is a separate design choice). */
+
+template<> AGAMA_DEVICE_INLINE PosCar toPos<Cyl,Car>(const PosCyl& p, const Car) {
+    double sinphi, cosphi;
+    math::sincos(p.phi, sinphi, cosphi);
+    return PosCar(mul(p.R, cosphi), mul(p.R, sinphi), p.z);
+}
+template<> AGAMA_DEVICE_INLINE PosCar toPos<Sph,Car>(const PosSph& p, const Car) {
+    double sintheta, costheta, sinphi, cosphi;
+    math::sincos(p.theta, sintheta, costheta);
+    math::sincos(p.phi, sinphi, cosphi);
+    return PosCar(mul(p.r, sintheta*cosphi), mul(p.r, sintheta*sinphi), mul(p.r, costheta));
+}
+template<> AGAMA_DEVICE_INLINE PosCyl toPos<Car,Cyl>(const PosCar& p, const Cyl) {
+    return PosCyl(std::sqrt(pow_2(p.x) + pow_2(p.y)), p.z, math::atan2(p.y, p.x));
+}
+template<> AGAMA_DEVICE_INLINE PosCyl toPos<Sph,Cyl>(const PosSph& p, const Cyl) {
+    double sintheta, costheta;
+    math::sincos(p.theta, sintheta, costheta);
+    return PosCyl(mul(p.r, sintheta), mul(p.r, costheta), p.phi);
+}
+template<> AGAMA_DEVICE_INLINE PosSph toPos<Car,Sph>(const PosCar& p, const Sph) {
+    return PosSph(std::sqrt(pow_2(p.x)+pow_2(p.y)+pow_2(p.z)),
+        math::atan2(std::sqrt(pow_2(p.x) + pow_2(p.y)), p.z), math::atan2(p.y, p.x));
+}
+template<> AGAMA_DEVICE_INLINE PosSph toPos<Cyl,Sph>(const PosCyl& p, const Sph) {
+    return PosSph(std::sqrt(pow_2(p.R) + pow_2(p.z)), math::atan2(p.R, p.z), p.phi);
+}
 
 ///@}
 /// \name   Routines for conversion between position in different coordinate systems with derivatives

@@ -12,6 +12,7 @@
 
 #include "gpu_policy.h"
 #include "math_sphharm.h"   // for math::trigMultiAngle (Tier 0 device-inline leaf)
+#include "coord.h"          // toPos<Car,Cyl>, toPos<Car,Sph> (Tier 0 Phase 2 device-inline)
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -112,6 +113,26 @@ int main() {
     std::printf("[CPU]   reduce result: %.1f (expected %.1f)\n",
         rsum_s, 0.5 * static_cast<double>(N) * static_cast<double>(N - 1));
 
+    // ----- coord::toPos<Car,Cyl> / toPos<Car,Sph> on Serial (reference) -----
+    // Tier 0 Phase 2 leaf: cartesian -> cylindrical / spherical conversion.
+    // Header-inlined so the same body runs CPU + GPU.
+    const std::size_t NPT = 1024;
+    std::vector<double> car_xyz(NPT * 3);
+    for(std::size_t i = 0; i < NPT; ++i) {
+        // a spread of points well off the singular axes / origin
+        car_xyz[i * 3 + 0] = 0.5 + 1.7 * static_cast<double>(i % 13);
+        car_xyz[i * 3 + 1] = -0.3 + 0.9 * static_cast<double>(i % 17);
+        car_xyz[i * 3 + 2] =  0.2 + 0.4 * static_cast<double>(i %  7);
+    }
+    std::vector<double> cyl_s(NPT * 3), sph_s(NPT * 3);
+    for(std::size_t i = 0; i < NPT; ++i) {
+        const coord::PosCar p(car_xyz[i*3+0], car_xyz[i*3+1], car_xyz[i*3+2]);
+        const coord::PosCyl c = coord::toPos<coord::Car, coord::Cyl>(p, coord::Cyl());
+        const coord::PosSph s = coord::toPos<coord::Car, coord::Sph>(p, coord::Sph());
+        cyl_s[i*3+0] = c.R;   cyl_s[i*3+1] = c.z;     cyl_s[i*3+2] = c.phi;
+        sph_s[i*3+0] = s.r;   sph_s[i*3+1] = s.theta; sph_s[i*3+2] = s.phi;
+    }
+
     // ----- math::trigMultiAngle on Serial (reference) -----
     // Tier 0 leaf math: cos(k*phi), sin(k*phi) for k=1..mmax via the Num.Rec. recurrence.
     // Inlined in math_sphharm.h with AGAMA_DEVICE_INLINE so the same body runs CPU+GPU.
@@ -136,6 +157,38 @@ int main() {
     // ----- parallel_reduce_sum<Cuda> -----
     double rsum_c = parallel_reduce_sum(Cuda{}, N, 0.0,
         [] AGAMA_DEVICE (std::size_t i) { return static_cast<double>(i); });
+
+    // ----- coord::toPos<Car,Cyl> / toPos<Car,Sph> on Cuda (Tier 0 Phase 2) -----
+    // One thread per point: read xyz, call the inline header-only transforms,
+    // write (R,z,phi) and (r,theta,phi). Compare bit-exact with the Serial
+    // reference; the formulas use math::sincos / math::atan2 (also header-inline)
+    // so host and device evaluate exactly the same arithmetic.
+    device_array<double> d_car(NPT * 3);
+    d_car.from_host(car_xyz.data(), NPT * 3);
+    const double* d_car_ptr = d_car.data();
+    device_array<double> d_cyl(NPT * 3), d_sph(NPT * 3);
+    double* d_cyl_ptr = d_cyl.data();
+    double* d_sph_ptr = d_sph.data();
+    forall(Cuda{}, NPT, [=] AGAMA_DEVICE (std::size_t i) {
+        const coord::PosCar p(d_car_ptr[i*3+0], d_car_ptr[i*3+1], d_car_ptr[i*3+2]);
+        const coord::PosCyl c = coord::toPos<coord::Car, coord::Cyl>(p, coord::Cyl());
+        const coord::PosSph s = coord::toPos<coord::Car, coord::Sph>(p, coord::Sph());
+        d_cyl_ptr[i*3+0] = c.R;   d_cyl_ptr[i*3+1] = c.z;     d_cyl_ptr[i*3+2] = c.phi;
+        d_sph_ptr[i*3+0] = s.r;   d_sph_ptr[i*3+1] = s.theta; d_sph_ptr[i*3+2] = s.phi;
+    });
+    std::vector<double> cyl_c(NPT * 3), sph_c(NPT * 3);
+    d_cyl.to_host(cyl_c.data(), NPT * 3);
+    d_sph.to_host(sph_c.data(), NPT * 3);
+    double max_coord_err = 0.0;
+    for(std::size_t i = 0; i < NPT * 3; ++i) {
+        max_coord_err = std::max(max_coord_err, std::fabs(cyl_s[i] - cyl_c[i]));
+        max_coord_err = std::max(max_coord_err, std::fabs(sph_s[i] - sph_c[i]));
+    }
+    // host glibc vs CUDA-intrinsic sin/cos in math::sincos diverge by ~1 ULP per call;
+    // atan2 here uses our own polynomial so it is bit-exact except for FMA-contraction
+    // differences. 1e-13 is the same loose-but-meaningful threshold used for trigMultiAngle.
+    const double COORD_TOL = 1e-13;
+    bool ok_coord = (max_coord_err <= COORD_TOL);
 
     // ----- math::trigMultiAngle on Cuda (Tier 0 worked example) -----
     // Each thread handles one phi sample, writes its 2*MM trig values into a
@@ -167,12 +220,14 @@ int main() {
     std::printf("[CUDA]  reduce result: %.1f\n", rsum_c);
     std::printf("[CUDA]  trigMultiAngle Serial vs Cuda (NP=%zu, mmax=%u): max |err| = %.3e, tol = %.1e -> %s\n",
         NP, MM, max_trig_err, TRIG_TOL, ok_trig ? "OK" : "FAIL");
+    std::printf("[CUDA]  toPos<Car,Cyl>/<Car,Sph> Serial vs Cuda (N=%zu): max |err| = %.3e, tol = %.1e -> %s\n",
+        NPT, max_coord_err, COORD_TOL, ok_coord ? "OK" : "FAIL");
 
-    if (!(ok_cpu && ok_gpu && ok_trig)) {
+    if (!(ok_cpu && ok_gpu && ok_trig && ok_coord)) {
         std::fprintf(stderr, "FAIL\n");
         return 1;
     }
-    std::printf("PASS (Serial/OpenMP/Cuda agree on forall, reduce, and trigMultiAngle to %.0e)\n", TRIG_TOL);
+    std::printf("PASS (Serial/OpenMP/Cuda agree on forall, reduce, trigMultiAngle, and toPos to %.0e)\n", TRIG_TOL);
 
     // ============================================================
     // Timing: Serial vs OpenMP vs Cuda. Two sizes (1M, 16M) × two precisions (fp64, fp32).

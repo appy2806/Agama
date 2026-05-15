@@ -168,84 +168,8 @@ double unwrapAngle(double x, double xprev)
     return x - 2*M_PI * nwraps;
 }
 
-void sincos(double x, double& s, double& c)
-{
-    double y = fabs(x);
-    long quad = long(4/M_PI * y); // floor(...), non-negative (!!no overflow check!!)
-    quad = (quad+1) >> 1;         // 0 => 0, 1 => 1, 2 => 1, 3 => 2, 4 => 2, 5 => 3, etc.
-    // range reduction to [-pi/4 .. pi/4]
-#if 1
-    // in this variant, multiples of M_PI/2 are exactly mapped to zero (this is a deliberate tweak)
-    y -= M_PI/2 * quad;
-#else
-    // a more accurate expression, but it leaves sin(M_PI)!=0, which we'd like to banish
-    y = ((y - quad * 1.57079631090164185) - quad * 1.58932547122958567e-08) - quad * 6.12323399573676604e-17;
-#endif
-    int q13 = quad & 1, q02 = 1 - q13;
-    int signc = 1 - (quad & 2), signs = std::signbit(x) ? -signc : signc;
-    double y2 = y * y;
-    // use a Chebyshev approximation for sin and cos on this interval
-    double sy = y + y * (((((
-        +1.5896230157654657e-10 * y2
-        -2.5050747762857807e-8) * y2
-        +2.7557313621385725e-6) * y2
-        -1.9841269829589539e-4) * y2
-        +8.3333333333221186e-3) * y2
-        -0.1666666666666663073) * y2;
-    double cy = 1.0 + ((((((
-        -1.1358536521387682e-11 * y2
-        +2.0875700841974730e-9) * y2
-        -2.7557314179296740e-7) * y2
-        +2.4801587288851704e-5) * y2
-        -0.0013888888888873056) * y2
-        +0.0416666666666665950) * y2
-        -0.5) * y2;
-    // assign the output values, depending on the quadrant
-    s = (q02 * sy + q13 * cy) * signs;
-    c = (q02 * cy - q13 * sy) * signc;
-}
-
-// rational approximation for |x| <= 1, accurate to 5e-17(rms) / 2e-16(max)
-// - somewhat worse than standard atan, but faster
-inline double atan1(double x)
-{
-    double x2 = x*x,
-    num = -403.11710541978266 +
-    x2 * (-902.59989673314130 +
-    x2 * (-707.35355100686270 +
-    x2 * (-230.47304101738868 +
-    x2 * (-28.595211396994470 +
-    x2 *  -0.9023747369388881)))),
-    den = 1209.3513162593547 +
-    x2 * (3433.4104799543807 +
-    x2 * (3663.8135197609940 +
-    x2 * (1821.3627056982116 +
-    x2 * (423.04454079463840 +
-    x2 * (39.917377889601520 + x2 )))));
-    return x * x2 * (num/den) + x;  // ONLY in that order!! x * (1 + x2 * num/den) is _much_ worse
-}
-
-double atan(double x)
-{
-    bool bigx = x>1 || x<-1;
-    double res = atan1(bigx ? -1/x : x);
-    if(bigx)
-        res +=  x<0 ? -0.5*M_PI : 0.5*M_PI;
-    return res;
-}
-
-double atan2(double y, double x)
-{
-    if(y==0)  // correct quadrant for all combinations of x=+-0 and/or y=+-0
-        return std::copysign(M_PI * std::signbit(x), y);
-    bool negx = x<0;
-    double signy = y>=0 ? 1 : -1, absy = y * signy, absx = negx ? -x : x;
-    bool ybigger = absy > absx;
-    double res = atan1(ybigger ? -x/y : y/x);
-    if(ybigger)   res += 0.5*M_PI * signy;
-    else if(negx) res += M_PI * signy;
-    return res;
-}
+// sincos, atan1, atan, atan2 were promoted to math_core.h as AGAMA_DEVICE_INLINE
+// so they are callable from CUDA kernels (Tier 0 coord.h Phase 2).
 
 template<typename NumT>
 ptrdiff_t binSearch(const NumT x, const NumT arr[], size_t size)

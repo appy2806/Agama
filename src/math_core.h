@@ -5,6 +5,7 @@
 */
 #pragma once
 #include "math_base.h"
+#include <cmath>      // fabs, signbit, copysign, floor — used by inline sincos/atan/atan2
 
 namespace math{
 
@@ -51,14 +52,85 @@ double unwrapAngle(double x, double xprev);
 
 /** optimized function for computing both sine and cosine at once;
     it performs a modified argument range reduction so that the floating-point values that are
-    integer multiples of M_PI/2 correspond to exactly zero values of sine or cosine */
-void sincos(double x, double& s, double& c);
+    integer multiples of M_PI/2 correspond to exactly zero values of sine or cosine.
+    Defined inline (and AGAMA_DEVICE_INLINE) so the body is reachable from CUDA kernels. */
+AGAMA_DEVICE_INLINE void sincos(double x, double& s, double& c)
+{
+    using std::fabs; using std::signbit;
+    double y = fabs(x);
+    long quad = long(4/M_PI * y); // floor(...), non-negative (!!no overflow check!!)
+    quad = (quad+1) >> 1;         // 0 => 0, 1 => 1, 2 => 1, 3 => 2, 4 => 2, 5 => 3, etc.
+    // range reduction to [-pi/4 .. pi/4]
+    // multiples of M_PI/2 are exactly mapped to zero (deliberate tweak; see math_core.cpp history
+    // for the more-accurate-but-non-zero-at-M_PI variant)
+    y -= M_PI/2 * quad;
+    int q13 = quad & 1, q02 = 1 - q13;
+    int signc = 1 - (quad & 2), signs = signbit(x) ? -signc : signc;
+    double y2 = y * y;
+    // Chebyshev approximation for sin and cos on this interval
+    double sy = y + y * (((((
+        +1.5896230157654657e-10 * y2
+        -2.5050747762857807e-8) * y2
+        +2.7557313621385725e-6) * y2
+        -1.9841269829589539e-4) * y2
+        +8.3333333333221186e-3) * y2
+        -0.1666666666666663073) * y2;
+    double cy = 1.0 + ((((((
+        -1.1358536521387682e-11 * y2
+        +2.0875700841974730e-9) * y2
+        -2.7557314179296740e-7) * y2
+        +2.4801587288851704e-5) * y2
+        -0.0013888888888873056) * y2
+        +0.0416666666666665950) * y2
+        -0.5) * y2;
+    s = (q02 * sy + q13 * cy) * signs;
+    c = (q02 * cy - q13 * sy) * signc;
+}
+
+// rational approximation for |x| <= 1, accurate to 5e-17(rms) / 2e-16(max)
+// — somewhat worse than standard atan, but faster. File-scope helper for atan/atan2 below.
+AGAMA_DEVICE_INLINE double atan1(double x)
+{
+    double x2 = x*x,
+    num = -403.11710541978266 +
+    x2 * (-902.59989673314130 +
+    x2 * (-707.35355100686270 +
+    x2 * (-230.47304101738868 +
+    x2 * (-28.595211396994470 +
+    x2 *  -0.9023747369388881)))),
+    den = 1209.3513162593547 +
+    x2 * (3433.4104799543807 +
+    x2 * (3663.8135197609940 +
+    x2 * (1821.3627056982116 +
+    x2 * (423.04454079463840 +
+    x2 * (39.917377889601520 + x2 )))));
+    return x * x2 * (num/den) + x;  // ONLY in that order!! x * (1 + x2 * num/den) is _much_ worse
+}
 
 /** arctangent function, faster than the one from standard library (result in the range +-M_PI/2) */
-double atan(double x);
+AGAMA_DEVICE_INLINE double atan(double x)
+{
+    bool bigx = x>1 || x<-1;
+    double res = atan1(bigx ? -1/x : x);
+    if(bigx)
+        res +=  x<0 ? -0.5*M_PI : 0.5*M_PI;
+    return res;
+}
 
 /** four-quadrant version of arctangent(y/x), faster than the one from standard library */
-double atan2(double y, double x);
+AGAMA_DEVICE_INLINE double atan2(double y, double x)
+{
+    using std::copysign; using std::signbit;
+    if(y==0)  // correct quadrant for all combinations of x=+-0 and/or y=+-0
+        return copysign(M_PI * signbit(x), y);
+    bool negx = x<0;
+    double signy = y>=0 ? 1 : -1, absy = y * signy, absx = negx ? -x : x;
+    bool ybigger = absy > absx;
+    double res = atan1(ybigger ? -x/y : y/x);
+    if(ybigger)   res += 0.5*M_PI * signy;
+    else if(negx) res += M_PI * signy;
+    return res;
+}
 
 /** Perform a binary search in an array of sorted numbers x_0 < x_1 < ... < x_N
     to locate the index of bin that contains a given value x.

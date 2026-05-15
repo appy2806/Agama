@@ -41,38 +41,12 @@ template<> double Lz(const PosVelAxi& p) {
     return p.vphi * chi * sinnu;
 }
 
-// multiply two numbers, replacing {anything including INFINITY} * 0 with 0;
-// the same result may be achieved by nan2num(x*y), but with two comparisons instead of one
-inline double mul(double x, double y) { return y==0 ? 0 : x*y; }
+// mul() and the 6 cross-coord pure-position toPos specializations were promoted
+// to coord.h as AGAMA_DEVICE_INLINE (Tier 0 coord.h Phase 2). They are still
+// used in this TU (toPosDeriv etc.) via the inline header copy.
 
 //--------  position conversion functions ---------//
 
-template<> PosCar toPos(const PosCyl& p, const Car) {
-    double sinphi, cosphi;
-    math::sincos(p.phi, sinphi, cosphi);
-    return PosCar(mul(p.R, cosphi), mul(p.R, sinphi), p.z);
-}
-template<> PosCar toPos(const PosSph& p, const Car) {
-    double sintheta, costheta, sinphi, cosphi;
-    math::sincos(p.theta, sintheta, costheta);
-    math::sincos(p.phi, sinphi, cosphi);
-    return PosCar(mul(p.r, sintheta*cosphi), mul(p.r, sintheta*sinphi), mul(p.r, costheta));
-}
-template<> PosCyl toPos(const PosCar& p, const Cyl) {
-    return PosCyl(sqrt(pow_2(p.x) + pow_2(p.y)), p.z, math::atan2(p.y, p.x));
-}
-template<> PosCyl toPos(const PosSph& p, const Cyl) {
-    double sintheta, costheta;
-    math::sincos(p.theta, sintheta, costheta);
-    return PosCyl(mul(p.r, sintheta), mul(p.r, costheta), p.phi);
-}
-template<> PosSph toPos(const PosCar& p, const Sph) {
-    return PosSph(sqrt(pow_2(p.x)+pow_2(p.y)+pow_2(p.z)),
-        math::atan2(sqrt(pow_2(p.x) + pow_2(p.y)), p.z), math::atan2(p.y, p.x));
-}
-template<> PosSph toPos(const PosCyl& p, const Sph) {
-    return PosSph(sqrt(pow_2(p.R) + pow_2(p.z)), math::atan2(p.R, p.z), p.phi);
-}
 template<> PosCyl toPos(const PosProlSph& p, const Cyl) {
     if(fabs(p.nu)>p.coordsys.Delta2 || p.lambda<p.coordsys.Delta2)
         throw std::invalid_argument("Incorrect ProlSph coordinates");
