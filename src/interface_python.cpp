@@ -3066,29 +3066,35 @@ static PyObject* Potential_potential_device_impl(
     }
     const T* in_data = static_cast<const T*>(PyArray_DATA(in_arr));
 
-    // Working buffer for xyz scaled into internal units (length 3*N).
-    // Allocated fresh so we never modify the user's input.
-    std::vector<T> xyz_internal(N * 3);
+    // Working buffer for xyz scaled into internal units (length 3*N), allocated
+    // ONLY when lengthUnit != 1. Default unit system has lengthUnit=1, so we
+    // can pass the user's input array directly without copy-and-scale --
+    // saving an N*3 element host loop and ~10ms at N=4M.
     const T L = static_cast<T>(conv->lengthUnit);
-    for(npy_intp i = 0; i < N * 3; i++)
-        xyz_internal[i] = in_data[i] * L;
-    Py_DECREF(in_arr);
+    std::vector<T> xyz_internal;  // empty unless needed
+    const T* xyz_to_use = in_data;
+    if(L != T(1)) {
+        xyz_internal.resize(N * 3);
+        for(npy_intp i = 0; i < N * 3; i++)
+            xyz_internal[i] = in_data[i] * L;
+        xyz_to_use = xyz_internal.data();
+    }
 
     // Output array (1D length-N, or 0D scalar for single_point).
     npy_intp out_dims[1] = { N };
     PyObject* out_obj = single_point
         ? PyArray_EMPTY(0, NULL, npy_typenum, 0)
         : PyArray_EMPTY(1, out_dims, npy_typenum, 0);
-    if(!out_obj)
-        return NULL;
+    if(!out_obj) { Py_DECREF(in_arr); return NULL; }
     T* out_data = static_cast<T*>(PyArray_DATA((PyArrayObject*)out_obj));
 
     // Dispatch into the GPU-routed code (potential_gpu.cpp). Releases GIL for the
     // duration; the underlying forall<Cuda> launch is blocking via cudaStreamSynchronize.
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = potential::evalPotentialGPU<T>(pot, N, xyz_internal.data(), out_data, device_str);
+    rc = potential::evalPotentialGPU<T>(pot, N, xyz_to_use, out_data, device_str);
     Py_END_ALLOW_THREADS
+    Py_DECREF(in_arr);  // safe to release here (after evalPotentialGPU has consumed xyz_to_use)
 
     if(rc != potential::POT_GPU_OK) {
         Py_DECREF(out_obj);
@@ -3117,9 +3123,13 @@ static PyObject* Potential_potential_device_impl(
     }
 
     // Convert Phi from internal units (where Phi has units of velocity^2) to user units.
-    const T invV2 = static_cast<T>(1.0 / pow_2(conv->velocityUnit));
-    for(npy_intp i = 0; i < N; i++)
-        out_data[i] *= invV2;
+    // Skip the host loop when velocityUnit == 1 (the default unit system).
+    const double V2 = pow_2(conv->velocityUnit);
+    if(V2 != 1.0) {
+        const T invV2 = static_cast<T>(1.0 / V2);
+        for(npy_intp i = 0; i < N; i++)
+            out_data[i] *= invV2;
+    }
     return out_obj;
 }
 
