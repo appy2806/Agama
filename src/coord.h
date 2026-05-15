@@ -35,6 +35,8 @@ The fundamental routines operating on these structures are the following:
   in different coordinate systems.
 */
 #pragma once
+
+#include "gpu_device.h"   // AGAMA_DEVICE_INLINE macro
 #include "math_base.h"
 
 /** Classes and routines for representing position/velocity points,
@@ -75,58 +77,58 @@ enum SymmetryType{
 };
 
 /** test for symmetry w.r.t.change of sign in x */
-inline bool isXReflSymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isXReflSymmetric(const SymmetryType sym) {
     return (sym & ST_XREFLECTION) == ST_XREFLECTION;
 }
 
 /** test for symmetry w.r.t.change of sign in y */
-inline bool isYReflSymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isYReflSymmetric(const SymmetryType sym) {
     return (sym & ST_YREFLECTION) == ST_YREFLECTION;
 }
 
 /** test for symmetry w.r.t.change of sign in z */
-inline bool isZReflSymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isZReflSymmetric(const SymmetryType sym) {
     return (sym & ST_ZREFLECTION) == ST_ZREFLECTION;
 }
 
 /** test for symmetry w.r.t.mirror reflection */
-inline bool isReflSymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isReflSymmetric(const SymmetryType sym) {
     return (sym & ST_REFLECTION) == ST_REFLECTION;
 }
 
 /** test for rotational symmetry about z axis */
-inline bool isZRotSymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isZRotSymmetric(const SymmetryType sym) {
     return (sym & ST_ZROTATION) == ST_ZROTATION;
 }
 
 /** test for rotational symmetry about any axis (implies spherical symmetry) */
-inline bool isRotSymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isRotSymmetric(const SymmetryType sym) {
     return (sym & ST_ROTATION) == ST_ROTATION;
 }
 
 /** test for symmetry under xy-reflection */
-inline bool isBisymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isBisymmetric(const SymmetryType sym) {
     return (sym & ST_BISYMMETRIC) == ST_BISYMMETRIC;
 }
 
 /** test for triaxial symmetry (reflection about any of the three principal planes) */
-inline bool isTriaxial(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isTriaxial(const SymmetryType sym) {
     return (sym & ST_TRIAXIAL) == ST_TRIAXIAL;
 }
 
 /** test for axisymmetry in the 'common definition'
     (i.e., invariance under rotation about z axis and under change of sign in z) */
-inline bool isAxisymmetric(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isAxisymmetric(const SymmetryType sym) {
     return (sym & ST_AXISYMMETRIC) == ST_AXISYMMETRIC;
 }
 
 /** test for spherical symmetry */
-inline bool isSpherical(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isSpherical(const SymmetryType sym) {
     return (sym & ST_SPHERICAL) == ST_SPHERICAL;
 }
 
 /** test for unknown/invalid symmetry */
-inline bool isUnknown(const SymmetryType sym) {
+AGAMA_DEVICE_INLINE bool isUnknown(const SymmetryType sym) {
     return sym<0 || sym>ST_SPHERICAL;
 }
 
@@ -647,28 +649,28 @@ template<typename CoordT>
 void combine(HessT<CoordT>& A, const HessT<CoordT>& B, double a=1, double b=1);
 
 template<>
-inline void clear(GradCar& grad) { grad.dx = grad.dy = grad.dz = 0; }
+AGAMA_DEVICE_INLINE void clear(GradCar& grad) { grad.dx = grad.dy = grad.dz = 0; }
 
 template<>
-inline void clear(GradCyl& grad) { grad.dR = grad.dz = grad.dphi = 0; }
+AGAMA_DEVICE_INLINE void clear(GradCyl& grad) { grad.dR = grad.dz = grad.dphi = 0; }
 
 template<>
-inline void clear(GradSph& grad) { grad.dr = grad.dtheta = grad.dphi = 0; }
+AGAMA_DEVICE_INLINE void clear(GradSph& grad) { grad.dr = grad.dtheta = grad.dphi = 0; }
 
 template<>
-inline void clear(HessCar& hess)
+AGAMA_DEVICE_INLINE void clear(HessCar& hess)
 { hess.dx2 = hess.dy2 = hess.dz2 = hess.dxdy = hess.dxdz = hess.dydz = 0; }
 
 template<>
-inline void clear(HessCyl& hess)
+AGAMA_DEVICE_INLINE void clear(HessCyl& hess)
 { hess.dR2 = hess.dz2 = hess.dphi2 = hess.dRdz = hess.dRdphi = hess.dzdphi = 0; }
 
 template<>
-inline void clear(HessSph& hess)
+AGAMA_DEVICE_INLINE void clear(HessSph& hess)
 { hess.dr2 = hess.dtheta2 = hess.dphi2 = hess.drdtheta = hess.drdphi = hess.dthetadphi = 0; }
 
 template<>
-inline void combine(PosVelCar& A, const PosVelCar& B, double a, double b)
+AGAMA_DEVICE_INLINE void combine(PosVelCar& A, const PosVelCar& B, double a, double b)
 {
     A.x  = a * A.x  + b * B.x;
     A.y  = a * A.y  + b * B.y;
@@ -679,7 +681,7 @@ inline void combine(PosVelCar& A, const PosVelCar& B, double a, double b)
 }
 
 template<>
-inline void combine(GradCar& A, const GradCar& B, double a, double b)
+AGAMA_DEVICE_INLINE void combine(GradCar& A, const GradCar& B, double a, double b)
 {
     A.dx = a * A.dx + b * B.dx;
     A.dy = a * A.dy + b * B.dy;
@@ -687,7 +689,7 @@ inline void combine(GradCar& A, const GradCar& B, double a, double b)
 }
 
 template<>
-inline void combine(HessCar& A, const HessCar& B, double a, double b)
+AGAMA_DEVICE_INLINE void combine(HessCar& A, const HessCar& B, double a, double b)
 {
     A.dx2  = a * A.dx2  + b * B.dx2;
     A.dy2  = a * A.dy2  + b * B.dy2;
@@ -698,7 +700,7 @@ inline void combine(HessCar& A, const HessCar& B, double a, double b)
 }
 
 template<>
-inline void combine(GradCyl& A, const GradCyl& B, double a, double b)
+AGAMA_DEVICE_INLINE void combine(GradCyl& A, const GradCyl& B, double a, double b)
 {
     A.dR   = a * A.dR   + b * B.dR;
     A.dz   = a * A.dz   + b * B.dz;
@@ -706,7 +708,7 @@ inline void combine(GradCyl& A, const GradCyl& B, double a, double b)
 }
 
 template<>
-inline void combine(HessCyl& A, const HessCyl& B, double a, double b)
+AGAMA_DEVICE_INLINE void combine(HessCyl& A, const HessCyl& B, double a, double b)
 {
     A.dR2    = a * A.dR2    + b * B.dR2;
     A.dz2    = a * A.dz2    + b * B.dz2;
@@ -717,7 +719,7 @@ inline void combine(HessCyl& A, const HessCyl& B, double a, double b)
 }
 
 template<>
-inline void combine(GradSph& A, const GradSph& B, double a, double b)
+AGAMA_DEVICE_INLINE void combine(GradSph& A, const GradSph& B, double a, double b)
 {
     A.dr     = a * A.dr     + b * B.dr;
     A.dtheta = a * A.dtheta + b * B.dtheta;
@@ -725,7 +727,7 @@ inline void combine(GradSph& A, const GradSph& B, double a, double b)
 }
 
 template<>
-inline void combine(HessSph& A, const HessSph& B, double a, double b)
+AGAMA_DEVICE_INLINE void combine(HessSph& A, const HessSph& B, double a, double b)
 {
     A.dr2        = a * A.dr2        + b * B.dr2;
     A.dtheta2    = a * A.dtheta2    + b * B.dtheta2;
@@ -785,12 +787,12 @@ inline PosVelSph toPosVelSph(const PosVelT<srcCS>& from) { return toPosVel<srcCS
 
 
 /** trivial conversions */
-template<> inline PosCar    toPos   <Car,Car>(const PosCar&    p, const Car) { return p; }
-template<> inline PosCyl    toPos   <Cyl,Cyl>(const PosCyl&    p, const Cyl) { return p; }
-template<> inline PosSph    toPos   <Sph,Sph>(const PosSph&    p, const Sph) { return p; }
-template<> inline PosVelCar toPosVel<Car,Car>(const PosVelCar& p, const Car) { return p; }
-template<> inline PosVelCyl toPosVel<Cyl,Cyl>(const PosVelCyl& p, const Cyl) { return p; }
-template<> inline PosVelSph toPosVel<Sph,Sph>(const PosVelSph& p, const Sph) { return p; }
+template<> AGAMA_DEVICE_INLINE PosCar    toPos   <Car,Car>(const PosCar&    p, const Car) { return p; }
+template<> AGAMA_DEVICE_INLINE PosCyl    toPos   <Cyl,Cyl>(const PosCyl&    p, const Cyl) { return p; }
+template<> AGAMA_DEVICE_INLINE PosSph    toPos   <Sph,Sph>(const PosSph&    p, const Sph) { return p; }
+template<> AGAMA_DEVICE_INLINE PosVelCar toPosVel<Car,Car>(const PosVelCar& p, const Car) { return p; }
+template<> AGAMA_DEVICE_INLINE PosVelCyl toPosVel<Cyl,Cyl>(const PosVelCyl& p, const Cyl) { return p; }
+template<> AGAMA_DEVICE_INLINE PosVelSph toPosVel<Sph,Sph>(const PosVelSph& p, const Sph) { return p; }
 
 ///@}
 /// \name   Routines for conversion between position in different coordinate systems with derivatives
