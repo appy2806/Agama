@@ -10,11 +10,28 @@
 
 namespace potential{
 
-/** Tier 1 leaf math: NFW potential at spherical radius r.
-    Same Pade-approximated body that NFW::evalDeriv uses for the potential output;
-    promoted to a header-inline free function tagged AGAMA_DEVICE_INLINE so it is
-    callable from both CPU and CUDA TUs. POD-only inputs by value -> works inside
-    a captured-by-copy device lambda. */
+// =====================================================================
+// Tier 1 leaf math: Phi-only, AGAMA_DEVICE_INLINE, single-source per class.
+// Each leaf is the same body that the corresponding evalDeriv/evalCar/evalCyl
+// uses for the *potential* output, extracted as a free function so it can be
+// called from both CPU and CUDA TUs. POD-only inputs by value -> safe inside
+// a captured-by-copy device lambda.
+// =====================================================================
+
+/** Plummer:  Phi(r) = -M / sqrt(r^2 + b^2).  Returns 0 when mass=0 (matches CPU). */
+template<typename T>
+AGAMA_DEVICE_INLINE T plummer_phi(T mass, T scaleRadius, T r) {
+    if(mass == T(0)) return T(0);
+    return -mass / std::sqrt(r*r + scaleRadius*scaleRadius);
+}
+
+/** Isochrone:  Phi(r) = -M / (b + sqrt(r^2 + b^2)). */
+template<typename T>
+AGAMA_DEVICE_INLINE T isochrone_phi(T mass, T scaleRadius, T r) {
+    return -mass / (scaleRadius + std::sqrt(r*r + scaleRadius*scaleRadius));
+}
+
+/** NFW:  Phi(r) = -M ln(1+r/r_s) / r, with a Pade(2,3) expansion at r->0. */
 template<typename T>
 AGAMA_DEVICE_INLINE T nfw_phi(T mass, T scaleRadius, T r) {
     T rrel = r / scaleRadius;
@@ -24,6 +41,31 @@ AGAMA_DEVICE_INLINE T nfw_phi(T mass, T scaleRadius, T r) {
         (T(1) + rrel * (T(1) + T(11.0/60.0) * rrel)) /
         (T(1) + rrel * (T(1.5) + rrel * (T(0.6) + rrel * T(0.05)))) / scaleRadius;
     return -mass * ln_over_r;
+}
+
+/** MiyamotoNagai:  Phi(R,z) = -M / sqrt(R^2 + (a + sqrt(z^2+b^2))^2). */
+template<typename T>
+AGAMA_DEVICE_INLINE T miyamoto_nagai_phi(T mass, T scaleRadius, T scaleHeight, T R, T z) {
+    T zb   = std::sqrt(z*z + scaleHeight*scaleHeight);
+    T azb  = scaleRadius + zb;
+    return -mass / std::sqrt(R*R + azb*azb);
+}
+
+/** Logarithmic:  Phi(x,y,z) = 0.5 v0^2 ln( (r_c^2 + x^2 + (y/p)^2 + (z/q)^2) / L^2 ).
+    Parameters are passed already-squared to match the class member layout. */
+template<typename T>
+AGAMA_DEVICE_INLINE T logarithmic_phi(T v0squared, T coreRadius2, T p2, T q2, T lengthUnit2,
+                                      T x, T y, T z)
+{
+    T m2 = coreRadius2 + x*x + (y*y)/p2 + (z*z)/q2;
+    return T(0.5) * v0squared * std::log(m2 / lengthUnit2);
+}
+
+/** Harmonic:  Phi(x,y,z) = 0.5 Omega^2 ( x^2 + (y/p)^2 + (z/q)^2 ).
+    Parameters are passed already-squared to match the class member layout. */
+template<typename T>
+AGAMA_DEVICE_INLINE T harmonic_phi(T Omega2, T p2, T q2, T x, T y, T z) {
+    return T(0.5) * Omega2 * (x*x + (y*y)/p2 + (z*z)/q2);
 }
 
 /** Spherical Plummer potential:
@@ -36,6 +78,19 @@ public:
     static std::string myName() { return "Plummer"; }
     virtual double enclosedMass(const double radius) const;
     virtual double totalMass() const { return mass; }
+
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via plummer_phi leaf. */
+    template<class Policy>
+    inline void evalmanyCar(Policy pol, std::size_t N,
+        const coord::PosCar* in, /*out*/ double* phi) const
+    {
+        const double m = mass, b = scaleRadius;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const coord::PosCar p = in[i];
+            const double r = std::sqrt(pow_2(p.x) + pow_2(p.y) + pow_2(p.z));
+            phi[i] = plummer_phi(m, b, r);
+        });
+    }
 private:
     const double mass;         ///< total mass  (M)
     const double scaleRadius;  ///< scale radius of the Plummer model  (b)
@@ -59,6 +114,19 @@ public:
     static std::string myName() { return "Isochrone"; }
     virtual double totalMass() const { return mass; }
     double getRadius() const { return scaleRadius; }
+
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via isochrone_phi leaf. */
+    template<class Policy>
+    inline void evalmanyCar(Policy pol, std::size_t N,
+        const coord::PosCar* in, /*out*/ double* phi) const
+    {
+        const double m = mass, b = scaleRadius;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const coord::PosCar p = in[i];
+            const double r = std::sqrt(pow_2(p.x) + pow_2(p.y) + pow_2(p.z));
+            phi[i] = isochrone_phi(m, b, r);
+        });
+    }
 private:
     const double mass;         ///< total mass  (M)
     const double scaleRadius;  ///< scale radius of the Isochrone model  (b)
@@ -121,6 +189,20 @@ public:
     virtual std::string name() const { return myName(); }
     static std::string myName() { return "MiyamotoNagai"; }
     virtual double totalMass() const { return mass; }
+
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via miyamoto_nagai_phi leaf.
+        Computes R = sqrt(x^2+y^2) directly (axisymmetric Phi has no phi dependence). */
+    template<class Policy>
+    inline void evalmanyCar(Policy pol, std::size_t N,
+        const coord::PosCar* in, /*out*/ double* phi) const
+    {
+        const double m = mass, a = scaleRadius, b = scaleHeight;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const coord::PosCar p = in[i];
+            const double R = std::sqrt(pow_2(p.x) + pow_2(p.y));
+            phi[i] = miyamoto_nagai_phi(m, a, b, R, p.z);
+        });
+    }
 private:
     const double mass;        ///< total mass  (M)
     const double scaleRadius; ///< scale radius (a),  determines the extent in the disk plane
@@ -174,6 +256,18 @@ public:
     virtual std::string name() const { return myName(); }
     static std::string myName() { return "Logarithmic"; }
     virtual double totalMass() const { return INFINITY; }
+
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via logarithmic_phi leaf. */
+    template<class Policy>
+    inline void evalmanyCar(Policy pol, std::size_t N,
+        const coord::PosCar* in, /*out*/ double* phi) const
+    {
+        const double v2 = v0squared, c2 = coreRadius2, pp = p2, qq = q2, L2 = lengthUnit2;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const coord::PosCar p = in[i];
+            phi[i] = logarithmic_phi(v2, c2, pp, qq, L2, p.x, p.y, p.z);
+        });
+    }
 private:
     const double v0squared;    ///< squared asymptotic circular velocity (v_0)
     const double coreRadius2;  ///< squared core radius (r_c)
@@ -196,6 +290,18 @@ public:
     virtual std::string name() const { return myName(); }
     static std::string myName() { return "Harmonic"; }
     virtual double totalMass() const { return INFINITY; }
+
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via harmonic_phi leaf. */
+    template<class Policy>
+    inline void evalmanyCar(Policy pol, std::size_t N,
+        const coord::PosCar* in, /*out*/ double* phi) const
+    {
+        const double w2 = Omega2, pp = p2, qq = q2;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const coord::PosCar p = in[i];
+            phi[i] = harmonic_phi(w2, pp, qq, p.x, p.y, p.z);
+        });
+    }
 private:
     const double Omega2;       ///< squared oscillation frequency (Omega)
     const double p2;           ///< squared y/x axis ratio (p)
