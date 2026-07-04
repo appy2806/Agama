@@ -81,16 +81,19 @@ public:
 
     /** Tier 1 batch evaluator: Phi at N Cartesian positions via plummer_phi leaf.
         xyz: packed input length 3*N (x0,y0,z0, x1,y1,z1, ...); phi: output length N.
-        Templated on precision T (float or double) and execution policy. */
+        Templated on precision T (float or double) and execution policy.
+        add=true accumulates into phi[] instead of overwriting (composite support);
+        the math is unchanged, only the final store differs (uniform branch). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi) const
+        const T* xyz, /*out*/ T* phi, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
             const T r = std::sqrt(x*x + y*y + z*z);
-            phi[i] = plummer_phi(m, b, r);
+            const T v = plummer_phi(m, b, r);
+            phi[i] = add ? phi[i] + v : v;
         });
     }
 private:
@@ -117,16 +120,18 @@ public:
     virtual double totalMass() const { return mass; }
     double getRadius() const { return scaleRadius; }
 
-    /** Tier 1 batch evaluator: Phi at N Cartesian positions via isochrone_phi leaf. */
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via isochrone_phi leaf.
+        add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi) const
+        const T* xyz, /*out*/ T* phi, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
             const T r = std::sqrt(x*x + y*y + z*z);
-            phi[i] = isochrone_phi(m, b, r);
+            const T v = isochrone_phi(m, b, r);
+            phi[i] = add ? phi[i] + v : v;
         });
     }
 private:
@@ -154,16 +159,18 @@ public:
         For the Cuda policy, `xyz[]` and `phi[]` must be device pointers.
 
         xyz: packed input length 3*N (x0,y0,z0, x1,y1,z1, ...); phi: output length N.
-        Templated on precision T (float or double) and execution policy. */
+        Templated on precision T (float or double) and execution policy.
+        add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi) const
+        const T* xyz, /*out*/ T* phi, bool add = false) const
     {
         const T m = static_cast<T>(mass), rs = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
             const T r = std::sqrt(x*x + y*y + z*z);
-            phi[i] = nfw_phi(m, rs, r);
+            const T v = nfw_phi(m, rs, r);
+            phi[i] = add ? phi[i] + v : v;
         });
     }
 private:
@@ -191,16 +198,18 @@ public:
     virtual double totalMass() const { return mass; }
 
     /** Tier 1 batch evaluator: Phi at N Cartesian positions via miyamoto_nagai_phi leaf.
-        Computes R = sqrt(x^2+y^2) directly (axisymmetric Phi has no phi dependence). */
+        Computes R = sqrt(x^2+y^2) directly (axisymmetric Phi has no phi dependence).
+        add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi) const
+        const T* xyz, /*out*/ T* phi, bool add = false) const
     {
         const T m = static_cast<T>(mass), a = static_cast<T>(scaleRadius), b = static_cast<T>(scaleHeight);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
             const T R = std::sqrt(x*x + y*y);
-            phi[i] = miyamoto_nagai_phi(m, a, b, R, z);
+            const T v = miyamoto_nagai_phi(m, a, b, R, z);
+            phi[i] = add ? phi[i] + v : v;
         });
     }
 private:
@@ -257,16 +266,18 @@ public:
     static std::string myName() { return "Logarithmic"; }
     virtual double totalMass() const { return INFINITY; }
 
-    /** Tier 1 batch evaluator: Phi at N Cartesian positions via logarithmic_phi leaf. */
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via logarithmic_phi leaf.
+        add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi) const
+        const T* xyz, /*out*/ T* phi, bool add = false) const
     {
         const T v2 = static_cast<T>(v0squared), c2 = static_cast<T>(coreRadius2);
         const T pp = static_cast<T>(p2), qq = static_cast<T>(q2), L2 = static_cast<T>(lengthUnit2);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
-            phi[i] = logarithmic_phi(v2, c2, pp, qq, L2, x, y, z);
+            const T v = logarithmic_phi(v2, c2, pp, qq, L2, x, y, z);
+            phi[i] = add ? phi[i] + v : v;
         });
     }
 private:
@@ -292,15 +303,17 @@ public:
     static std::string myName() { return "Harmonic"; }
     virtual double totalMass() const { return INFINITY; }
 
-    /** Tier 1 batch evaluator: Phi at N Cartesian positions via harmonic_phi leaf. */
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via harmonic_phi leaf.
+        add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi) const
+        const T* xyz, /*out*/ T* phi, bool add = false) const
     {
         const T w2 = static_cast<T>(Omega2), pp = static_cast<T>(p2), qq = static_cast<T>(q2);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
-            phi[i] = harmonic_phi(w2, pp, qq, x, y, z);
+            const T v = harmonic_phi(w2, pp, qq, x, y, z);
+            phi[i] = add ? phi[i] + v : v;
         });
     }
 private:

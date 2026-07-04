@@ -241,6 +241,22 @@ public:
             n_ = n;
         }
     }
+    /** Ensure the device buffer holds at least `n` elements, never shrink.
+        Idempotent when n <= current size: pointer + capacity unchanged.
+        NOTE: growth is free-then-realloc, NOT in-place -- existing contents
+        are DISCARDED whenever the buffer actually grows. That is fine for the
+        intended use (persistent scratch buffers that are fully overwritten by
+        from_host / a kernel before every read), but do not use reserve() on a
+        buffer whose contents must survive the growth. */
+    void reserve(std::size_t n) {
+        if (n <= n_) return;
+        // Exception safety: null out d_/n_ BEFORE the malloc (which may throw,
+        // e.g. GPU OOM), so a failed growth leaves the array validly empty
+        // instead of dangling at the freed old buffer (mirrors resize()).
+        if (d_) { cudaFree(d_); d_ = nullptr; n_ = 0; }
+        AGAMA_CUDA_CHECK(cudaMalloc(&d_, n * sizeof(T)));
+        n_ = n;
+    }
     void from_host(const T* h, std::size_t n) {
         AGAMA_CUDA_CHECK(cudaMemcpy(d_, h, n * sizeof(T), cudaMemcpyHostToDevice));
     }
@@ -262,6 +278,7 @@ public:
     device_array() = default;
     explicit device_array(std::size_t n) : v_(n) {}
     void resize(std::size_t n) { v_.resize(n); }
+    void reserve(std::size_t n) { if (n > v_.size()) v_.resize(n); }  // CPU fallback: grow-only
     void from_host(const T* h, std::size_t n) {
         if (n > v_.size()) v_.resize(n);
         std::copy(h, h + n, v_.begin());

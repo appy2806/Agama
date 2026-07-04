@@ -26,3 +26,4 @@ pending_tasks.md
 # Python egg-info / build artifacts from pip install
 agama_migrate.egg-info/
 build/
+local_notes/

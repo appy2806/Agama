@@ -37,6 +37,8 @@
 #include <stdexcept>
 #include <complex>
 #include <algorithm>
+#include <cstring>   // std::strcmp (CAI passthrough path)
+#include <cstdint>   // uintptr_t  (CAI device-pointer round-trip)
 #ifdef _OPENMP
 #include "omp.h"
 #endif
@@ -3029,6 +3031,37 @@ public:
     }
 };
 
+/// Translate a PotentialGPUResult error code (potential_gpu.h) into the
+/// corresponding Python exception. Shared by the host (numpy) and
+/// device-resident (__cuda_array_interface__) entry paths.
+static void Potential_gpu_set_error(int rc, const char* device_str,
+                                    const potential::BasePotential& pot)
+{
+    switch(rc) {
+        case potential::POT_GPU_EBADDEV:
+            PyErr_Format(PyExc_ValueError,
+                "potential(device='%s'): unknown device; use 'cpu', 'openmp', 'serial', or 'cuda'",
+                device_str);
+            break;
+        case potential::POT_GPU_ENOTBUILT:
+            PyErr_SetString(PyExc_RuntimeError,
+                "potential(device='cuda'): library built without CUDA support; "
+                "recompile with HAVE_CUDA=1");
+            break;
+        case potential::POT_GPU_EUNSUPP:
+            // For a Composite this names the first non-GPU-capable member
+            // (with its component index) rather than the joined composite name.
+            PyErr_Format(PyExc_NotImplementedError,
+                "potential(device='%s'): not supported for potential type '%s'",
+                device_str, potential::unsupportedGPUPotentialName(pot).c_str());
+            break;
+        default:
+            PyErr_Format(PyExc_RuntimeError,
+                "potential(device='%s'): unknown error (rc=%d)", device_str, rc);
+            break;
+    }
+}
+
 /// Templated device-path implementation for `pot.potential(xyz, device=..., dtype=...)`.
 /// Returns NULL on error (with a Python exception set), or the output numpy array on success.
 /// Caller must already have validated the device kwarg presence and parsed `device_str`.
@@ -3090,35 +3123,30 @@ static PyObject* Potential_potential_device_impl(
 
     // Dispatch into the GPU-routed code (potential_gpu.cpp). Releases GIL for the
     // duration; the underlying forall<Cuda> launch is blocking via cudaStreamSynchronize.
-    int rc;
+    // C++ exceptions (AGAMA_CUDA_CHECK throws std::runtime_error on e.g. GPU OOM)
+    // must NOT propagate through Py_BEGIN/END_ALLOW_THREADS -- that would skip the
+    // GIL re-acquisition and abort the interpreter -- so catch inside the block and
+    // re-raise as a Python exception after the GIL is restored.
+    int rc = potential::POT_GPU_OK;
+    std::string errmsg;
     Py_BEGIN_ALLOW_THREADS
-    rc = potential::evalPotentialGPU<T>(pot, N, xyz_to_use, out_data, device_str);
+    try {
+        rc = potential::evalPotentialGPU<T>(pot, N, xyz_to_use, out_data, device_str);
+    }
+    catch(std::exception& ex) {
+        errmsg = ex.what();
+    }
     Py_END_ALLOW_THREADS
     Py_DECREF(in_arr);  // safe to release here (after evalPotentialGPU has consumed xyz_to_use)
 
+    if(!errmsg.empty()) {
+        Py_DECREF(out_obj);
+        PyErr_SetString(PyExc_RuntimeError, errmsg.c_str());
+        return NULL;
+    }
     if(rc != potential::POT_GPU_OK) {
         Py_DECREF(out_obj);
-        switch(rc) {
-            case potential::POT_GPU_EBADDEV:
-                PyErr_Format(PyExc_ValueError,
-                    "potential(device='%s'): unknown device; use 'cpu', 'openmp', or 'cuda'",
-                    device_str);
-                break;
-            case potential::POT_GPU_ENOTBUILT:
-                PyErr_SetString(PyExc_RuntimeError,
-                    "potential(device='cuda'): library built without CUDA support; "
-                    "recompile with HAVE_CUDA=1");
-                break;
-            case potential::POT_GPU_EUNSUPP:
-                PyErr_Format(PyExc_NotImplementedError,
-                    "potential(device='%s'): not supported for potential type '%s'",
-                    device_str, pot.name().c_str());
-                break;
-            default:
-                PyErr_Format(PyExc_RuntimeError,
-                    "potential(device='%s'): unknown error (rc=%d)", device_str, rc);
-                break;
-        }
+        Potential_gpu_set_error(rc, device_str, pot);
         return NULL;
     }
 
@@ -3131,6 +3159,289 @@ static PyObject* Potential_potential_device_impl(
             out_data[i] *= invV2;
     }
     return out_obj;
+}
+
+// ---------------------------------------------------------------------------
+// Phase B: __cuda_array_interface__ (CAI) passthrough.
+// Device-resident input (CuPy et al.) skips H2D/D2H entirely: the kernel in
+// potential_gpu.cpp runs directly on the caller's device pointer, and the
+// result is returned as a freshly allocated CuPy array (CuPy in -> CuPy out).
+// ---------------------------------------------------------------------------
+
+/// Lazily imported & cached `cupy` module, needed to allocate device-resident
+/// output arrays. Returns a borrowed reference, or NULL with a Python
+/// RuntimeError set if CuPy is not importable.
+static PyObject* Potential_get_cupy()
+{
+    static PyObject* cupy = NULL;   // intentionally immortal (module cache)
+    if(!cupy) {
+        cupy = PyImport_ImportModule("cupy");
+        if(!cupy) {
+            PyErr_Clear();
+            PyErr_SetString(PyExc_RuntimeError,
+                "potential(device='cuda'): input is device-resident "
+                "(__cuda_array_interface__), so the output must be allocated on the "
+                "device, which requires CuPy -- but `import cupy` failed. "
+                "Install CuPy, or pass a host (numpy) array instead.");
+            return NULL;
+        }
+    }
+    return cupy;
+}
+
+/// Fetch obj.__cuda_array_interface__['data'][0] as a device pointer.
+/// Returns false with a Python exception set on any structural problem.
+static bool Potential_cai_data_ptr(PyObject* cai, void** ptr_out)
+{
+    PyObject* data_obj = PyDict_GetItemString(cai, "data");   // borrowed
+    if(!data_obj || !PyTuple_Check(data_obj) || PyTuple_GET_SIZE(data_obj) != 2) {
+        PyErr_SetString(PyExc_TypeError,
+            "__cuda_array_interface__['data'] must be a (pointer, readonly) tuple");
+        return false;
+    }
+    unsigned long long p = PyLong_AsUnsignedLongLong(PyTuple_GET_ITEM(data_obj, 0));
+    if(PyErr_Occurred())
+        return false;
+    *ptr_out = reinterpret_cast<void*>(static_cast<uintptr_t>(p));
+    return true;
+}
+
+/// Templated tail of the CAI path: allocate a CuPy output array of the right
+/// shape/dtype, run the kernel on the caller's device pointer, return the
+/// CuPy array. All structural validation (shape, strides, dtype, units,
+/// device string) was done by the non-template caller below.
+template<typename T>
+static PyObject* Potential_potential_cai_impl(
+    const potential::BasePotential& pot,
+    const void* in_ptr,            // caller's device pointer, C-contiguous 3*N T's
+    npy_intp N,
+    bool single_point,
+    unsigned long long input_stream,
+    const char* device_str)        // always "cuda" here; kept for error messages
+{
+    PyObject* cupy = Potential_get_cupy();
+    if(!cupy)
+        return NULL;
+
+    // out = cupy.empty(shape, dtype) -- shape is () for a (3,) input, mirroring
+    // the numpy path's 0-d scalar output, or (N,) otherwise.
+    PyObject* shape_tuple = single_point
+        ? PyTuple_New(0)
+        : Py_BuildValue("(n)", (Py_ssize_t)N);
+    if(!shape_tuple)
+        return NULL;
+    PyObject* out_obj = PyObject_CallMethod(cupy, "empty", "Os",
+        shape_tuple, sizeof(T) == 8 ? "float64" : "float32");
+    Py_DECREF(shape_tuple);
+    if(!out_obj)
+        return NULL;
+
+    // Extract the output array's own device pointer through its CAI dict.
+    PyObject* out_cai = PyObject_GetAttrString(out_obj, "__cuda_array_interface__");
+    if(!out_cai) {
+        Py_DECREF(out_obj);
+        return NULL;
+    }
+    void* out_ptr = NULL;
+    bool ok;
+    if(!PyDict_Check(out_cai)) {
+        PyErr_SetString(PyExc_TypeError,
+            "cupy.empty() returned an array whose __cuda_array_interface__ is not a dict");
+        ok = false;
+    } else
+        ok = Potential_cai_data_ptr(out_cai, &out_ptr);
+    Py_DECREF(out_cai);
+    if(!ok) {
+        Py_DECREF(out_obj);
+        return NULL;
+    }
+
+    // Run the kernel directly on the two device pointers; GIL released for the
+    // duration. evalPotentialGPUDevice synchronizes before returning, so the
+    // CuPy output array is fully written when we hand it back.
+    // C++ exceptions (AGAMA_CUDA_CHECK throws std::runtime_error on e.g. a garbage
+    // CAI 'stream' handle or a stale device pointer) must NOT propagate through
+    // Py_BEGIN/END_ALLOW_THREADS -- that would skip the GIL re-acquisition and
+    // abort the interpreter -- so catch inside the block and re-raise as a Python
+    // exception after the GIL is restored.
+    int rc = potential::POT_GPU_OK;
+    std::string errmsg;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+        rc = potential::evalPotentialGPUDevice<T>(
+            pot, N, static_cast<const T*>(in_ptr), static_cast<T*>(out_ptr), input_stream);
+    }
+    catch(std::exception& ex) {
+        errmsg = ex.what();
+    }
+    Py_END_ALLOW_THREADS
+
+    if(!errmsg.empty()) {
+        Py_DECREF(out_obj);
+        PyErr_SetString(PyExc_RuntimeError, errmsg.c_str());
+        return NULL;
+    }
+    if(rc != potential::POT_GPU_OK) {
+        Py_DECREF(out_obj);
+        Potential_gpu_set_error(rc, device_str, pot);
+        return NULL;
+    }
+    return out_obj;
+}
+
+/// Parse and validate a `__cuda_array_interface__` dict attached to the xyz
+/// argument of pot.potential(xyz, device='cuda'), then dispatch to the
+/// templated impl above. Returns NULL with a Python exception set on error.
+/// `dtype_given` / `npy_typenum` describe the optional dtype kwarg: when the
+/// kwarg is absent, T is inferred from the array's typestr (the dtype follows
+/// the device array -- unlike the numpy path's float64 default).
+static PyObject* Potential_potential_cai(
+    const potential::BasePotential& pot,
+    PyObject* cai,                 // the (owned-by-caller) CAI dict
+    const char* device_str,
+    bool dtype_given,
+    int npy_typenum)
+{
+    if(std::strcmp(device_str, "cuda") != 0) {
+        PyErr_Format(PyExc_TypeError,
+            "potential(device='%s'): device-resident input (an object exposing "
+            "__cuda_array_interface__) requires device='cuda'; for CPU paths copy it "
+            "to host first, e.g. xyz.get()", device_str);
+        return NULL;
+    }
+    if(!PyDict_Check(cai)) {
+        PyErr_SetString(PyExc_TypeError,
+            "__cuda_array_interface__ must be a dict");
+        return NULL;
+    }
+
+    // -- shape: must be (N,3) or (3,) ------------------------------------
+    PyObject* shape_obj = PyDict_GetItemString(cai, "shape");   // borrowed
+    if(!shape_obj || !PyTuple_Check(shape_obj)) {
+        PyErr_SetString(PyExc_TypeError,
+            "__cuda_array_interface__['shape'] must be a tuple");
+        return NULL;
+    }
+    const Py_ssize_t ndim = PyTuple_GET_SIZE(shape_obj);
+    bool single_point = false;
+    npy_intp N = 0;
+    Py_ssize_t dims[2] = {0, 0};
+    for(Py_ssize_t d = 0; d < ndim && d < 2; d++) {
+        dims[d] = PyLong_AsSsize_t(PyTuple_GET_ITEM(shape_obj, d));
+        if(PyErr_Occurred())
+            return NULL;
+        if(dims[d] < 0) {
+            PyErr_SetString(PyExc_TypeError,
+                "__cuda_array_interface__['shape'] contains a negative dimension");
+            return NULL;
+        }
+    }
+    if(ndim == 1 && dims[0] == 3) {
+        single_point = true;
+        N = 1;
+    } else if(ndim == 2 && dims[1] == 3) {
+        N = dims[0];
+    } else {
+        PyErr_SetString(PyExc_TypeError,
+            "potential(device='cuda'): device-resident input must have shape (N,3) "
+            "or (3,)");
+        return NULL;
+    }
+
+    // -- typestr: '<f8' or '<f4' -> element type T ------------------------
+    PyObject* typestr_obj = PyDict_GetItemString(cai, "typestr");   // borrowed
+    if(!typestr_obj || !PyUnicode_Check(typestr_obj)) {
+        PyErr_SetString(PyExc_TypeError,
+            "__cuda_array_interface__['typestr'] must be a string");
+        return NULL;
+    }
+    const char* typestr = PyUnicode_AsUTF8(typestr_obj);
+    if(!typestr)
+        return NULL;   // unlikely (encoding failure); error already set
+    int cai_typenum;
+    if(std::strcmp(typestr, "<f8") == 0)
+        cai_typenum = NPY_DOUBLE;
+    else if(std::strcmp(typestr, "<f4") == 0)
+        cai_typenum = NPY_FLOAT;
+    else {
+        PyErr_Format(PyExc_TypeError,
+            "potential(device='cuda'): device-resident input has typestr '%s'; only "
+            "'<f8' (float64) and '<f4' (float32) are supported -- cast on device first "
+            "(e.g. xyz.astype(...))", typestr);
+        return NULL;
+    }
+    // dtype kwarg, when present, must match the device array's dtype: we never
+    // cast device-side data behind the user's back.
+    if(dtype_given && npy_typenum != cai_typenum) {
+        PyErr_Format(PyExc_TypeError,
+            "potential(dtype=...): requested dtype %s but the device-resident input "
+            "is %s; no device-side cast is performed -- cast the array on device "
+            "(xyz.astype(...)) or drop the dtype kwarg to follow the input's dtype",
+            npy_typenum == NPY_FLOAT ? "float32" : "float64",
+            cai_typenum == NPY_FLOAT ? "float32" : "float64");
+        return NULL;
+    }
+    const Py_ssize_t itemsize = cai_typenum == NPY_DOUBLE ? 8 : 4;
+
+    // -- strides: None, absent, or exactly C-contiguous -------------------
+    PyObject* strides_obj = PyDict_GetItemString(cai, "strides");   // borrowed
+    if(strides_obj && strides_obj != Py_None) {
+        bool contig = PyTuple_Check(strides_obj) && PyTuple_GET_SIZE(strides_obj) == ndim;
+        if(contig) {
+            Py_ssize_t expect[2] = { ndim == 2 ? 3 * itemsize : itemsize, itemsize };
+            for(Py_ssize_t d = 0; d < ndim; d++) {
+                Py_ssize_t s = PyLong_AsSsize_t(PyTuple_GET_ITEM(strides_obj, d));
+                if(PyErr_Occurred())
+                    return NULL;
+                if(s != expect[d])
+                    contig = false;
+            }
+        }
+        if(!contig) {
+            PyErr_SetString(PyExc_TypeError,
+                "potential(device='cuda'): device-resident input must be C-contiguous; "
+                "use cupy.ascontiguousarray(xyz) first");
+            return NULL;
+        }
+    }
+
+    // -- data: (pointer, readonly) ----------------------------------------
+    void* in_ptr = NULL;
+    if(!Potential_cai_data_ptr(cai, &in_ptr))
+        return NULL;
+    if(!in_ptr && N > 0) {
+        PyErr_SetString(PyExc_TypeError,
+            "__cuda_array_interface__['data'] pointer is NULL but the shape is non-empty");
+        return NULL;
+    }
+
+    // -- stream (CAI v3, optional): producer stream handle -----------------
+    unsigned long long input_stream = 0;
+    PyObject* stream_obj = PyDict_GetItemString(cai, "stream");   // borrowed
+    if(stream_obj && stream_obj != Py_None) {
+        input_stream = PyLong_AsUnsignedLongLong(stream_obj);
+        if(PyErr_Occurred())
+            return NULL;
+    }
+
+    // -- unit systems: v1 limitation --------------------------------------
+    // The host path scales xyz by lengthUnit on the way in and Phi by
+    // 1/velocityUnit^2 on the way out; doing that for device-resident data
+    // would need an extra kernel (or fusing the scale into every evaluator).
+    // The default unit system has lengthUnit == velocityUnit == 1.
+    if(conv->lengthUnit != 1 || conv->velocityUnit != 1) {
+        PyErr_SetString(PyExc_NotImplementedError,
+            "potential(device='cuda'): device-resident input is not yet supported "
+            "with a non-trivial unit system (agama.setUnits); use the default unit "
+            "system or pass a host (numpy) array");
+        return NULL;
+    }
+
+    return cai_typenum == NPY_FLOAT
+        ? Potential_potential_cai_impl<float >(pot, in_ptr, N, single_point,
+                                               input_stream, device_str)
+        : Potential_potential_cai_impl<double>(pot, in_ptr, N, single_point,
+                                               input_stream, device_str);
 }
 
 PyObject* Potential_potential(PyObject* self, PyObject* args, PyObject* namedArgs)
@@ -3176,6 +3487,23 @@ PyObject* Potential_potential(PyObject* self, PyObject* args, PyObject* namedArg
             if(PyTuple_Check(args) && PyTuple_Size(args) == 1)
                 xyz_obj = PyTuple_GET_ITEM(args, 0);
             const potential::BasePotential& pot = *((PotentialObject*)self)->pot;
+            // Phase B: device-resident input? Probe for __cuda_array_interface__
+            // BEFORE any numpy coercion (which would trigger an implicit D2H
+            // copy or fail outright). Input-type-driven dispatch: presence of
+            // the attribute selects the zero-copy passthrough path.
+            PyObject* cai = PyObject_GetAttrString(xyz_obj, "__cuda_array_interface__");
+            if(cai) {
+                PyObject* result = Potential_potential_cai(
+                    pot, cai, device_str, /*dtype_given*/ dtype_obj != NULL, npy_typenum);
+                Py_DECREF(cai);
+                return result;
+            }
+            // Only an AttributeError means "not a device array -- take the host
+            // path"; anything else (e.g. an exception raised by a property
+            // getter) is a real error and must propagate to the caller.
+            if(!PyErr_ExceptionMatches(PyExc_AttributeError))
+                return NULL;
+            PyErr_Clear();   // attribute absent: ordinary host-array path
             return npy_typenum == NPY_FLOAT
                 ? Potential_potential_device_impl<float >(pot, xyz_obj, device_str, NPY_FLOAT)
                 : Potential_potential_device_impl<double>(pot, xyz_obj, device_str, NPY_DOUBLE);
