@@ -64,6 +64,7 @@
 #include "potential_multipole.h"
 #include "potential_utils.h"
 #include "orbit.h"
+#include "orbit_gpu.h"   // integrateOrbitsGPU<T>, ORBIT_GPU_* result codes (Tier 3 batch path)
 #include "orbit_variational.h"
 #include "units.h"
 #include "utils.h"
@@ -8200,6 +8201,16 @@ static const char* docstringOrbit =
     "usually somewhat more efficient than dop853), or 'hermite' (4th order, might be more efficient "
     "in the regime of low accuracy, but only works in static potentials).\n"
     "  verbose (optional, default True):  whether to display progress when integrating multiple orbits.\n"
+    "  device (optional, string):  execution backend for the batch trajectory path: "
+    "'cpu'/'openmp' (all-core CPU), 'serial' (single-thread baseline), or 'cuda' "
+    "(GPU, one thread per orbit; requires a HAVE_CUDA=1 build). When given, all orbits are "
+    "integrated in a single batch call sharing the same DOP853 core as the default path; "
+    "only plain trajectory output is supported (trajsize >= 1, identical for all orbits; "
+    "no targets/der/lyapunov/Omega/method). The potential must be GPU-capable (analytic types "
+    "or a Composite of them), otherwise NotImplementedError is raised. Integration precision "
+    "is float64 by default; passing dtype=float32 (or complex64) explicitly opts the "
+    "integration itself into fp32 (useful on consumer GPUs with throttled fp64). "
+    "When device is omitted, the legacy per-orbit CPU code path is used, unchanged.\n"
     "Returns:\n"
     "  depending on the arguments, one or a tuple of several data containers (one for each target, "
     "plus an extra one for trajectories if trajsize>0, plus another one for deviation vectors "
@@ -8282,13 +8293,16 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
     int verbose  = 1;
     int dtype = NPY_FLOAT;
     PyObject *ic_obj = NULL, *time_obj = NULL, *timestart_obj = NULL, *pot_obj = NULL,
-        *targets_obj = NULL, *trajsize_obj = NULL, *dtype_obj = NULL, *method_obj = NULL;
+        *targets_obj = NULL, *trajsize_obj = NULL, *dtype_obj = NULL, *method_obj = NULL,
+        *device_obj = NULL;
     static const char* keywords[] =
         {"ic", "time", "timestart", "potential", "targets", "trajsize", "der",
-        "lyapunov", "Omega", "accuracy", "maxNumSteps", "dtype", "method", "verbose", NULL};
-    if(!PyArg_ParseTupleAndKeywords(args, namedArgs, "|OOOOOOiiddiOOi", const_cast<char**>(keywords),
+        "lyapunov", "Omega", "accuracy", "maxNumSteps", "dtype", "method", "verbose",
+        "device", NULL};
+    if(!PyArg_ParseTupleAndKeywords(args, namedArgs, "|OOOOOOiiddiOOiO", const_cast<char**>(keywords),
         &ic_obj, &time_obj, &timestart_obj, &pot_obj, &targets_obj, &trajsize_obj, &haveDer, &haveLyap,
-        &Omega, &params.accuracy, &params.maxNumSteps, &dtype_obj, &method_obj, &verbose))
+        &Omega, &params.accuracy, &params.maxNumSteps, &dtype_obj, &method_obj, &verbose,
+        &device_obj))
         return NULL;
 
     // check if deviation vectors are needed (if yes, the output contains yet another array)
@@ -8324,6 +8338,21 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
         PyErr_SetString(PyExc_TypeError, "Argument 'verbose' must be a boolean or an int 0/1");
         return NULL;
     }
+
+    // choice of the execution backend (Tier 3 batch path); absent = legacy CPU code path
+    std::string deviceStr;
+    if(device_obj != NULL && device_obj != Py_None) {
+        deviceStr = toString(device_obj);
+        if(!(deviceStr == "cpu" || deviceStr == "openmp" ||
+             deviceStr == "serial" || deviceStr == "cuda"))
+        {
+            PyErr_Format(PyExc_ValueError,
+                "orbit(device='%s'): unknown device; use 'cpu', 'openmp', 'serial', or 'cuda'",
+                deviceStr.c_str());
+            return NULL;
+        }
+    }
+    bool useDevice = !deviceStr.empty();
 
     // unit-convert the pattern speed
     Omega /= conv->timeUnit;
@@ -8460,6 +8489,43 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
         haveTraj = true;
     }
 
+    // Tier 3 batch path (device=...): reject the feature combinations it does not cover.
+    // The batch kernel integrates plain trajectories only, sampled at a fixed number of
+    // regular intervals identical for all orbits, with the default DOP853 integrator in
+    // an inertial frame. Everything else stays on the legacy CPU code path.
+    if(useDevice) {
+        const char* unsupported =
+            numTargets > 0 ? "targets" :
+            haveDer          ? "der=True" :
+            haveLyap         ? "lyapunov=True" :
+            Omega != 0       ? "a rotating frame (Omega != 0)" :
+            params.method != orbit::OrbitIntParams::DOP853 ? "method other than 'dop853'" :
+            dtype == NPY_OBJECT ? "dtype=object" :
+            !haveTraj        ? "output without trajsize" : NULL;
+        if(!unsupported) {
+            for(npy_intp i=0; i<numOrbits; i++)
+                if(trajSizes[i] != trajSizes[0]) {
+                    unsupported = "per-orbit trajsize values";
+                    break;
+                }
+        }
+        if(!unsupported && trajSizes[0] < 1)
+            unsupported = "trajsize=0 (recording at every internal timestep)";
+        if(unsupported) {
+            PyErr_Format(PyExc_NotImplementedError,
+                "orbit(device='%s') does not support %s; "
+                "omit the device argument to use the legacy CPU code path",
+                deviceStr.c_str(), unsupported);
+            return NULL;
+        }
+    }
+    // Integration precision on the device path: double by default; an EXPLICIT 32-bit
+    // dtype (float32/complex64) opts into fp32 integration (the storage dtype already
+    // is 32-bit in both cases -- the legacy path also integrates in double and merely
+    // stores float32, which is what an absent dtype keeps meaning here).
+    bool deviceFp32 = useDevice && dtype_obj != NULL && dtype_obj != Py_None &&
+        (dtype == NPY_FLOAT || dtype == NPY_CFLOAT);
+
     // the output is one or more Numpy arrays:
     // each target corresponds to a NumPy array where the collected information for all orbits is stored,
     // plus optionally an array containing the trajectories of all orbits if they are requested,
@@ -8529,7 +8595,86 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
     // finally, run the orbit integration
     volatile npy_intp numCompleted = 0;
     std::string errorMessage;
-    if(!fail) {
+    if(!fail && useDevice) {
+        // ---- Tier 3 batch path: all orbits in one integrateOrbitsGPU call
+        // (one thread per orbit under the Serial / OpenMP / Cuda backend).
+        // The flat sample buffer is converted back into orbit::Trajectory
+        // objects and handed to the same createOrbit() as the legacy path,
+        // so the output format and unit conversion are identical by construction.
+        const npy_intp trajsize = trajSizes[0];   // validated: uniform and >= 1
+        std::vector<double> icFlat((size_t)numOrbits * 6), trajFlat;
+        for(npy_intp i=0; i<numOrbits; i++)
+            initCond[i].unpack_to(&icFlat[i*6]);
+        int rc = orbit::ORBIT_GPU_OK;
+        {
+            PyReleaseGIL unlock;
+            // exceptions (e.g. CUDA errors) must not escape through the
+            // GIL-released region -- captured and re-raised after it
+            try{
+                trajFlat.resize((size_t)numOrbits * trajsize * 6);
+                if(deviceFp32) {
+                    std::vector<float> trajF((size_t)numOrbits * trajsize * 6);
+                    rc = orbit::integrateOrbitsGPU<float>(*pot, numOrbits, icFlat.data(),
+                        timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
+                        trajF.data(), deviceStr.c_str());
+                    for(size_t j=0; j<trajF.size(); j++)
+                        trajFlat[j] = trajF[j];
+                } else
+                    rc = orbit::integrateOrbitsGPU<double>(*pot, numOrbits, icFlat.data(),
+                        timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
+                        trajFlat.data(), deviceStr.c_str());
+            }
+            catch(std::exception& ex) {
+                errorMessage = ex.what();
+                fail = true;
+            }
+        }
+        if(!fail && rc != orbit::ORBIT_GPU_OK) {
+            switch(rc) {
+                case orbit::ORBIT_GPU_ENOTBUILT:
+                    PyErr_SetString(PyExc_RuntimeError,
+                        "orbit(device='cuda'): library built without CUDA support; "
+                        "recompile with HAVE_CUDA=1");
+                    break;
+                case orbit::ORBIT_GPU_EUNSUPP:
+                    // for a Composite this names the first non-GPU-capable member
+                    PyErr_Format(PyExc_NotImplementedError,
+                        "orbit(device='%s'): not supported for potential type '%s'",
+                        deviceStr.c_str(),
+                        potential::unsupportedGPUPotentialName(*pot).c_str());
+                    break;
+                default:   // EBADDEV is pre-validated above, so this is unreachable
+                    PyErr_Format(PyExc_RuntimeError,
+                        "orbit(device='%s'): unknown error (rc=%d)", deviceStr.c_str(), rc);
+                    break;
+            }
+            fail = true;   // the cleanup below respects an already-set Python error
+        }
+        if(!fail) {
+            PyReleaseGIL unlock;   // createOrbit re-acquires the GIL where needed
+            for(npy_intp orb = 0; orb < numOrbits && !fail; orb++) {
+                const double sgn = timetotal[orb] >= 0 ? +1 : -1;
+                const double interval = trajsize > 1 ?
+                    fabs(timetotal[orb]) / (trajsize - 1) : 0;
+                orbit::Trajectory traj((size_t)trajsize);
+                for(npy_intp j = 0; j < trajsize; j++) {
+                    const double* w = &trajFlat[((size_t)orb * trajsize + j) * 6];
+                    traj[j].first  = coord::PosVelCar(w[0], w[1], w[2], w[3], w[4], w[5]);
+                    // sample times replicate RuntimeTrajectory: t0 + sign*interval*j;
+                    // a single sample (trajsize=1) holds the final state
+                    traj[j].second = trajsize == 1 ? timestart[orb] + timetotal[orb] :
+                        timestart[orb] + sgn * interval * j;
+                }
+                PyObject** output = static_cast<PyObject**>(
+                    PyArray_DATA(result_arrays[0])) + orb * result_numCols[0];
+                if(!createOrbit(dtype, traj, /*Omega*/ 0., /*outputTime*/ true,
+                    /*normFactor*/ 1., output))
+                    fail = true;
+                ++numCompleted;
+            }
+        }
+    }
+    else if(!fail) {
         // the GIL must be released when running an OpenMP-parallelized loop
         // in which we may call Python C API functions from different threads;
         // these functions will temporarily re-acquire GIL in their respective threads

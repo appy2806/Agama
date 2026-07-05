@@ -366,6 +366,10 @@ public:
             rho[i] = add ? rho[i] + v : v;
         });
     }
+
+    /** Export constructor parameters for the GPU force descriptor (Tier 3);
+        layout consumed by gpu_term_phi_acc in potential_descriptor.h. */
+    void gpuTermParams(double p[]) const { p[0] = mass;  p[1] = scaleRadius; }
 private:
     const double mass;         ///< total mass  (M)
     const double scaleRadius;  ///< scale radius of the Plummer model  (b)
@@ -438,6 +442,10 @@ public:
             rho[i] = add ? rho[i] + v : v;
         });
     }
+
+    /** Export constructor parameters for the GPU force descriptor (Tier 3);
+        layout consumed by gpu_term_phi_acc in potential_descriptor.h. */
+    void gpuTermParams(double p[]) const { p[0] = mass;  p[1] = scaleRadius; }
 private:
     const double mass;         ///< total mass  (M)
     const double scaleRadius;  ///< scale radius of the Isochrone model  (b)
@@ -512,6 +520,10 @@ public:
             rho[i] = add ? rho[i] + v : v;
         });
     }
+
+    /** Export constructor parameters for the GPU force descriptor (Tier 3);
+        layout consumed by gpu_term_phi_acc in potential_descriptor.h. */
+    void gpuTermParams(double p[]) const { p[0] = mass;  p[1] = scaleRadius; }
 private:
     const double mass;         ///< normalization factor  (M);  equals to mass enclosed within ~5.3r_s
     const double scaleRadius;  ///< scale radius of the NFW model  (r_s)
@@ -587,6 +599,11 @@ public:
             rho[i] = add ? rho[i] + v : v;
         });
     }
+
+    /** Export constructor parameters for the GPU force descriptor (Tier 3);
+        layout consumed by gpu_term_phi_acc in potential_descriptor.h. */
+    void gpuTermParams(double p[]) const
+    { p[0] = mass;  p[1] = scaleRadius;  p[2] = scaleHeight; }
 private:
     const double mass;        ///< total mass  (M)
     const double scaleRadius; ///< scale radius (a),  determines the extent in the disk plane
@@ -689,6 +706,11 @@ public:
             rho[i] = add ? rho[i] + v : v;
         });
     }
+
+    /** Export constructor parameters for the GPU force descriptor (Tier 3);
+        layout consumed by gpu_term_phi_acc in potential_descriptor.h. */
+    void gpuTermParams(double p[]) const
+    { p[0] = v0squared;  p[1] = coreRadius2;  p[2] = p2;  p[3] = q2;  p[4] = lengthUnit2; }
 private:
     const double v0squared;    ///< squared asymptotic circular velocity (v_0)
     const double coreRadius2;  ///< squared core radius (r_c)
@@ -757,6 +779,10 @@ public:
             rho[i] = add ? rho[i] + v : v;
         });
     }
+
+    /** Export constructor parameters for the GPU force descriptor (Tier 3);
+        layout consumed by gpu_term_phi_acc in potential_descriptor.h. */
+    void gpuTermParams(double p[]) const { p[0] = Omega2;  p[1] = p2;  p[2] = q2; }
 private:
     const double Omega2;       ///< squared oscillation frequency (Omega)
     const double p2;           ///< squared y/x axis ratio (p)

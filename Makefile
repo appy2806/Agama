@@ -111,12 +111,15 @@ endef
 $(foreach tu,$(CUDA_TUS),$(eval $(call CUDA_TU_RULE,$(tu))))
 endif
 
-# GPU-policy smoke test. Compiled through nvcc so that the kernel-launch syntax
-# in src/gpu_policy.h is parseable. Links against agama.so for the Tier 1+ class
-# parity checks (NFW.evalmanyCar, etc.) — the class vtable lives in agama.so.
-ifdef HAVE_CUDA
+# GPU-policy smoke test. Always part of 'all': in a CPU-only build the generic
+# $(EXEDIR)/%.exe pattern rule compiles it with $(CXX) (Serial/OpenMP paths and
+# the Tier 3 batch-orbit checks run without a CUDA toolchain). Under HAVE_CUDA=1
+# the explicit rule below takes precedence and routes it through nvcc so that
+# the kernel-launch syntax in src/gpu_policy.h is parseable. Links against
+# agama.so for the class parity checks (NFW.evalmanyCar, etc.).
 all: $(EXEDIR)/test_gpu_policy.exe
 
+ifdef HAVE_CUDA
 $(EXEDIR)/test_gpu_policy.exe: $(TESTSDIR)/test_gpu_policy.cpp $(LIBNAME_SHARED)
 	@mkdir -p $(EXEDIR)
 	$(NVCC) $(NVCC_FLAGS_ALL) -x cu "$<" -o "$@" -L. -l:$(LIBNAME_SHARED) -L$(CUDA_LIBDIR) -lcudart -Xlinker -rpath -Xlinker '$$ORIGIN'

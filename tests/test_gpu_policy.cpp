@@ -14,6 +14,10 @@
 #include "math_sphharm.h"        // for math::trigMultiAngle (Tier 0 device-inline leaf)
 #include "coord.h"               // toPos<Car,Cyl>, toPos<Car,Sph> (Tier 0 Phase 2 device-inline)
 #include "potential_analytic.h"  // potential::NFW + nfw_phi leaf (Tier 1 worked example)
+#include "potential_composite.h"    // Composite for the Tier 3 orbit workload
+#include "potential_descriptor.h"   // GpuPotDesc + gpu_desc_phi_acc (Tier 3 force descriptor)
+#include "orbit.h"                  // orbit::integrateTraj (CPU reference integrator)
+#include "orbit_gpu.h"              // orbit::integrateOrbitsGPU (Tier 3 batch path)
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -80,6 +84,9 @@ double time_ms_min(int trials, F fn) {
 // Templated forall + reduce timing harness — runs the same workload for any T.
 // Important on RTX 30xx/L40 (Ada/Ampere consumer) because fp64:fp32 throughput is 1:64;
 // the fp32 path is the realistic one for GPU acceleration on those cards.
+// HAVE_CUDA-gated: references the Cuda policy, which does not exist in CPU-only builds
+// (and g++ rejects the unknown identifier even in this uninstantiated template).
+#ifdef HAVE_CUDA
 template<typename T>
 void run_perf_T(int trials, std::size_t N, const char* tname) {
     using namespace agama;
@@ -126,6 +133,7 @@ void run_perf_T(int trials, std::size_t N, const char* tname) {
     std::printf("  reduce results: Serial=%.6f  OpenMP=%.6f  Cuda=%.6f\n",
         double(rs), double(ro), double(rc));
 }
+#endif  // HAVE_CUDA (run_perf_T)
 }  // namespace
 
 int main() {
@@ -182,6 +190,171 @@ int main() {
     for(std::size_t p = 0; p < NP; ++p) {
         const double phi = (p + 0.5) * (2.0 * 3.14159265358979323846 / NP);
         math::trigMultiAngle(phi, MM, /*needSine=*/true, &trig_s[p * 2 * MM]);
+    }
+
+    // =====================================================================
+    // Tier 3: GPU force descriptor + batch orbit integration.
+    // (a) gpu_desc_phi_acc vs the virtual Composite::eval at scattered points
+    //     (locks the tagged-union glue against the class path);
+    // (b) integrateOrbitsGPU 'serial' vs the CPU class integrator
+    //     (orbit::integrateTraj) -- same DOP853 core, different force-eval
+    //     glue, so trajectories agree to a slowly-growing tolerance, and
+    //     energy is conserved to the integrator accuracy;
+    // (c) [HAVE_CUDA] 'cuda' vs 'serial' parity + fp32 sanity.
+    // The composite (Plummer bulge + MiyamotoNagai disk + NFW halo) mirrors
+    // the stream-modelling workload of local_notes/crosscheck_orbits.py.
+    // =====================================================================
+    {
+        std::vector<potential::PtrPotential> comps;
+        comps.push_back(potential::PtrPotential(new potential::Plummer(0.1, 0.3)));
+        comps.push_back(potential::PtrPotential(new potential::MiyamotoNagai(0.5, 1.0, 0.3)));
+        comps.push_back(potential::PtrPotential(new potential::NFW(10.0, 5.0)));
+        potential::Composite pot(comps);
+
+        // ----- (a) descriptor-vs-virtual force parity -----
+        potential::GpuPotDesc<double> desc;
+        bool ok_desc = potential::buildGpuPotDesc(pot, desc);
+        double max_rel_force = 0;
+        if(ok_desc) {
+            for(int i = 0; i < 256; i++) {
+                const double x = 0.05 + 0.03  * i,
+                             y = -0.4 + 0.021 * (i % 37),
+                             z = -0.2 + 0.013 * (i % 29);
+                double phi_d, acc_d[3];
+                potential::gpu_desc_phi_acc(desc, x, y, z, &phi_d, acc_d);
+                double phi_v;
+                coord::GradCar grad;
+                pot.eval(coord::PosCar(x, y, z), &phi_v, &grad, NULL);
+                const double acc_v[3] = { -grad.dx, -grad.dy, -grad.dz };
+                double scale = std::fabs(phi_v);
+                max_rel_force = std::max(max_rel_force, std::fabs(phi_d - phi_v) / scale);
+                for(int k = 0; k < 3; k++) {
+                    scale = std::max(1e-300, std::fabs(acc_v[k]));
+                    max_rel_force = std::max(max_rel_force,
+                        std::fabs(acc_d[k] - acc_v[k]) / scale);
+                }
+            }
+        }
+        const double DESC_TOL = 1e-13;
+        bool ok_desc_parity = ok_desc && max_rel_force <= DESC_TOL;
+        std::printf("[T3]    force descriptor vs virtual eval (composite, 256 pts): "
+            "max rel err = %.3e, tol = %.1e -> %s\n",
+            max_rel_force, DESC_TOL, ok_desc_parity ? "OK" : "FAIL");
+
+        // ----- (b) batch orbits, 'serial' backend vs the CPU class integrator -----
+        const std::size_t NORB = 64, TRAJ = 16;
+        const double TTOT = 40.0, ACC = 1e-8;
+        std::vector<double> ic(NORB * 6), times(NORB, TTOT);
+        for(std::size_t i = 0; i < NORB; i++) {
+            const double r   = 0.5 + 2.5 * double(i) / NORB;
+            const double ang = 0.7 * i;
+            // roughly circular-speed ICs with a vertical kick, scattered in phase
+            double phi_v;
+            coord::GradCar grad;
+            pot.eval(coord::PosCar(r * std::cos(ang), r * std::sin(ang), 0.05), &phi_v, &grad, NULL);
+            const double vc = std::sqrt(r * std::sqrt(grad.dx*grad.dx + grad.dy*grad.dy));
+            ic[i*6+0] = r * std::cos(ang);
+            ic[i*6+1] = r * std::sin(ang);
+            ic[i*6+2] = 0.05;
+            ic[i*6+3] = -vc * std::sin(ang) * 0.9;
+            ic[i*6+4] =  vc * std::cos(ang) * 0.9;
+            ic[i*6+5] =  0.1 * vc;
+        }
+        std::vector<double> traj_s(NORB * TRAJ * 6);
+        int rc_s = orbit::integrateOrbitsGPU<double>(pot, NORB, ic.data(), times.data(),
+            TRAJ, ACC, /*maxNumSteps*/ 100000000, traj_s.data(), "serial");
+        // reference: the ordinary CPU orbit integrator, same sampling
+        double max_rel_orbit = 0;
+        for(std::size_t i = 0; i < NORB; i++) {
+            coord::PosVelCar ic_i(&ic[i*6]);
+            orbit::Trajectory ref = orbit::integrateTraj(ic_i, TTOT,
+                /*samplingInterval*/ TTOT / (TRAJ - 1), pot);
+            if(ref.size() != TRAJ) { max_rel_orbit = INFINITY; break; }
+            for(std::size_t j = 0; j < TRAJ; j++) {
+                double refv[6], scale = 0;
+                ref[j].first.unpack_to(refv);
+                for(int k = 0; k < 6; k++)
+                    scale = std::max(scale, std::fabs(refv[k]));
+                for(int k = 0; k < 6; k++)
+                    max_rel_orbit = std::max(max_rel_orbit,
+                        std::fabs(traj_s[(i*TRAJ+j)*6+k] - refv[k]) / scale);
+            }
+        }
+        // Two independent 1e-8-accuracy solutions of the same ODE with
+        // ULP-different force glue: the difference grows secularly with time;
+        // 1e-5 over ~10 orbital periods is the expected scale, NOT a bug.
+        const double ORB_TOL = 1e-5;
+        bool ok_orb_serial = rc_s == 0 && max_rel_orbit <= ORB_TOL;
+        std::printf("[T3]    batch orbits 'serial' vs OrbitIntegrator (N=%zu, T=%g, %zu samples): "
+            "max rel err = %.3e, tol = %.1e -> %s\n",
+            NORB, TTOT, TRAJ, max_rel_orbit, ORB_TOL, ok_orb_serial ? "OK" : "FAIL");
+
+        // energy conservation of the batch output (an absolute quality gate
+        // that does not depend on comparing two step sequences)
+        auto energy = [&](const double w[6]) {
+            double phi_v;
+            pot.eval(coord::PosCar(w[0], w[1], w[2]), &phi_v, NULL, NULL);
+            return phi_v + 0.5 * (w[3]*w[3] + w[4]*w[4] + w[5]*w[5]);
+        };
+        double max_dE = 0;
+        for(std::size_t i = 0; i < NORB; i++) {
+            const double E0 = energy(&traj_s[(i*TRAJ+0)*6]);
+            const double E1 = energy(&traj_s[(i*TRAJ+TRAJ-1)*6]);
+            max_dE = std::max(max_dE, std::fabs((E1 - E0) / E0));
+        }
+        const double DE_TOL = 1e-7;
+        bool ok_energy = max_dE <= DE_TOL;
+        std::printf("[T3]    batch orbits 'serial' energy conservation: max |dE/E| = %.3e, "
+            "tol = %.1e -> %s\n", max_dE, DE_TOL, ok_energy ? "OK" : "FAIL");
+
+        bool ok_t3 = ok_desc_parity && ok_orb_serial && ok_energy;
+
+#ifdef HAVE_CUDA
+        // ----- (c) 'cuda' vs 'serial' parity (fp64) + fp32 sanity -----
+        std::vector<double> traj_c(NORB * TRAJ * 6);
+        int rc_c = orbit::integrateOrbitsGPU<double>(pot, NORB, ic.data(), times.data(),
+            TRAJ, ACC, 100000000, traj_c.data(), "cuda");
+        double max_rel_cuda = 0;
+        for(std::size_t i = 0; i < NORB * TRAJ; i++) {
+            double scale = 0;
+            for(int k = 0; k < 6; k++)
+                scale = std::max(scale, std::fabs(traj_s[i*6+k]));
+            for(int k = 0; k < 6; k++)
+                max_rel_cuda = std::max(max_rel_cuda,
+                    std::fabs(traj_c[i*6+k] - traj_s[i*6+k]) / scale);
+        }
+        bool ok_orb_cuda = rc_c == 0 && max_rel_cuda <= ORB_TOL;
+        std::printf("[CUDA]  batch orbits 'cuda' vs 'serial' (fp64): max rel err = %.3e, "
+            "tol = %.1e -> %s\n", max_rel_cuda, ORB_TOL, ok_orb_cuda ? "OK" : "FAIL");
+
+        // fp32: integration quality is limited by single precision; gate on
+        // energy conservation at a loose tolerance and absence of NaNs
+        std::vector<float> traj_f(NORB * TRAJ * 6);
+        int rc_f = orbit::integrateOrbitsGPU<float>(pot, NORB, ic.data(), times.data(),
+            TRAJ, /*accuracy*/ 1e-5, 100000000, traj_f.data(), "cuda");
+        double max_dE_f = 0;
+        bool nan_f = false;
+        for(std::size_t i = 0; i < NORB; i++) {
+            double w0[6], w1[6];
+            for(int k = 0; k < 6; k++) {
+                w0[k] = traj_f[(i*TRAJ+0)*6+k];
+                w1[k] = traj_f[(i*TRAJ+TRAJ-1)*6+k];
+                nan_f |= w0[k] != w0[k] || w1[k] != w1[k];
+            }
+            if(nan_f) break;
+            max_dE_f = std::max(max_dE_f, std::fabs((energy(w1) - energy(w0)) / energy(w0)));
+        }
+        const double DE_TOL_F = 1e-2;
+        bool ok_orb_f = rc_f == 0 && !nan_f && max_dE_f <= DE_TOL_F;
+        std::printf("[CUDA]  batch orbits 'cuda' fp32 sanity: max |dE/E| = %.3e, tol = %.1e, "
+            "NaN: %s -> %s\n", max_dE_f, DE_TOL_F, nan_f ? "yes" : "no", ok_orb_f ? "OK" : "FAIL");
+
+        ok_t3 = ok_t3 && ok_orb_cuda && ok_orb_f;
+#endif
+        if(!ok_t3) {
+            std::fprintf(stderr, "FAIL (Tier 3 orbit integration)\n");
+            return 1;
+        }
     }
 
 #ifdef HAVE_CUDA
