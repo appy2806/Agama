@@ -2049,8 +2049,21 @@ public:
     }
 };
 
+/// GPU-routed device-kwarg path for dens.density(xyz, device=..., dtype=...);
+/// defined further below, after the GPU batch helpers it depends on.
+static PyObject* Density_density_gpu(PyObject* self, PyObject* args,
+    PyObject* namedArgs, PyObject* device_obj);
+
 PyObject* Density_density(PyObject* self, PyObject* args, PyObject* namedArgs)
 {
+    // device kwarg -> templated batch density path (potential_gpu.cpp),
+    // mirroring pot.potential(xyz, device=..., dtype=...). Works for both
+    // Density and Potential python objects (Potential subclasses Density).
+    if(namedArgs) {
+        PyObject* device_obj = PyDict_GetItemString(namedArgs, "device");
+        if(device_obj)
+            return Density_density_gpu(self, args, namedArgs, device_obj);
+    }
     return FncDensityDensity(args, namedArgs, *((DensityObject*)self)->dens).run(/*chunk*/1024);
 }
 
@@ -3031,46 +3044,98 @@ public:
     }
 };
 
+/// Which batch operation the GPU-routed device path computes. Selects the
+/// eval*GPU entry point in potential_gpu.h, the output shape ((N,) vs (N,3))
+/// and the unit-conversion factor. One parameterized implementation serves
+/// pot.potential / pot.force / pot.density so the CAI helpers, the input
+/// coercion and the error handling stay single-sourced.
+enum GPUEvalOp {
+    GPU_OP_POTENTIAL,  ///< Phi,          output (N,)  or 0-d
+    GPU_OP_FORCE,      ///< a = -grad Phi, output (N,3) or (3,)
+    GPU_OP_DENSITY     ///< rho,          output (N,)  or 0-d
+};
+
+/// Python-visible method name for error messages ("potential"/"force"/"density").
+static const char* GPU_op_name(int op)
+{
+    return op == GPU_OP_FORCE ? "force" : op == GPU_OP_DENSITY ? "density" : "potential";
+}
+
+/// Number of output values per input point (3 for force, 1 otherwise).
+static int GPU_op_width(int op)
+{
+    return op == GPU_OP_FORCE ? 3 : 1;
+}
+
+/// Output unit-conversion factor (multiplies the internal-unit result):
+/// Phi is in velocity^2, force per unit mass in V/T, density in M/L^3 --
+/// the same conversions the legacy FncPotentialPotential / FncPotentialForce /
+/// FncDensityDensity loops apply. Equals 1 in the default unit system.
+static double GPU_op_out_factor(int op)
+{
+    switch(op) {
+        case GPU_OP_FORCE:   return 1 / (conv->velocityUnit / conv->timeUnit);
+        case GPU_OP_DENSITY: return 1 / (conv->massUnit / pow_3(conv->lengthUnit));
+        default:             return 1 / pow_2(conv->velocityUnit);
+    }
+}
+
 /// Translate a PotentialGPUResult error code (potential_gpu.h) into the
 /// corresponding Python exception. Shared by the host (numpy) and
-/// device-resident (__cuda_array_interface__) entry paths.
+/// device-resident (__cuda_array_interface__) entry paths of all three ops.
 static void Potential_gpu_set_error(int rc, const char* device_str,
-                                    const potential::BasePotential& pot)
+                                    const potential::BasePotential& pot, int op)
 {
+    const char* opname = GPU_op_name(op);
     switch(rc) {
         case potential::POT_GPU_EBADDEV:
             PyErr_Format(PyExc_ValueError,
-                "potential(device='%s'): unknown device; use 'cpu', 'openmp', 'serial', or 'cuda'",
-                device_str);
+                "%s(device='%s'): unknown device; use 'cpu', 'openmp', 'serial', or 'cuda'",
+                opname, device_str);
             break;
         case potential::POT_GPU_ENOTBUILT:
-            PyErr_SetString(PyExc_RuntimeError,
-                "potential(device='cuda'): library built without CUDA support; "
-                "recompile with HAVE_CUDA=1");
+            PyErr_Format(PyExc_RuntimeError,
+                "%s(device='cuda'): library built without CUDA support; "
+                "recompile with HAVE_CUDA=1", opname);
             break;
         case potential::POT_GPU_EUNSUPP:
             // For a Composite this names the first non-GPU-capable member
             // (with its component index) rather than the joined composite name.
             PyErr_Format(PyExc_NotImplementedError,
-                "potential(device='%s'): not supported for potential type '%s'",
-                device_str, potential::unsupportedGPUPotentialName(pot).c_str());
+                "%s(device='%s'): not supported for potential type '%s'",
+                opname, device_str, potential::unsupportedGPUPotentialName(pot).c_str());
             break;
         default:
             PyErr_Format(PyExc_RuntimeError,
-                "potential(device='%s'): unknown error (rc=%d)", device_str, rc);
+                "%s(device='%s'): unknown error (rc=%d)", opname, device_str, rc);
             break;
     }
 }
 
-/// Templated device-path implementation for `pot.potential(xyz, device=..., dtype=...)`.
+/// Route to the op-appropriate host-pointer entry point in potential_gpu.h.
+/// `out` is the phi/rho buffer (length N) or the packed acc buffer (length 3N).
+template<typename T>
+static int Potential_gpu_eval_host(const potential::BasePotential& pot,
+    std::size_t N, const T* xyz, T* out, const char* device_str, int op)
+{
+    switch(op) {
+        case GPU_OP_FORCE:   return potential::evalForceGPU<T>  (pot, N, xyz, out, device_str);
+        case GPU_OP_DENSITY: return potential::evalDensityGPU<T>(pot, N, xyz, out, device_str);
+        default:             return potential::evalPotentialGPU<T>(pot, N, xyz, out, device_str);
+    }
+}
+
+/// Templated host-array (numpy) implementation for
+/// `pot.{potential,force,density}(xyz, device=..., dtype=...)`.
 /// Returns NULL on error (with a Python exception set), or the output numpy array on success.
 /// Caller must already have validated the device kwarg presence and parsed `device_str`.
 template<typename T>
-static PyObject* Potential_potential_device_impl(
+static PyObject* Potential_batch_device_impl(
     const potential::BasePotential& pot,
     PyObject* xyz_obj,
     const char* device_str,
-    int npy_typenum)  // NPY_DOUBLE or NPY_FLOAT
+    int npy_typenum,  // NPY_DOUBLE or NPY_FLOAT
+    int op)           // a GPUEvalOp value
 {
     // Coerce input to the chosen dtype + C-contiguous Nx3 (or 1D-length-3 single point).
     // FORCECAST is required to allow lossy down-casts like float64->float32; the user
@@ -3081,8 +3146,9 @@ static PyObject* Potential_potential_device_impl(
     if(!in_arr) {
         // numpy may have set a more specific error; only override if it didn't.
         if(!PyErr_Occurred())
-            PyErr_SetString(PyExc_TypeError,
-                "potential(device=...): input must be a Nx3 array or a 3-element 1D array");
+            PyErr_Format(PyExc_TypeError,
+                "%s(device=...): input must be a Nx3 array or a 3-element 1D array",
+                GPU_op_name(op));
         return NULL;
     }
     bool single_point = false;
@@ -3093,8 +3159,9 @@ static PyObject* Potential_potential_device_impl(
         N = PyArray_DIM(in_arr, 0);
     } else {
         Py_DECREF(in_arr);
-        PyErr_SetString(PyExc_TypeError,
-            "potential(device=...): input must be a Nx3 array or a 3-element 1D array");
+        PyErr_Format(PyExc_TypeError,
+            "%s(device=...): input must be a Nx3 array or a 3-element 1D array",
+            GPU_op_name(op));
         return NULL;
     }
     const T* in_data = static_cast<const T*>(PyArray_DATA(in_arr));
@@ -3113,11 +3180,21 @@ static PyObject* Potential_potential_device_impl(
         xyz_to_use = xyz_internal.data();
     }
 
-    // Output array (1D length-N, or 0D scalar for single_point).
-    npy_intp out_dims[1] = { N };
-    PyObject* out_obj = single_point
-        ? PyArray_EMPTY(0, NULL, npy_typenum, 0)
-        : PyArray_EMPTY(1, out_dims, npy_typenum, 0);
+    // Output array: (N,) / 0-d scalar for potential & density,
+    // (N,3) / (3,) for force -- matching the legacy output shapes.
+    const int width = GPU_op_width(op);
+    PyObject* out_obj;
+    if(width == 3) {
+        npy_intp dims2[2] = { N, 3 };
+        out_obj = single_point
+            ? PyArray_EMPTY(1, dims2 + 1, npy_typenum, 0)   // (3,)
+            : PyArray_EMPTY(2, dims2,     npy_typenum, 0);  // (N,3)
+    } else {
+        npy_intp dims1[1] = { N };
+        out_obj = single_point
+            ? PyArray_EMPTY(0, NULL,  npy_typenum, 0)       // 0-d
+            : PyArray_EMPTY(1, dims1, npy_typenum, 0);      // (N,)
+    }
     if(!out_obj) { Py_DECREF(in_arr); return NULL; }
     T* out_data = static_cast<T*>(PyArray_DATA((PyArrayObject*)out_obj));
 
@@ -3131,13 +3208,13 @@ static PyObject* Potential_potential_device_impl(
     std::string errmsg;
     Py_BEGIN_ALLOW_THREADS
     try {
-        rc = potential::evalPotentialGPU<T>(pot, N, xyz_to_use, out_data, device_str);
+        rc = Potential_gpu_eval_host<T>(pot, N, xyz_to_use, out_data, device_str, op);
     }
     catch(std::exception& ex) {
         errmsg = ex.what();
     }
     Py_END_ALLOW_THREADS
-    Py_DECREF(in_arr);  // safe to release here (after evalPotentialGPU has consumed xyz_to_use)
+    Py_DECREF(in_arr);  // safe to release here (after the eval has consumed xyz_to_use)
 
     if(!errmsg.empty()) {
         Py_DECREF(out_obj);
@@ -3146,17 +3223,18 @@ static PyObject* Potential_potential_device_impl(
     }
     if(rc != potential::POT_GPU_OK) {
         Py_DECREF(out_obj);
-        Potential_gpu_set_error(rc, device_str, pot);
+        Potential_gpu_set_error(rc, device_str, pot, op);
         return NULL;
     }
 
-    // Convert Phi from internal units (where Phi has units of velocity^2) to user units.
-    // Skip the host loop when velocityUnit == 1 (the default unit system).
-    const double V2 = pow_2(conv->velocityUnit);
-    if(V2 != 1.0) {
-        const T invV2 = static_cast<T>(1.0 / V2);
-        for(npy_intp i = 0; i < N; i++)
-            out_data[i] *= invV2;
+    // Convert the result from internal units to user units (Phi: velocity^2;
+    // force per unit mass: V/T; density: M/L^3 -- the same factors the legacy
+    // per-point loops apply). Skip the host loop in the default unit system.
+    const double F = GPU_op_out_factor(op);
+    if(F != 1.0) {
+        const T Ft = static_cast<T>(F);
+        for(npy_intp i = 0; i < N * width; i++)
+            out_data[i] *= Ft;
     }
     return out_obj;
 }
@@ -3171,18 +3249,18 @@ static PyObject* Potential_potential_device_impl(
 /// Lazily imported & cached `cupy` module, needed to allocate device-resident
 /// output arrays. Returns a borrowed reference, or NULL with a Python
 /// RuntimeError set if CuPy is not importable.
-static PyObject* Potential_get_cupy()
+static PyObject* Potential_get_cupy(int op)
 {
     static PyObject* cupy = NULL;   // intentionally immortal (module cache)
     if(!cupy) {
         cupy = PyImport_ImportModule("cupy");
         if(!cupy) {
             PyErr_Clear();
-            PyErr_SetString(PyExc_RuntimeError,
-                "potential(device='cuda'): input is device-resident "
+            PyErr_Format(PyExc_RuntimeError,
+                "%s(device='cuda'): input is device-resident "
                 "(__cuda_array_interface__), so the output must be allocated on the "
                 "device, which requires CuPy -- but `import cupy` failed. "
-                "Install CuPy, or pass a host (numpy) array instead.");
+                "Install CuPy, or pass a host (numpy) array instead.", GPU_op_name(op));
             return NULL;
         }
     }
@@ -3206,28 +3284,48 @@ static bool Potential_cai_data_ptr(PyObject* cai, void** ptr_out)
     return true;
 }
 
+/// Route to the op-appropriate device-pointer entry point in potential_gpu.h.
+template<typename T>
+static int Potential_gpu_eval_device(const potential::BasePotential& pot,
+    std::size_t N, const T* d_xyz, T* d_out, unsigned long long input_stream, int op)
+{
+    switch(op) {
+        case GPU_OP_FORCE:
+            return potential::evalForceGPUDevice<T>  (pot, N, d_xyz, d_out, input_stream);
+        case GPU_OP_DENSITY:
+            return potential::evalDensityGPUDevice<T>(pot, N, d_xyz, d_out, input_stream);
+        default:
+            return potential::evalPotentialGPUDevice<T>(pot, N, d_xyz, d_out, input_stream);
+    }
+}
+
 /// Templated tail of the CAI path: allocate a CuPy output array of the right
 /// shape/dtype, run the kernel on the caller's device pointer, return the
 /// CuPy array. All structural validation (shape, strides, dtype, units,
 /// device string) was done by the non-template caller below.
 template<typename T>
-static PyObject* Potential_potential_cai_impl(
+static PyObject* Potential_batch_cai_impl(
     const potential::BasePotential& pot,
     const void* in_ptr,            // caller's device pointer, C-contiguous 3*N T's
     npy_intp N,
     bool single_point,
     unsigned long long input_stream,
-    const char* device_str)        // always "cuda" here; kept for error messages
+    const char* device_str,        // always "cuda" here; kept for error messages
+    int op)                        // a GPUEvalOp value
 {
-    PyObject* cupy = Potential_get_cupy();
+    PyObject* cupy = Potential_get_cupy(op);
     if(!cupy)
         return NULL;
 
-    // out = cupy.empty(shape, dtype) -- shape is () for a (3,) input, mirroring
-    // the numpy path's 0-d scalar output, or (N,) otherwise.
-    PyObject* shape_tuple = single_point
-        ? PyTuple_New(0)
-        : Py_BuildValue("(n)", (Py_ssize_t)N);
+    // out = cupy.empty(shape, dtype) -- mirroring the numpy path's output
+    // shapes: potential/density get (N,) or () for a (3,) single point;
+    // force gets (N,3) or (3,).
+    PyObject* shape_tuple =
+        GPU_op_width(op) == 3
+        ? (single_point ? Py_BuildValue("(n)",  (Py_ssize_t)3)
+                        : Py_BuildValue("(nn)", (Py_ssize_t)N, (Py_ssize_t)3))
+        : (single_point ? PyTuple_New(0)
+                        : Py_BuildValue("(n)",  (Py_ssize_t)N));
     if(!shape_tuple)
         return NULL;
     PyObject* out_obj = PyObject_CallMethod(cupy, "empty", "Os",
@@ -3268,8 +3366,9 @@ static PyObject* Potential_potential_cai_impl(
     std::string errmsg;
     Py_BEGIN_ALLOW_THREADS
     try {
-        rc = potential::evalPotentialGPUDevice<T>(
-            pot, N, static_cast<const T*>(in_ptr), static_cast<T*>(out_ptr), input_stream);
+        rc = Potential_gpu_eval_device<T>(
+            pot, N, static_cast<const T*>(in_ptr), static_cast<T*>(out_ptr),
+            input_stream, op);
     }
     catch(std::exception& ex) {
         errmsg = ex.what();
@@ -3283,30 +3382,31 @@ static PyObject* Potential_potential_cai_impl(
     }
     if(rc != potential::POT_GPU_OK) {
         Py_DECREF(out_obj);
-        Potential_gpu_set_error(rc, device_str, pot);
+        Potential_gpu_set_error(rc, device_str, pot, op);
         return NULL;
     }
     return out_obj;
 }
 
 /// Parse and validate a `__cuda_array_interface__` dict attached to the xyz
-/// argument of pot.potential(xyz, device='cuda'), then dispatch to the
-/// templated impl above. Returns NULL with a Python exception set on error.
+/// argument of pot.{potential,force,density}(xyz, device='cuda'), then dispatch
+/// to the templated impl above. Returns NULL with a Python exception set on error.
 /// `dtype_given` / `npy_typenum` describe the optional dtype kwarg: when the
 /// kwarg is absent, T is inferred from the array's typestr (the dtype follows
 /// the device array -- unlike the numpy path's float64 default).
-static PyObject* Potential_potential_cai(
+static PyObject* Potential_batch_cai(
     const potential::BasePotential& pot,
     PyObject* cai,                 // the (owned-by-caller) CAI dict
     const char* device_str,
     bool dtype_given,
-    int npy_typenum)
+    int npy_typenum,
+    int op)                        // a GPUEvalOp value
 {
     if(std::strcmp(device_str, "cuda") != 0) {
         PyErr_Format(PyExc_TypeError,
-            "potential(device='%s'): device-resident input (an object exposing "
+            "%s(device='%s'): device-resident input (an object exposing "
             "__cuda_array_interface__) requires device='cuda'; for CPU paths copy it "
-            "to host first, e.g. xyz.get()", device_str);
+            "to host first, e.g. xyz.get()", GPU_op_name(op), device_str);
         return NULL;
     }
     if(!PyDict_Check(cai)) {
@@ -3342,9 +3442,9 @@ static PyObject* Potential_potential_cai(
     } else if(ndim == 2 && dims[1] == 3) {
         N = dims[0];
     } else {
-        PyErr_SetString(PyExc_TypeError,
-            "potential(device='cuda'): device-resident input must have shape (N,3) "
-            "or (3,)");
+        PyErr_Format(PyExc_TypeError,
+            "%s(device='cuda'): device-resident input must have shape (N,3) "
+            "or (3,)", GPU_op_name(op));
         return NULL;
     }
 
@@ -3365,18 +3465,19 @@ static PyObject* Potential_potential_cai(
         cai_typenum = NPY_FLOAT;
     else {
         PyErr_Format(PyExc_TypeError,
-            "potential(device='cuda'): device-resident input has typestr '%s'; only "
+            "%s(device='cuda'): device-resident input has typestr '%s'; only "
             "'<f8' (float64) and '<f4' (float32) are supported -- cast on device first "
-            "(e.g. xyz.astype(...))", typestr);
+            "(e.g. xyz.astype(...))", GPU_op_name(op), typestr);
         return NULL;
     }
     // dtype kwarg, when present, must match the device array's dtype: we never
     // cast device-side data behind the user's back.
     if(dtype_given && npy_typenum != cai_typenum) {
         PyErr_Format(PyExc_TypeError,
-            "potential(dtype=...): requested dtype %s but the device-resident input "
+            "%s(dtype=...): requested dtype %s but the device-resident input "
             "is %s; no device-side cast is performed -- cast the array on device "
             "(xyz.astype(...)) or drop the dtype kwarg to follow the input's dtype",
+            GPU_op_name(op),
             npy_typenum == NPY_FLOAT ? "float32" : "float64",
             cai_typenum == NPY_FLOAT ? "float32" : "float64");
         return NULL;
@@ -3398,9 +3499,9 @@ static PyObject* Potential_potential_cai(
             }
         }
         if(!contig) {
-            PyErr_SetString(PyExc_TypeError,
-                "potential(device='cuda'): device-resident input must be C-contiguous; "
-                "use cupy.ascontiguousarray(xyz) first");
+            PyErr_Format(PyExc_TypeError,
+                "%s(device='cuda'): device-resident input must be C-contiguous; "
+                "use cupy.ascontiguousarray(xyz) first", GPU_op_name(op));
             return NULL;
         }
     }
@@ -3425,23 +3526,110 @@ static PyObject* Potential_potential_cai(
     }
 
     // -- unit systems: v1 limitation --------------------------------------
-    // The host path scales xyz by lengthUnit on the way in and Phi by
-    // 1/velocityUnit^2 on the way out; doing that for device-resident data
-    // would need an extra kernel (or fusing the scale into every evaluator).
-    // The default unit system has lengthUnit == velocityUnit == 1.
-    if(conv->lengthUnit != 1 || conv->velocityUnit != 1) {
-        PyErr_SetString(PyExc_NotImplementedError,
-            "potential(device='cuda'): device-resident input is not yet supported "
+    // The host path scales xyz by lengthUnit on the way in and the result by
+    // the op-specific output factor on the way out; doing that for
+    // device-resident data would need an extra kernel (or fusing the scale
+    // into every evaluator). The default unit system has all factors == 1.
+    if(conv->lengthUnit != 1 || GPU_op_out_factor(op) != 1) {
+        PyErr_Format(PyExc_NotImplementedError,
+            "%s(device='cuda'): device-resident input is not yet supported "
             "with a non-trivial unit system (agama.setUnits); use the default unit "
-            "system or pass a host (numpy) array");
+            "system or pass a host (numpy) array", GPU_op_name(op));
         return NULL;
     }
 
     return cai_typenum == NPY_FLOAT
-        ? Potential_potential_cai_impl<float >(pot, in_ptr, N, single_point,
-                                               input_stream, device_str)
-        : Potential_potential_cai_impl<double>(pot, in_ptr, N, single_point,
-                                               input_stream, device_str);
+        ? Potential_batch_cai_impl<float >(pot, in_ptr, N, single_point,
+                                           input_stream, device_str, op)
+        : Potential_batch_cai_impl<double>(pot, in_ptr, N, single_point,
+                                           input_stream, device_str, op);
+}
+
+/// Shared device-kwarg entry for pot.{potential,force,density}(xyz, device=..., dtype=...).
+/// Called only when the `device` kwarg is present (namedArgs non-NULL, device_obj
+/// the kwarg's value). Parses device & dtype, probes for a device-resident
+/// (__cuda_array_interface__) input and routes to the CAI or the host impl.
+static PyObject* Potential_batch_gpu_entry(
+    const potential::BasePotential& pot,
+    PyObject* args, PyObject* namedArgs, PyObject* device_obj, int op)
+{
+    const char* device_str = PyUnicode_AsUTF8(device_obj);
+    if(!device_str) {
+        PyErr_Format(PyExc_TypeError,
+            "%s(device=...): device must be a string", GPU_op_name(op));
+        return NULL;
+    }
+    // Parse optional `dtype` kwarg; defaults to numpy.float64 (Pythonic default).
+    int npy_typenum = NPY_DOUBLE;
+    PyObject* dtype_obj = PyDict_GetItemString(namedArgs, "dtype");
+    if(dtype_obj) {
+        PyArray_Descr* descr = NULL;
+        if(!PyArray_DescrConverter(dtype_obj, &descr)) {
+            PyErr_Format(PyExc_TypeError,
+                "%s(dtype=...): not a valid numpy dtype", GPU_op_name(op));
+            return NULL;
+        }
+        npy_typenum = descr->type_num;
+        Py_DECREF(descr);
+        if(npy_typenum != NPY_DOUBLE && npy_typenum != NPY_FLOAT) {
+            PyErr_Format(PyExc_TypeError,
+                "%s(dtype=...): only numpy.float64 (default) and "
+                "numpy.float32 are supported on the device path", GPU_op_name(op));
+            return NULL;
+        }
+    }
+    // The positional xyz argument: args is a tuple (xyz,) or (xyz, ...).
+    // We accept either a single positional arg or treat args itself as the input
+    // (matches the existing BatchFunction behavior).
+    PyObject* xyz_obj = args;
+    if(PyTuple_Check(args) && PyTuple_Size(args) == 1)
+        xyz_obj = PyTuple_GET_ITEM(args, 0);
+    // Phase B: device-resident input? Probe for __cuda_array_interface__
+    // BEFORE any numpy coercion (which would trigger an implicit D2H
+    // copy or fail outright). Input-type-driven dispatch: presence of
+    // the attribute selects the zero-copy passthrough path.
+    PyObject* cai = PyObject_GetAttrString(xyz_obj, "__cuda_array_interface__");
+    if(cai) {
+        PyObject* result = Potential_batch_cai(
+            pot, cai, device_str, /*dtype_given*/ dtype_obj != NULL, npy_typenum, op);
+        Py_DECREF(cai);
+        return result;
+    }
+    // Only an AttributeError means "not a device array -- take the host
+    // path"; anything else (e.g. an exception raised by a property
+    // getter) is a real error and must propagate to the caller.
+    if(!PyErr_ExceptionMatches(PyExc_AttributeError))
+        return NULL;
+    PyErr_Clear();   // attribute absent: ordinary host-array path
+    return npy_typenum == NPY_FLOAT
+        ? Potential_batch_device_impl<float >(pot, xyz_obj, device_str, NPY_FLOAT,  op)
+        : Potential_batch_device_impl<double>(pot, xyz_obj, device_str, NPY_DOUBLE, op);
+}
+
+/// Deferred definition (declared above Density_density): the device-kwarg path
+/// of dens.density(xyz, device=..., dtype=...). `self` may be a Density or a
+/// Potential python object (identical layout, see DensityObject/PotentialObject);
+/// the GPU batch dispatch requires the underlying C++ object to be a
+/// BasePotential from the GPU-capable list, so a plain Density (or a
+/// non-migrated potential) raises NotImplementedError.
+static PyObject* Density_density_gpu(PyObject* self, PyObject* args,
+    PyObject* namedArgs, PyObject* device_obj)
+{
+    const potential::BaseDensity* dens = ((DensityObject*)self)->dens.get();
+    if(!dens) {
+        PyErr_SetString(PyExc_RuntimeError, "Density object is not initialized properly");
+        return NULL;
+    }
+    const potential::BasePotential* pot =
+        dynamic_cast<const potential::BasePotential*>(dens);
+    if(!pot) {
+        PyErr_Format(PyExc_NotImplementedError,
+            "density(device=...): not supported for density type '%s' "
+            "(only GPU-migrated Potential objects); omit the device kwarg "
+            "for the standard CPU path", dens->name().c_str());
+        return NULL;
+    }
+    return Potential_batch_gpu_entry(*pot, args, namedArgs, device_obj, GPU_OP_DENSITY);
 }
 
 PyObject* Potential_potential(PyObject* self, PyObject* args, PyObject* namedArgs)
@@ -3454,60 +3642,9 @@ PyObject* Potential_potential(PyObject* self, PyObject* args, PyObject* namedArg
     // CPU loop (FncPotentialPotential / BatchFunction).
     if(namedArgs) {
         PyObject* device_obj = PyDict_GetItemString(namedArgs, "device");
-        if(device_obj) {
-            const char* device_str = PyUnicode_AsUTF8(device_obj);
-            if(!device_str) {
-                PyErr_SetString(PyExc_TypeError,
-                    "potential(device=...): device must be a string");
-                return NULL;
-            }
-            // Parse optional `dtype` kwarg; defaults to numpy.float64 (Pythonic default).
-            int npy_typenum = NPY_DOUBLE;
-            PyObject* dtype_obj = PyDict_GetItemString(namedArgs, "dtype");
-            if(dtype_obj) {
-                PyArray_Descr* descr = NULL;
-                if(!PyArray_DescrConverter(dtype_obj, &descr)) {
-                    PyErr_SetString(PyExc_TypeError,
-                        "potential(dtype=...): not a valid numpy dtype");
-                    return NULL;
-                }
-                npy_typenum = descr->type_num;
-                Py_DECREF(descr);
-                if(npy_typenum != NPY_DOUBLE && npy_typenum != NPY_FLOAT) {
-                    PyErr_SetString(PyExc_TypeError,
-                        "potential(dtype=...): only numpy.float64 (default) and "
-                        "numpy.float32 are supported on the device path");
-                    return NULL;
-                }
-            }
-            // The positional xyz argument: args is a tuple (xyz,) or (xyz, ...).
-            // We accept either a single positional arg or treat args itself as the input
-            // (matches the existing FncPotentialPotential behavior).
-            PyObject* xyz_obj = args;
-            if(PyTuple_Check(args) && PyTuple_Size(args) == 1)
-                xyz_obj = PyTuple_GET_ITEM(args, 0);
-            const potential::BasePotential& pot = *((PotentialObject*)self)->pot;
-            // Phase B: device-resident input? Probe for __cuda_array_interface__
-            // BEFORE any numpy coercion (which would trigger an implicit D2H
-            // copy or fail outright). Input-type-driven dispatch: presence of
-            // the attribute selects the zero-copy passthrough path.
-            PyObject* cai = PyObject_GetAttrString(xyz_obj, "__cuda_array_interface__");
-            if(cai) {
-                PyObject* result = Potential_potential_cai(
-                    pot, cai, device_str, /*dtype_given*/ dtype_obj != NULL, npy_typenum);
-                Py_DECREF(cai);
-                return result;
-            }
-            // Only an AttributeError means "not a device array -- take the host
-            // path"; anything else (e.g. an exception raised by a property
-            // getter) is a real error and must propagate to the caller.
-            if(!PyErr_ExceptionMatches(PyExc_AttributeError))
-                return NULL;
-            PyErr_Clear();   // attribute absent: ordinary host-array path
-            return npy_typenum == NPY_FLOAT
-                ? Potential_potential_device_impl<float >(pot, xyz_obj, device_str, NPY_FLOAT)
-                : Potential_potential_device_impl<double>(pot, xyz_obj, device_str, NPY_DOUBLE);
-        }
+        if(device_obj)
+            return Potential_batch_gpu_entry(*((PotentialObject*)self)->pot,
+                args, namedArgs, device_obj, GPU_OP_POTENTIAL);
     }
 
     // Legacy path: existing OpenMP-parallelized CPU loop, fp64 output.
@@ -3559,6 +3696,14 @@ public:
 PyObject* Potential_force(PyObject* self, PyObject* args, PyObject* namedArgs) {
     if(!Potential_isCorrect(self))
         return NULL;
+    // device kwarg -> fused Phi+acc batch path (acceleration-only output),
+    // mirroring pot.potential(xyz, device=..., dtype=...).
+    if(namedArgs) {
+        PyObject* device_obj = PyDict_GetItemString(namedArgs, "device");
+        if(device_obj)
+            return Potential_batch_gpu_entry(*((PotentialObject*)self)->pot,
+                args, namedArgs, device_obj, GPU_OP_FORCE);
+    }
     return FncPotentialForce<false>(args, namedArgs, *((PotentialObject*)self)->pot).run(/*chunk*/1024);
 }
 

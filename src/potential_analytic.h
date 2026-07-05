@@ -11,61 +11,294 @@
 namespace potential{
 
 // =====================================================================
-// Tier 1 leaf math: Phi-only, AGAMA_DEVICE_INLINE, single-source per class.
-// Each leaf is the same body that the corresponding evalDeriv/evalCar/evalCyl
-// uses for the *potential* output, extracted as a free function so it can be
-// called from both CPU and CUDA TUs. POD-only inputs by value -> safe inside
-// a captured-by-copy device lambda.
+// Tier 1 leaf math: AGAMA_DEVICE_INLINE, single-source per class.
+// Each <name>_eval leaf is the SAME math as the corresponding CPU
+// evalDeriv/evalCyl/evalCar in potential_analytic.cpp -- the expressions
+// (including Pade/Taylor guard branches) are copied verbatim, and the CPU
+// virtual methods are now thin calls into these leaves, so the values are
+// bit-for-bit identical between the virtual single-point path and the
+// templated batch path. Outputs are nullable pointers, AGAMA's own
+// evalDeriv convention: pass NULL to skip an output (uniform branch, safe
+// on device). POD-only inputs by value -> safe inside a captured-by-copy
+// device lambda.
+//
+// Each <name>_rho leaf mirrors the class's EXISTING density path: the
+// explicit closed-form density override where one exists (Plummer,
+// Isochrone, NFW, MiyamotoNagai), or the Laplacian/Poisson route
+// (sum of Cartesian second derivatives) / (4 pi G) used by the generic
+// BasePotential::densityCar for Logarithmic and Harmonic.
 // =====================================================================
 
-/** Plummer:  Phi(r) = -M / sqrt(r^2 + b^2).  Returns 0 when mass=0 (matches CPU). */
+/** Plummer:  Phi(r) = -M / sqrt(r^2 + b^2), plus dPhi/dr and d2Phi/dr2.
+    Outputs 0 when mass=0 (matches CPU). Null output pointers are skipped. */
+template<typename T>
+AGAMA_DEVICE_INLINE void plummer_eval(T mass, T scaleRadius, T r,
+    T* potential, T* deriv, T* deriv2)
+{
+    T invrsq = mass != T(0) ?  T(1) / (pow_2(r) + pow_2(scaleRadius)) : T(0);  // if mass=0, output 0
+    T pot = -mass * std::sqrt(invrsq);
+    if(potential)
+        *potential = pot;
+    if(deriv)
+        *deriv = -pot * r * invrsq;
+    if(deriv2)
+        *deriv2 = pot * (T(2) * pow_2(r * invrsq) - pow_2(scaleRadius * invrsq));
+}
+
+/** Plummer density (explicit closed form, same as Plummer::densitySph). */
+template<typename T>
+AGAMA_DEVICE_INLINE T plummer_rho(T mass, T scaleRadius, T r) {
+    T invrsq = T(1) / (pow_2(r) + pow_2(scaleRadius));
+    return T(3./4/M_PI) * mass * pow_2(scaleRadius * invrsq) * std::sqrt(invrsq);
+}
+
+/** Plummer:  Phi only (thin wrapper over plummer_eval). */
 template<typename T>
 AGAMA_DEVICE_INLINE T plummer_phi(T mass, T scaleRadius, T r) {
-    if(mass == T(0)) return T(0);
-    return -mass / std::sqrt(r*r + scaleRadius*scaleRadius);
+    T phi;
+    plummer_eval(mass, scaleRadius, r, &phi, (T*)NULL, (T*)NULL);
+    return phi;
 }
 
-/** Isochrone:  Phi(r) = -M / (b + sqrt(r^2 + b^2)). */
+/** Isochrone:  Phi(r) = -M / (b + sqrt(r^2 + b^2)), plus dPhi/dr and d2Phi/dr2. */
+template<typename T>
+AGAMA_DEVICE_INLINE void isochrone_eval(T mass, T scaleRadius, T r,
+    T* potential, T* deriv, T* deriv2)
+{
+    T rb  = std::sqrt(pow_2(r) + pow_2(scaleRadius));
+    T brb = scaleRadius + rb;
+    T pot = -mass / brb;
+    if(potential)
+        *potential = pot;
+    if(deriv)
+        *deriv = -pot * r / (rb * brb);
+    if(deriv2)
+        *deriv2 = pot * (T(2)*pow_2(r / (rb * brb)) -
+            pow_2(scaleRadius / (rb * brb)) * (T(1) + scaleRadius / rb));
+}
+
+/** Isochrone density (explicit closed form, same as Isochrone::densitySph). */
+template<typename T>
+AGAMA_DEVICE_INLINE T isochrone_rho(T mass, T scaleRadius, T r) {
+    T rb  = std::sqrt(pow_2(r) + pow_2(scaleRadius));
+    T brb = scaleRadius + rb;
+    return T(1./4/M_PI) * mass * scaleRadius *
+        (T(3) * scaleRadius * brb + T(2) * pow_2(r)) / pow_3(rb * brb);
+}
+
+/** Isochrone:  Phi only (thin wrapper over isochrone_eval). */
 template<typename T>
 AGAMA_DEVICE_INLINE T isochrone_phi(T mass, T scaleRadius, T r) {
-    return -mass / (scaleRadius + std::sqrt(r*r + scaleRadius*scaleRadius));
+    T phi;
+    isochrone_eval(mass, scaleRadius, r, &phi, (T*)NULL, (T*)NULL);
+    return phi;
 }
 
-/** NFW:  Phi(r) = -M ln(1+r/r_s) / r, with a Pade(2,3) expansion at r->0. */
+/** NFW:  Phi(r) = -M ln(1+r/r_s) / r, plus dPhi/dr and d2Phi/dr2, each with
+    its own accurate Pade expansion at r->0 (thresholds copied from the CPU code). */
 template<typename T>
-AGAMA_DEVICE_INLINE T nfw_phi(T mass, T scaleRadius, T r) {
+AGAMA_DEVICE_INLINE void nfw_eval(T mass, T scaleRadius, T r,
+    T* potential, T* deriv, T* deriv2)
+{
     T rrel = r / scaleRadius;
     T ln_over_r = r == T(INFINITY) ? T(0) :
         rrel > T(0.016) ? std::log(T(1) + rrel) / r :
         // accurate (14 digits) asymptotic Pade(2,3) expansion at r->0
-        (T(1) + rrel * (T(1) + T(11.0/60.0) * rrel)) /
+        (T(1) + rrel * (T(1) + T(11./60) * rrel)) /
         (T(1) + rrel * (T(1.5) + rrel * (T(0.6) + rrel * T(0.05)))) / scaleRadius;
-    return -mass * ln_over_r;
+    if(potential)
+        *potential = -mass * ln_over_r;
+    if(deriv)
+        *deriv = mass * (rrel > T(0.013) ?
+            (ln_over_r - T(1)/(r+scaleRadius)) / r :
+            // accurate (12 digits) asymptotic Pade(1,3) expansion at r->0
+            (T(0.5) + T(17./96) * rrel) /
+            (T(1) + rrel * (T(27./16) + rrel * (T(0.75) + T(11./160) * rrel))) /
+            pow_2(scaleRadius));
+    if(deriv2)
+        *deriv2 = -mass * (rrel > T(0.010) ?
+            (T(2)*ln_over_r - (T(2)*scaleRadius + T(3)*r) / pow_2(scaleRadius+r) ) / pow_2(r) :
+            // accurate (10 digits) asymptotic Pade(2,3) expansion at r->0
+            T(1) / (T(1.5) + rrel * (T(27./8) + rrel * (T(351./160) + T(183./640) * rrel))) /
+            pow_3(scaleRadius) );
 }
 
-/** MiyamotoNagai:  Phi(R,z) = -M / sqrt(R^2 + (a + sqrt(z^2+b^2))^2). */
+/** NFW density (explicit closed form, same as NFW::densitySph). */
+template<typename T>
+AGAMA_DEVICE_INLINE T nfw_rho(T mass, T scaleRadius, T r) {
+    return T(1./4/M_PI) * mass / r / pow_2(r + scaleRadius);
+}
+
+/** NFW:  Phi only (thin wrapper over nfw_eval). */
+template<typename T>
+AGAMA_DEVICE_INLINE T nfw_phi(T mass, T scaleRadius, T r) {
+    T phi;
+    nfw_eval(mass, scaleRadius, r, &phi, (T*)NULL, (T*)NULL);
+    return phi;
+}
+
+/** MiyamotoNagai:  Phi(R,z) = -M / sqrt(R^2 + (a + sqrt(z^2+b^2))^2),
+    plus first (dR, dz) and second (dR2, dz2, dRdz) cylindrical derivatives.
+    dphi-direction derivatives are identically zero (axisymmetric) and not output. */
+template<typename T>
+AGAMA_DEVICE_INLINE void miyamoto_nagai_eval(T mass, T scaleRadius, T scaleHeight, T R, T z,
+    T* potential, T* dR, T* dz, T* dR2, T* dz2, T* dRdz)
+{
+    T zb    = std::sqrt(pow_2(z) + pow_2(scaleHeight));
+    T azb2  = pow_2(scaleRadius + zb);
+    T den2  = T(1) / (pow_2(R) + azb2);
+    T denom = std::sqrt(den2);
+    T Rsc   = R * denom;
+    T zsc   = z * denom;
+    if(potential)
+        *potential = -mass * denom;
+    if(dR)
+        *dR = mass * den2 * Rsc;
+    if(dz)
+        *dz = mass * den2 * zsc * (T(1) + scaleRadius / zb);
+    if(dR2 || dz2 || dRdz) {
+        T mden3 = mass * denom * den2;
+        if(dR2)
+            *dR2  = mden3 * (azb2 * den2 - T(2)*pow_2(Rsc));
+        if(dz2)
+            *dz2  = mden3 * ( (pow_2(Rsc) - T(2) * azb2 * den2) * pow_2(z / zb) +
+                pow_2(scaleHeight) * (T(1) + scaleRadius / zb) * (pow_2(Rsc) + azb2 * den2) / pow_2(zb) );
+        if(dRdz)
+            *dRdz = mden3 * T(-3) * Rsc * zsc * (T(1) + scaleRadius / zb);
+    }
+}
+
+/** MiyamotoNagai density (explicit closed form, same as MiyamotoNagai::densityCyl). */
+template<typename T>
+AGAMA_DEVICE_INLINE T miyamoto_nagai_rho(T mass, T scaleRadius, T scaleHeight, T R, T z) {
+    T zb   = std::sqrt(pow_2(z) + pow_2(scaleHeight));
+    T azb2 = pow_2(scaleRadius + zb), R2azb2 = pow_2(R) + azb2;
+    return T(1./4/M_PI) * mass * pow_2(scaleHeight) *
+        (scaleRadius + T(3)*zb * azb2 / R2azb2) / (pow_3(zb) * R2azb2 * std::sqrt(R2azb2));
+}
+
+/** MiyamotoNagai:  Phi only (thin wrapper over miyamoto_nagai_eval). */
 template<typename T>
 AGAMA_DEVICE_INLINE T miyamoto_nagai_phi(T mass, T scaleRadius, T scaleHeight, T R, T z) {
-    T zb   = std::sqrt(z*z + scaleHeight*scaleHeight);
-    T azb  = scaleRadius + zb;
-    return -mass / std::sqrt(R*R + azb*azb);
+    T phi;
+    miyamoto_nagai_eval(mass, scaleRadius, scaleHeight, R, z,
+        &phi, (T*)NULL, (T*)NULL, (T*)NULL, (T*)NULL, (T*)NULL);
+    return phi;
 }
 
-/** Logarithmic:  Phi(x,y,z) = 0.5 v0^2 ln( (r_c^2 + x^2 + (y/p)^2 + (z/q)^2) / L^2 ).
-    Parameters are passed already-squared to match the class member layout. */
+/** Logarithmic:  Phi(x,y,z) = 0.5 v0^2 ln( (r_c^2 + x^2 + (y/p)^2 + (z/q)^2) / L^2 ),
+    plus the Cartesian gradient (grad[3]: dx,dy,dz) and Hessian
+    (hess[6]: dx2,dy2,dz2,dxdy,dydz,dxdz). Parameters are passed already-squared
+    to match the class member layout. */
+template<typename T>
+AGAMA_DEVICE_INLINE void logarithmic_eval(T v0squared, T coreRadius2, T p2, T q2, T lengthUnit2,
+    T x, T y, T z, T* potential, T* grad, T* hess)
+{
+    T m2 = coreRadius2 + pow_2(x) + pow_2(y)/p2 + pow_2(z)/q2;
+    if(potential)
+        *potential = T(0.5) * v0squared * std::log(m2 / lengthUnit2);
+    if(grad) {
+        grad[0] = x * v0squared/m2;
+        grad[1] = y * v0squared/m2/p2;
+        grad[2] = z * v0squared/m2/q2;
+    }
+    if(hess) {
+        hess[0] = v0squared * (T(1)/m2    - T(2) * pow_2(x / m2));
+        hess[1] = v0squared * (T(1)/m2/p2 - T(2) * pow_2(y / (m2 * p2)));
+        hess[2] = v0squared * (T(1)/m2/q2 - T(2) * pow_2(z / (m2 * q2)));
+        hess[3] =-v0squared * x * y * T(2) / (pow_2(m2) * p2);
+        hess[4] =-v0squared * y * z * T(2) / (pow_2(m2) * p2 * q2);
+        hess[5] =-v0squared * z * x * T(2) / (pow_2(m2) * q2);
+    }
+}
+
+/** Logarithmic density via the Poisson/Laplacian route -- the same
+    (dx2+dy2+dz2)/(4 pi) expression as the generic BasePotential::densityCar,
+    which is what the CPU path uses (the class has no explicit density override). */
+template<typename T>
+AGAMA_DEVICE_INLINE T logarithmic_rho(T v0squared, T coreRadius2, T p2, T q2, T lengthUnit2,
+    T x, T y, T z)
+{
+    T hess[6];
+    logarithmic_eval(v0squared, coreRadius2, p2, q2, lengthUnit2, x, y, z,
+        (T*)NULL, (T*)NULL, hess);
+    return (hess[0] + hess[1] + hess[2]) * T(1. / (4*M_PI));
+}
+
+/** Logarithmic:  Phi only (thin wrapper over logarithmic_eval). */
 template<typename T>
 AGAMA_DEVICE_INLINE T logarithmic_phi(T v0squared, T coreRadius2, T p2, T q2, T lengthUnit2,
                                       T x, T y, T z)
 {
-    T m2 = coreRadius2 + x*x + (y*y)/p2 + (z*z)/q2;
-    return T(0.5) * v0squared * std::log(m2 / lengthUnit2);
+    T phi;
+    logarithmic_eval(v0squared, coreRadius2, p2, q2, lengthUnit2, x, y, z,
+        &phi, (T*)NULL, (T*)NULL);
+    return phi;
 }
 
-/** Harmonic:  Phi(x,y,z) = 0.5 Omega^2 ( x^2 + (y/p)^2 + (z/q)^2 ).
-    Parameters are passed already-squared to match the class member layout. */
+/** Harmonic:  Phi(x,y,z) = 0.5 Omega^2 ( x^2 + (y/p)^2 + (z/q)^2 ),
+    plus the Cartesian gradient (grad[3]) and Hessian (hess[6], same layout as
+    logarithmic_eval). Parameters are passed already-squared to match the class
+    member layout. */
+template<typename T>
+AGAMA_DEVICE_INLINE void harmonic_eval(T Omega2, T p2, T q2, T x, T y, T z,
+    T* potential, T* grad, T* hess)
+{
+    if(potential)
+        *potential = T(0.5)*Omega2 * (pow_2(x) + pow_2(y)/p2 + pow_2(z)/q2);
+    if(grad) {
+        grad[0] = x*Omega2;
+        grad[1] = y*Omega2/p2;
+        grad[2] = z*Omega2/q2;
+    }
+    if(hess) {
+        hess[0] = Omega2;
+        hess[1] = Omega2/p2;
+        hess[2] = Omega2/q2;
+        hess[3] = hess[4] = hess[5] = T(0);
+    }
+}
+
+/** Harmonic density via the Poisson/Laplacian route (same as the generic
+    BasePotential::densityCar used by the CPU path; spatially constant). */
+template<typename T>
+AGAMA_DEVICE_INLINE T harmonic_rho(T Omega2, T p2, T q2, T x, T y, T z)
+{
+    T hess[6];
+    harmonic_eval(Omega2, p2, q2, x, y, z, (T*)NULL, (T*)NULL, hess);
+    return (hess[0] + hess[1] + hess[2]) * T(1. / (4*M_PI));
+}
+
+/** Harmonic:  Phi only (thin wrapper over harmonic_eval). */
 template<typename T>
 AGAMA_DEVICE_INLINE T harmonic_phi(T Omega2, T p2, T q2, T x, T y, T z) {
-    return T(0.5) * Omega2 * (x*x + (y*y)/p2 + (z*z)/q2);
+    T phi;
+    harmonic_eval(Omega2, p2, q2, x, y, z, &phi, (T*)NULL, (T*)NULL);
+    return phi;
+}
+
+// =====================================================================
+// Cartesian acceleration helpers: convert leaf derivatives to a = -grad Phi.
+// =====================================================================
+
+/** Spherical:  a = -dPhi/dr * (x,y,z)/r,  with a = 0 at the origin (r=0 guard). */
+template<typename T>
+AGAMA_DEVICE_INLINE void sph_acc_car(T dPhi_dr, T x, T y, T z, T r, T* acc /*[3]*/)
+{
+    T s = r > T(0) ? -dPhi_dr / r : T(0);
+    acc[0] = s * x;
+    acc[1] = s * y;
+    acc[2] = s * z;
+}
+
+/** Cylindrical (axisymmetric):  a_xy = -dPhi/dR * (x,y)/R  (R=0 guard),  a_z = -dPhi/dz. */
+template<typename T>
+AGAMA_DEVICE_INLINE void cyl_acc_car(T dPhi_dR, T dPhi_dz, T x, T y, T R, T* acc /*[3]*/)
+{
+    T s = R > T(0) ? -dPhi_dR / R : T(0);
+    acc[0] = s * x;
+    acc[1] = s * y;
+    acc[2] = -dPhi_dz;
 }
 
 /** Spherical Plummer potential:
@@ -94,6 +327,43 @@ public:
             const T r = std::sqrt(x*x + y*y + z*z);
             const T v = plummer_phi(m, b, r);
             phi[i] = add ? phi[i] + v : v;
+        });
+    }
+
+    /** Fused batch evaluator: Phi (optional) and Cartesian acceleration a = -grad Phi
+        at N positions in ONE kernel (fused per the CLAUDE.md convention).
+        phi may be NULL (acceleration-only); acc is packed length 3*N.
+        add=true accumulates into the outputs (composite support). */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
+            T pot, dPhidr;
+            plummer_eval(m, b, r, &pot, &dPhidr, (T*)NULL);
+            T a[3];
+            sph_acc_car(dPhidr, x, y, z, r, a);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            for(int k=0; k<3; k++)
+                acc[i*3+k] = add ? acc[i*3+k] + a[k] : a[k];
+        });
+    }
+
+    /** Batch density evaluator at N Cartesian positions via the plummer_rho leaf.
+        add=true accumulates into rho[] (composite support: composite density = sum). */
+    template<typename T, class Policy>
+    inline void evalmanyDensCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* rho, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
+            const T v = plummer_rho(m, b, r);
+            rho[i] = add ? rho[i] + v : v;
         });
     }
 private:
@@ -132,6 +402,40 @@ public:
             const T r = std::sqrt(x*x + y*y + z*z);
             const T v = isochrone_phi(m, b, r);
             phi[i] = add ? phi[i] + v : v;
+        });
+    }
+
+    /** Fused batch evaluator: Phi (optional, may be NULL) + Cartesian acceleration,
+        one kernel. acc packed length 3*N; add=true accumulates (composite support). */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
+            T pot, dPhidr;
+            isochrone_eval(m, b, r, &pot, &dPhidr, (T*)NULL);
+            T a[3];
+            sph_acc_car(dPhidr, x, y, z, r, a);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            for(int k=0; k<3; k++)
+                acc[i*3+k] = add ? acc[i*3+k] + a[k] : a[k];
+        });
+    }
+
+    /** Batch density evaluator via the isochrone_rho leaf; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyDensCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* rho, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
+            const T v = isochrone_rho(m, b, r);
+            rho[i] = add ? rho[i] + v : v;
         });
     }
 private:
@@ -173,6 +477,41 @@ public:
             phi[i] = add ? phi[i] + v : v;
         });
     }
+
+    /** Fused batch evaluator: Phi (optional, may be NULL) + Cartesian acceleration,
+        one kernel (Tier 3 on-ramp: the orbit integrator calls this same nfw_eval
+        leaf per step). acc packed length 3*N; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), rs = static_cast<T>(scaleRadius);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
+            T pot, dPhidr;
+            nfw_eval(m, rs, r, &pot, &dPhidr, (T*)NULL);
+            T a[3];
+            sph_acc_car(dPhidr, x, y, z, r, a);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            for(int k=0; k<3; k++)
+                acc[i*3+k] = add ? acc[i*3+k] + a[k] : a[k];
+        });
+    }
+
+    /** Batch density evaluator via the nfw_rho leaf; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyDensCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* rho, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), rs = static_cast<T>(scaleRadius);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T r = std::sqrt(x*x + y*y + z*z);
+            const T v = nfw_rho(m, rs, r);
+            rho[i] = add ? rho[i] + v : v;
+        });
+    }
 private:
     const double mass;         ///< normalization factor  (M);  equals to mass enclosed within ~5.3r_s
     const double scaleRadius;  ///< scale radius of the NFW model  (r_s)
@@ -180,7 +519,7 @@ private:
     virtual void evalDeriv(double r,
         double* potential, double* deriv, double* deriv2) const;
     virtual double densitySph(const coord::PosSph &pos, double /*time*/) const
-    { return (1./4/M_PI) * mass / pos.r / pow_2(pos.r + scaleRadius); }
+    { return nfw_rho(mass, scaleRadius, pos.r); }   // single source: the same leaf as the batch path
 };
 
 /** Axisymmetric Miyamoto-Nagai potential:
@@ -210,6 +549,42 @@ public:
             const T R = std::sqrt(x*x + y*y);
             const T v = miyamoto_nagai_phi(m, a, b, R, z);
             phi[i] = add ? phi[i] + v : v;
+        });
+    }
+
+    /** Fused batch evaluator: Phi (optional, may be NULL) + Cartesian acceleration,
+        one kernel. Cylindrical leaf derivatives (dR, dz) are converted to Cartesian
+        via cyl_acc_car. acc packed length 3*N; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), ar = static_cast<T>(scaleRadius), b = static_cast<T>(scaleHeight);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T R = std::sqrt(x*x + y*y);
+            T pot, dPhidR, dPhidz;
+            miyamoto_nagai_eval(m, ar, b, R, z,
+                &pot, &dPhidR, &dPhidz, (T*)NULL, (T*)NULL, (T*)NULL);
+            T a[3];
+            cyl_acc_car(dPhidR, dPhidz, x, y, R, a);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            for(int k=0; k<3; k++)
+                acc[i*3+k] = add ? acc[i*3+k] + a[k] : a[k];
+        });
+    }
+
+    /** Batch density evaluator via the miyamoto_nagai_rho leaf; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyDensCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* rho, bool add = false) const
+    {
+        const T m = static_cast<T>(mass), ar = static_cast<T>(scaleRadius), b = static_cast<T>(scaleHeight);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T R = std::sqrt(x*x + y*y);
+            const T v = miyamoto_nagai_rho(m, ar, b, R, z);
+            rho[i] = add ? rho[i] + v : v;
         });
     }
 private:
@@ -280,6 +655,40 @@ public:
             phi[i] = add ? phi[i] + v : v;
         });
     }
+
+    /** Fused batch evaluator: Phi (optional, may be NULL) + Cartesian acceleration
+        (triaxial: gradient computed directly in Cartesian coordinates), one kernel.
+        acc packed length 3*N; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+    {
+        const T v2 = static_cast<T>(v0squared), c2 = static_cast<T>(coreRadius2);
+        const T pp = static_cast<T>(p2), qq = static_cast<T>(q2), L2 = static_cast<T>(lengthUnit2);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            T pot, g[3];
+            logarithmic_eval(v2, c2, pp, qq, L2, x, y, z, &pot, g, (T*)NULL);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            for(int k=0; k<3; k++)
+                acc[i*3+k] = add ? acc[i*3+k] - g[k] : -g[k];
+        });
+    }
+
+    /** Batch density evaluator via the logarithmic_rho leaf (Poisson/Laplacian route,
+        matching the CPU path); add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyDensCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* rho, bool add = false) const
+    {
+        const T v2 = static_cast<T>(v0squared), c2 = static_cast<T>(coreRadius2);
+        const T pp = static_cast<T>(p2), qq = static_cast<T>(q2), L2 = static_cast<T>(lengthUnit2);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T v = logarithmic_rho(v2, c2, pp, qq, L2, x, y, z);
+            rho[i] = add ? rho[i] + v : v;
+        });
+    }
 private:
     const double v0squared;    ///< squared asymptotic circular velocity (v_0)
     const double coreRadius2;  ///< squared core radius (r_c)
@@ -314,6 +723,38 @@ public:
             const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
             const T v = harmonic_phi(w2, pp, qq, x, y, z);
             phi[i] = add ? phi[i] + v : v;
+        });
+    }
+
+    /** Fused batch evaluator: Phi (optional, may be NULL) + Cartesian acceleration
+        (triaxial: gradient computed directly in Cartesian coordinates), one kernel.
+        acc packed length 3*N; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+    {
+        const T w2 = static_cast<T>(Omega2), pp = static_cast<T>(p2), qq = static_cast<T>(q2);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            T pot, g[3];
+            harmonic_eval(w2, pp, qq, x, y, z, &pot, g, (T*)NULL);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            for(int k=0; k<3; k++)
+                acc[i*3+k] = add ? acc[i*3+k] - g[k] : -g[k];
+        });
+    }
+
+    /** Batch density evaluator via the harmonic_rho leaf (Poisson/Laplacian route,
+        matching the CPU path); add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyDensCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* rho, bool add = false) const
+    {
+        const T w2 = static_cast<T>(Omega2), pp = static_cast<T>(p2), qq = static_cast<T>(q2);
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T v = harmonic_rho(w2, pp, qq, x, y, z);
+            rho[i] = add ? rho[i] + v : v;
         });
     }
 private:

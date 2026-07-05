@@ -262,6 +262,38 @@ int main() {
             std::fprintf(stderr, "FAIL (Tier 1 analytic potential parity)\n");
             return 1;
         }
+
+        // ----- Tier 3 on-ramp: NFW fused Phi+acc batch, Serial vs Cuda -----
+        // evalmanyPhiAccCarT runs the same nfw_eval leaf on both policies; the
+        // fused kernel writes Phi and the packed Cartesian acceleration in one
+        // launch. Absolute tolerance 1e-13 (values are O(1) for M=rs=1).
+        {
+            std::vector<double> phi_s(NN), acc_s(NN * 3);
+            nfw.evalmanyPhiAccCarT<double>(Serial{}, NN, xyz_h.data(),
+                phi_s.data(), acc_s.data());
+            device_array<double> d_xyz2(NN * 3);
+            d_xyz2.from_host(xyz_h.data(), NN * 3);
+            device_array<double> d_phi2(NN), d_acc2(NN * 3);
+            nfw.evalmanyPhiAccCarT<double>(Cuda{}, NN, d_xyz2.data(),
+                d_phi2.data(), d_acc2.data());
+            std::vector<double> phi_c(NN), acc_c(NN * 3);
+            d_phi2.to_host(phi_c.data(), NN);
+            d_acc2.to_host(acc_c.data(), NN * 3);
+            double max_err = 0.0;
+            for(std::size_t i = 0; i < NN; ++i)
+                max_err = std::max(max_err, std::fabs(phi_s[i] - phi_c[i]));
+            for(std::size_t i = 0; i < NN * 3; ++i)
+                max_err = std::max(max_err, std::fabs(acc_s[i] - acc_c[i]));
+            const double ACC_TOL = 1e-13;
+            bool ok_acc = (max_err <= ACC_TOL);
+            std::printf("[CUDA]  NFW evalmanyPhiAccCarT (fused Phi+acc, N=%zu): "
+                "Serial-vs-Cuda max |err| = %.3e, tol = %.1e -> %s\n",
+                NN, max_err, ACC_TOL, ok_acc ? "OK" : "FAIL");
+            if(!ok_acc) {
+                std::fprintf(stderr, "FAIL (NFW fused Phi+acc parity)\n");
+                return 1;
+            }
+        }
     }
 
     // ----- math::trigMultiAngle on Cuda (Tier 0 worked example) -----

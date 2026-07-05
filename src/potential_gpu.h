@@ -44,6 +44,25 @@ int evalPotentialGPU(const BasePotential& pot,
                      std::size_t N, const T* xyz, T* phi,
                      const char* device);
 
+/** Compute the Cartesian acceleration a = -grad Phi at N positions through the
+    fused Phi+acc batch path (evalmanyPhiAccCarT with the Phi output disabled).
+    Same contract as evalPotentialGPU: host pointers, internal units, device
+    string routing, PotentialGPUResult codes. \param acc: output host buffer,
+    packed length 3*N [ax0,ay0,az0, ax1,...]. */
+template<typename T>
+int evalForceGPU(const BasePotential& pot,
+                 std::size_t N, const T* xyz, T* acc,
+                 const char* device);
+
+/** Compute the density rho at N Cartesian positions through the batch path
+    (evalmanyDensCarT). Same contract as evalPotentialGPU: host pointers,
+    internal units, device string routing, PotentialGPUResult codes.
+    \param rho: output host buffer, length N. */
+template<typename T>
+int evalDensityGPU(const BasePotential& pot,
+                   std::size_t N, const T* xyz, T* rho,
+                   const char* device);
+
 /** For a POT_GPU_EUNSUPP result: the name of the potential type that blocked
     the dispatch. For a plain potential this is just pot.name(); for a
     Composite it recurses into the members and names the FIRST one that is not
@@ -84,5 +103,21 @@ template<typename T>
 int evalPotentialGPUDevice(const BasePotential& pot,
                            std::size_t N, const T* d_xyz, T* d_phi,
                            unsigned long long input_stream);
+
+/** Device-pointer variant of evalForceGPU: d_xyz and d_acc (packed 3*N) are
+    GPU-resident buffers. Same synchronization contract, unit-system limitation
+    and multi-GPU caveat as evalPotentialGPUDevice. */
+template<typename T>
+int evalForceGPUDevice(const BasePotential& pot,
+                       std::size_t N, const T* d_xyz, T* d_acc,
+                       unsigned long long input_stream);
+
+/** Device-pointer variant of evalDensityGPU: d_xyz (3*N) and d_rho (N) are
+    GPU-resident buffers. Same synchronization contract, unit-system limitation
+    and multi-GPU caveat as evalPotentialGPUDevice. */
+template<typename T>
+int evalDensityGPUDevice(const BasePotential& pot,
+                         std::size_t N, const T* d_xyz, T* d_rho,
+                         unsigned long long input_stream);
 
 }  // namespace potential

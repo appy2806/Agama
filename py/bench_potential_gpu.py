@@ -170,6 +170,32 @@ def main():
                   f"kernel times (delta {t_cp - t_members:+.3f} ms ~ saved output allocs + "
                   f"launch overhead): no hidden transfers in the composite path.")
 
+    # ----------------------------------------------------------------------
+    # Force: the fused Phi+acc kernel with the Phi output disabled, reached via
+    # pot.force(xyz, device=..., dtype=...). Output is (N,3), so the numpy-cuda
+    # path pays a 3x larger D2H copy than potential(); the cupy-cuda path is
+    # copy-free. One compact table: NFW + Composite4 at N=4M, fp64 + fp32,
+    # best of 5 trials after a warm-up call (time_ms_min).
+    # ----------------------------------------------------------------------
+    print(f"\nForce (fused Phi+acc kernel, acceleration-only output), N={N}, best of 5:")
+    hdr = (f"  {'target':12s} {'prec':4s} {'OpenMP':>10s} {'numpy-cuda':>11s} "
+           f"{'cupy-cuda':>10s} {'np/omp':>7s} {'cp/omp':>7s}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for tname, tpot in (("NFW", nfw), ("Composite4", comp)):
+        for dtype, xyz_h in ((np.float64, xyz_f64), (np.float32, xyz_f32)):
+            tag = 'fp64' if dtype == np.float64 else 'fp32'
+            t_omp = time_ms_min(lambda: tpot.force(xyz_h, device='cpu',  dtype=dtype))
+            t_np  = time_ms_min(lambda: tpot.force(xyz_h, device='cuda', dtype=dtype))
+            if cp is not None:
+                d_in = cp.asarray(xyz_h)
+                t_cp = time_ms_min(lambda: tpot.force(d_in, device='cuda'))
+                cp_str, cp_ratio = f"{t_cp:8.3f}ms", f"{t_omp/t_cp:6.1f}x"
+            else:
+                cp_str, cp_ratio = f"{'n/a':>10s}", f"{'n/a':>7s}"
+            print(f"  {tname:12s} {tag:4s} {t_omp:8.3f}ms {t_np:9.3f}ms "
+                  f"{cp_str} {t_omp/t_np:6.1f}x {cp_ratio}")
+
     # Reminder: input flexibility — numpy and list-of-tuples both work
     print("\nInput-type sanity check (NFW, N=4):")
     for desc, xyz_in in [

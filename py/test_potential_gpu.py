@@ -237,6 +237,72 @@ def cupy_passthrough_tests(pots, xyz):
     return all_ok
 
 
+def _check_fd(name, pot, xyz, device, dtype, ref, op):
+    """One (pot, device, dtype) combo for force/density: device path vs legacy ref.
+
+    ref is the legacy CPU result (pot.force(xyz) -> (N,3), pot.density(xyz) -> (N,)).
+    Tolerances: rtol 1e-12 (fp64) / 2e-6 (fp32) vs max|ref| -- except fp32 FORCE,
+    which uses 5e-6 (same as the fp32 potential parity tolerance): NFW's fp32
+    dPhi/dr accumulates ~30 ULP through log(1+r/rs)/r - 1/(r+rs), measured at
+    2.7e-6 relative IDENTICALLY on serial/cpu/openmp/cuda, i.e. inherent fp32
+    rounding of the shared leaf math, not a backend difference."""
+    out = getattr(pot, op)(xyz, device=device, dtype=dtype)
+    label = f"{name:14s} {op:8s} {device:6s} {dtype.__name__:8s}"
+    if out.dtype != dtype:
+        print(f"  FAIL {label} : dtype {out.dtype} != {dtype}")
+        return False
+    if out.shape != ref.shape:
+        print(f"  FAIL {label} : shape {out.shape} != {ref.shape}")
+        return False
+    max_ref = float(np.max(np.abs(ref))) if ref.size else 1.0
+    rel_tol = (5e-6 if op == "force" else 2e-6) if dtype == np.float32 else 1e-12
+    abs_tol = rel_tol * max_ref
+    err = float(np.max(np.abs(out.astype(np.float64) - ref)))
+    ok = err <= abs_tol
+    print(f"  {'OK  ' if ok else 'FAIL'} {label} "
+          f": max|ref|={max_ref:.3e}  |err|={err:.3e}  tol={abs_tol:.3e}")
+    return ok
+
+
+def force_density_cupy_tests(targets, xyz):
+    """CuPy in -> CuPy out for force and density: type, shape ((N,3) for force,
+    (N,) for density), and parity vs the NumPy device='cuda' path, fp64 + fp32."""
+    try:
+        import cupy as cp
+        cp.cuda.runtime.getDeviceCount()
+    except Exception as e:
+        print(f"  SKIP force/density CuPy tests: cupy unavailable ({type(e).__name__}: {e})")
+        return True
+
+    all_ok = True
+    N = xyz.shape[0]
+    for dtype, tag, rtol in ((np.float64, 'fp64', 1e-12), (np.float32, 'fp32', 2e-6)):
+        xyz_t = xyz.astype(dtype)
+        d_xyz = cp.asarray(xyz_t)
+        for name, pot in targets:
+            for op, want_shape in (("force", (N, 3)), ("density", (N,))):
+                ref = getattr(pot, op)(xyz_t, device='cuda', dtype=dtype)  # NumPy path
+                try:
+                    out = getattr(pot, op)(d_xyz, device='cuda')           # dtype inferred
+                    is_cp = isinstance(out, cp.ndarray)
+                    shape_ok = out.shape == want_shape
+                    dt_ok = out.dtype == dtype
+                    max_ref = float(np.max(np.abs(ref)))
+                    err = float(np.max(np.abs(cp.asnumpy(out).astype(np.float64)
+                                              - ref.astype(np.float64))))
+                    val_ok = err <= rtol * max_ref
+                    ok = is_cp and shape_ok and dt_ok and val_ok
+                    print(f"  {'OK  ' if ok else 'FAIL'} {name:14s} {op:8s} cupy {tag} : "
+                          f"isinstance={is_cp} shape={out.shape} dtype={out.dtype} "
+                          f"|err|={err:.3e} (tol {rtol*max_ref:.3e})")
+                except Exception as e:
+                    print(f"  FAIL {name:14s} {op:8s} cupy {tag} : {type(e).__name__}: {e}")
+                    ok = False
+                if not ok:
+                    all_ok = False
+    return all_ok
+
+
 def main():
     rng = np.random.default_rng(42)
     N = 1024
@@ -422,6 +488,107 @@ def main():
         print(f"  FAIL Composite+Dehnen cuda raised wrong type {type(e).__name__}: {e}")
         all_ok = False
 
+    # -- Force + density parity: 6 potentials + Composite3, device x dtype --
+    # References are the LEGACY CPU paths (pot.force(xyz) -> (N,3),
+    # pot.density(xyz) -> (N,)), not the device='cpu' path, so this closes the
+    # loop legacy-vs-batch for the new fused Phi+acc and density kernels.
+    print("\n== Force & density parity: {6 pots + Composite3} x device x dtype ==")
+    fd_targets = pots + [("Composite3", composite)]
+    for name, pot in fd_targets:
+        for op in ("force", "density"):
+            ref = getattr(pot, op)(xyz)          # legacy CPU path
+            for device in ("serial", "cpu", "openmp", "cuda"):
+                for dtype in (np.float64, np.float32):
+                    try:
+                        if not _check_fd(name, pot, xyz, device, dtype, ref, op):
+                            all_ok = False
+                    except Exception as e:
+                        print(f"  FAIL {name:14s} {op:8s} {device:6s} "
+                              f"{dtype.__name__:8s} : {type(e).__name__}: {e}")
+                        all_ok = False
+
+    # -- Force & density single-point shapes: (3,) for force, 0-d for density --
+    print("\n== Force & density single-point input shapes ==")
+    pt = (1.0, 0.5, 0.3)
+    ref_f = np.asarray(nfw.force(pt), dtype=np.float64)   # legacy: (3,)
+    ref_d = float(nfw.density(pt))                        # legacy: scalar
+    for dtype in (np.float64, np.float32):
+        tol = 2e-6 if dtype == np.float32 else 1e-12
+        try:
+            f = nfw.force(np.array(pt), device='cuda', dtype=dtype)
+            shape_ok = f.shape == (3,)
+            err = float(np.max(np.abs(f.astype(np.float64) - ref_f)))
+            ok = shape_ok and err <= tol * float(np.max(np.abs(ref_f)))
+            print(f"  {'OK  ' if ok else 'FAIL'} NFW force   cuda {dtype.__name__:8s} "
+                  f"single point : shape={f.shape} (want (3,))  |err|={err:.3e}")
+        except Exception as e:
+            print(f"  FAIL NFW force   cuda {dtype.__name__:8s} single point : "
+                  f"{type(e).__name__}: {e}")
+            ok = False
+        if not ok:
+            all_ok = False
+        try:
+            d = nfw.density(pt, device='cuda', dtype=dtype)
+            shape_ok = d.shape == ()
+            err = abs(float(d) - ref_d)
+            ok = shape_ok and err <= tol * max(abs(ref_d), 1.0)
+            print(f"  {'OK  ' if ok else 'FAIL'} NFW density cuda {dtype.__name__:8s} "
+                  f"single point : shape={d.shape} (want ())    |err|={err:.3e}")
+        except Exception as e:
+            print(f"  FAIL NFW density cuda {dtype.__name__:8s} single point : "
+                  f"{type(e).__name__}: {e}")
+            ok = False
+        if not ok:
+            all_ok = False
+
+    # -- NotImplementedError for force/density on unsupported targets --
+    print("\n== Force & density NotImplementedError on unsupported targets ==")
+    for op in ("force", "density"):
+        try:
+            getattr(composite_bad, op)(xyz, device='cuda', dtype=np.float64)
+            print(f"  FAIL Composite+Dehnen {op} cuda : unexpectedly succeeded")
+            all_ok = False
+        except NotImplementedError as e:
+            ok = 'Dehnen' in str(e)
+            print(f"  {'OK  ' if ok else 'FAIL'} Composite+Dehnen {op:8s} cuda raised "
+                  f"NotImplementedError (names Dehnen: {ok})")
+            if not ok:
+                all_ok = False
+        except Exception as e:
+            print(f"  FAIL Composite+Dehnen {op} cuda raised wrong type "
+                  f"{type(e).__name__}: {e}")
+            all_ok = False
+    # a Density NOT backed by a Potential object must reject the device kwarg
+    # (agama.Density(type='Plummer') is backed by the Plummer POTENTIAL class,
+    # so it legitimately dispatches -- verified below; Spheroid is a pure
+    # density with no BasePotential base, so it must raise).
+    dens_only = agama.Density(type='Spheroid', densityNorm=1.0, scaleRadius=1.0,
+                              gamma=1, beta=4)
+    try:
+        dens_only.density(xyz, device='cuda', dtype=np.float64)
+        print("  FAIL Spheroid (pure Density) density cuda : unexpectedly succeeded")
+        all_ok = False
+    except NotImplementedError as e:
+        print(f"  OK   Spheroid (pure Density, non-Potential) density cuda raised "
+              f"NotImplementedError: {e}")
+    except Exception as e:
+        print(f"  FAIL Spheroid density cuda raised wrong type {type(e).__name__}: {e}")
+        all_ok = False
+    # ...whereas a Density backed by a GPU-migrated Potential dispatches fine
+    dens_plummer = agama.Density(type='Plummer', mass=1.0, scaleRadius=1.0)
+    try:
+        out = dens_plummer.density(xyz, device='cuda', dtype=np.float64)
+        ref = dens_plummer.density(xyz)
+        err = float(np.max(np.abs(out - ref)))
+        ok = err <= 1e-12 * float(np.max(np.abs(ref)))
+        print(f"  {'OK  ' if ok else 'FAIL'} Density(type='Plummer') "
+              f"(backed by Potential) density cuda : |err|={err:.3e}")
+        if not ok:
+            all_ok = False
+    except Exception as e:
+        print(f"  FAIL Density(type='Plummer') density cuda : {type(e).__name__}: {e}")
+        all_ok = False
+
     # -- Malformed CAI 'stream' raises RuntimeError, does NOT abort --
     # Run in a subprocess: before the exception-safety fix this aborted the
     # whole interpreter (throw escaping Py_BEGIN_ALLOW_THREADS), so a
@@ -472,6 +639,11 @@ def main():
     # -- Phase B: __cuda_array_interface__ passthrough (CuPy in -> CuPy out) --
     print("\n== CuPy device-resident passthrough (__cuda_array_interface__) ==")
     if not cupy_passthrough_tests(pots, xyz):
+        all_ok = False
+
+    # -- Force & density through the CuPy passthrough (incl. (N,3) force shape) --
+    print("\n== Force & density: CuPy in -> CuPy out parity ==")
+    if not force_density_cupy_tests(pots + [("Composite3", composite)], xyz):
         all_ok = False
 
     print("\n" + ("PASS" if all_ok else "FAIL"))
