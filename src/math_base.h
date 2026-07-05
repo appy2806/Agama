@@ -55,7 +55,7 @@ template<typename T> AGAMA_DEVICE_INLINE T pow_2(T x) { return x*x; }
 template<typename T> AGAMA_DEVICE_INLINE T pow_3(T x) { return x*x*x; }
 
 /// test if a number is neither infinity nor NaN
-inline bool isFinite(double x) { return x>-INFINITY && x<INFINITY; }
+AGAMA_DEVICE_INLINE bool isFinite(double x) { return x>-INFINITY && x<INFINITY; }
 
 /// sterilize NaN (replace with zero) and keep any other input unchanged
 inline double nan2num(double x) { return isFinite(x) ? x : 0; }
