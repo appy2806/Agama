@@ -27,3 +27,4 @@ pending_tasks.md
 agama_migrate.egg-info/
 build/
 local_notes/
+notebooks/
