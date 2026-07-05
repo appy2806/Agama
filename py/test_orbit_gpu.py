@@ -21,9 +21,13 @@ Tests covered:
   8. Error cases: exact exception types for all rejected combinations.
   9. serial == cpu == openmp bit-for-bit.
   10. cuda: SKIP cleanly if the build lacks CUDA support.
+  11. Path A thread concurrency: results bit-identical solo vs concurrent.
+  12. Mixed-precision concurrency: fp64 + fp32 threads vs solo.
+  13. Exception safety under concurrency: failing thread does not corrupt valid ones.
 """
 import sys
 import numpy as np
+import concurrent.futures
 import agama_migrate as agama
 
 # ---------------------------------------------------------------------------
@@ -575,6 +579,286 @@ def test_two_single_potentials(cuda_available, all_ok):
 
 
 # ---------------------------------------------------------------------------
+# Path A thread concurrency tests (CUDA-only)
+# ---------------------------------------------------------------------------
+
+def _orbit_call(args):
+    """Worker thunk for ThreadPoolExecutor: unpack args, run agama.orbit, return result."""
+    pot, ic, T, trajsize, dtype = args
+    return agama.orbit(potential=pot, ic=ic, time=T, trajsize=trajsize,
+                       device='cuda', dtype=dtype, verbose=False)
+
+
+def test_path_a_concurrency_parity(pot, cuda_available, all_ok):
+    """Path A thread concurrency: concurrent cuda calls are bit-identical to solo.
+
+    Builds 4 distinct IC sets of 2000 orbits each (T=50, trajsize=32, fp64).
+    Computes each result solo (sequential), then re-runs all 4 concurrently via
+    ThreadPoolExecutor(4).  Repeats the concurrent round 3 times -- stream
+    scheduling varies run to run, correctness must hold every time.
+    """
+    print("\n== Path A thread concurrency: concurrent == solo (fp64, 4 IC sets) ==")
+
+    if not cuda_available:
+        print("  SKIP : no CUDA support in this build")
+        return all_ok
+
+    NORB_CONC = 2000
+    TRAJSIZE_CONC = 32
+    T_CONC = 50.0
+
+    # Build 4 distinct IC sets with different seeds.
+    ic_sets = []
+    for seed in [101, 202, 303, 404]:
+        ic_s, _ = _make_ics(pot, n=NORB_CONC, seed=seed)
+        ic_sets.append(ic_s)
+
+    # Solo (sequential) reference for each IC set.
+    solo_results = []
+    for ic_s in ic_sets:
+        res = agama.orbit(potential=pot, ic=ic_s, time=T_CONC,
+                          trajsize=TRAJSIZE_CONC, device='cuda',
+                          dtype=np.float64, verbose=False)
+        solo_results.append(res)
+
+    print(f"  Solo baselines computed: {len(ic_sets)} IC sets x {NORB_CONC} orbits each")
+
+    # Run concurrent rounds.
+    N_ROUNDS = 3
+    all_rounds_ok = True
+    for rnd in range(N_ROUNDS):
+        work_args = [(pot, ic_sets[i], T_CONC, TRAJSIZE_CONC, np.float64)
+                     for i in range(len(ic_sets))]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futures = [ex.submit(_orbit_call, a) for a in work_args]
+            conc_results = [f.result() for f in futures]
+
+        round_ok = True
+        for i, (conc_res, solo_res) in enumerate(zip(conc_results, solo_results)):
+            for k in range(NORB_CONC):
+                t_conc, tr_conc = conc_res[k]
+                t_solo, tr_solo = solo_res[k]
+                if not np.array_equal(t_conc, t_solo):
+                    print(f"  FAIL round {rnd+1} IC set {i} orbit {k}: "
+                          f"time arrays differ")
+                    round_ok = False
+                    all_rounds_ok = False
+                    break
+                if not np.array_equal(tr_conc, tr_solo):
+                    diff = np.abs(tr_conc.astype(np.float64)
+                                  - tr_solo.astype(np.float64))
+                    print(f"  FAIL round {rnd+1} IC set {i} orbit {k}: "
+                          f"traj arrays differ, max abs diff = {diff.max():.6e}")
+                    round_ok = False
+                    all_rounds_ok = False
+                    break
+            if not round_ok:
+                break
+
+        status = "OK  " if round_ok else "FAIL"
+        print(f"  {status} round {rnd+1}/{N_ROUNDS}: "
+              f"4 concurrent cuda calls bit-identical to solo "
+              f"({len(ic_sets)} x {NORB_CONC} orbits)")
+
+    if not all_rounds_ok:
+        all_ok = False
+
+    return all_ok
+
+
+def test_path_a_mixed_precision_concurrency(pot, cuda_available, all_ok):
+    """Mixed-precision concurrency: 2 fp64 + 2 fp32 threads concurrent vs solo.
+
+    Each thread's result must be bit-exactly equal to its solo counterpart.
+    fp64 threads use the same IC sets as the concurrency parity test; fp32
+    threads use two fresh IC sets.
+    """
+    print("\n== Path A mixed-precision concurrency: 2xfp64 + 2xfp32 threads ==")
+
+    if not cuda_available:
+        print("  SKIP : no CUDA support in this build")
+        return all_ok
+
+    NORB_CONC = 2000
+    TRAJSIZE_CONC = 32
+    T_CONC = 50.0
+
+    # 2 fp64 IC sets + 2 fp32 IC sets.
+    ic_fp64 = []
+    for seed in [501, 602]:
+        ic_s, _ = _make_ics(pot, n=NORB_CONC, seed=seed)
+        ic_fp64.append(ic_s)
+
+    ic_fp32 = []
+    for seed in [703, 804]:
+        ic_s, _ = _make_ics(pot, n=NORB_CONC, seed=seed)
+        ic_fp32.append(ic_s)
+
+    # Solo references.
+    solo_fp64 = [
+        agama.orbit(potential=pot, ic=ic_s, time=T_CONC, trajsize=TRAJSIZE_CONC,
+                    device='cuda', dtype=np.float64, verbose=False)
+        for ic_s in ic_fp64
+    ]
+    solo_fp32 = [
+        agama.orbit(potential=pot, ic=ic_s, time=T_CONC, trajsize=TRAJSIZE_CONC,
+                    device='cuda', dtype=np.float32, verbose=False)
+        for ic_s in ic_fp32
+    ]
+
+    # Build work list: [fp64_0, fp64_1, fp32_0, fp32_1].
+    dtypes = [np.float64, np.float64, np.float32, np.float32]
+    ic_all = ic_fp64 + ic_fp32
+    solo_all = solo_fp64 + solo_fp32
+    work_args = [(pot, ic_all[i], T_CONC, TRAJSIZE_CONC, dtypes[i])
+                 for i in range(4)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_orbit_call, a) for a in work_args]
+        conc_results = [f.result() for f in futures]
+
+    labels = ["fp64-0", "fp64-1", "fp32-0", "fp32-1"]
+    section_ok = True
+    for i, (conc_res, solo_res, label) in enumerate(
+            zip(conc_results, solo_all, labels)):
+        thread_ok = True
+        for k in range(NORB_CONC):
+            t_conc, tr_conc = conc_res[k]
+            t_solo, tr_solo = solo_res[k]
+            if not np.array_equal(t_conc, t_solo):
+                print(f"  FAIL thread {label} orbit {k}: time arrays differ")
+                thread_ok = False
+                break
+            if not np.array_equal(tr_conc, tr_solo):
+                diff = np.abs(tr_conc.astype(np.float64)
+                              - tr_solo.astype(np.float64))
+                print(f"  FAIL thread {label} orbit {k}: "
+                      f"traj arrays differ, max abs diff = {diff.max():.6e}")
+                thread_ok = False
+                break
+        status = "OK  " if thread_ok else "FAIL"
+        print(f"  {status} thread {label}: "
+              f"concurrent result bit-identical to solo ({NORB_CONC} orbits)")
+        if not thread_ok:
+            section_ok = False
+
+    if not section_ok:
+        all_ok = False
+
+    return all_ok
+
+
+def test_path_a_exception_safety(pot, cuda_available, all_ok):
+    """Exception safety under concurrency: one bad thread must not corrupt valid ones.
+
+    4 threads run concurrently.  Thread 0 uses an unsupported Dehnen potential
+    and must raise exactly NotImplementedError.  Threads 1-3 run valid cuda
+    calls and their results must be bit-identical to solo runs.
+    """
+    print("\n== Path A exception safety: 1 bad thread + 3 valid threads concurrent ==")
+
+    if not cuda_available:
+        print("  SKIP : no CUDA support in this build")
+        return all_ok
+
+    NORB_CONC = 2000
+    TRAJSIZE_CONC = 32
+    T_CONC = 50.0
+
+    dehnen = agama.Potential(type='Dehnen', mass=1.0, scaleRadius=1.0)
+
+    ic_valid = []
+    for seed in [901, 1002, 1103]:
+        ic_s, _ = _make_ics(pot, n=NORB_CONC, seed=seed)
+        ic_valid.append(ic_s)
+
+    # Dummy IC for the bad thread (small; it should raise before integrating).
+    ic_bad, _ = _make_ics(pot, n=4, seed=999)
+
+    # Solo references for the 3 valid threads.
+    solo_valid = [
+        agama.orbit(potential=pot, ic=ic_s, time=T_CONC, trajsize=TRAJSIZE_CONC,
+                    device='cuda', dtype=np.float64, verbose=False)
+        for ic_s in ic_valid
+    ]
+
+    # Submit: thread 0 = bad (Dehnen), threads 1-3 = valid.
+    def bad_call():
+        return agama.orbit(potential=dehnen, ic=ic_bad, time=T_CONC,
+                           trajsize=TRAJSIZE_CONC, device='cuda',
+                           dtype=np.float64, verbose=False)
+
+    good_args = [(pot, ic_valid[j], T_CONC, TRAJSIZE_CONC, np.float64)
+                 for j in range(3)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        f_bad = ex.submit(bad_call)
+        f_good = [ex.submit(_orbit_call, a) for a in good_args]
+        # Collect good results first (they should succeed).
+        good_results = []
+        good_exc = None
+        for f in f_good:
+            try:
+                good_results.append(f.result())
+            except Exception as e:
+                good_exc = e
+                good_results.append(None)
+        # Now collect bad result.
+        bad_exc = None
+        try:
+            f_bad.result()
+            bad_exc = None  # no exception -- unexpected
+        except Exception as e:
+            bad_exc = e
+
+    # Check bad thread raised NotImplementedError.
+    bad_ok = isinstance(bad_exc, NotImplementedError)
+    print(f"  {'OK  ' if bad_ok else 'FAIL'} bad thread raised "
+          f"{type(bad_exc).__name__ if bad_exc is not None else 'nothing'}"
+          f"{' (want NotImplementedError)' if not bad_ok else ''}"
+          f": {bad_exc}")
+    if not bad_ok:
+        all_ok = False
+
+    # Check good threads not corrupted.
+    if good_exc is not None:
+        print(f"  FAIL valid thread raised unexpected {type(good_exc).__name__}: "
+              f"{good_exc}")
+        all_ok = False
+    else:
+        labels = ["valid-0", "valid-1", "valid-2"]
+        for j, (conc_res, solo_res, label) in enumerate(
+                zip(good_results, solo_valid, labels)):
+            if conc_res is None:
+                print(f"  FAIL thread {label}: no result (exception was raised)")
+                all_ok = False
+                continue
+            thread_ok = True
+            for k in range(NORB_CONC):
+                t_conc, tr_conc = conc_res[k]
+                t_solo, tr_solo = solo_res[k]
+                if not np.array_equal(t_conc, t_solo):
+                    print(f"  FAIL thread {label} orbit {k}: time arrays differ")
+                    thread_ok = False
+                    break
+                if not np.array_equal(tr_conc, tr_solo):
+                    diff = np.abs(tr_conc.astype(np.float64)
+                                  - tr_solo.astype(np.float64))
+                    print(f"  FAIL thread {label} orbit {k}: "
+                          f"traj arrays differ, max abs diff = {diff.max():.6e}")
+                    thread_ok = False
+                    break
+            status = "OK  " if thread_ok else "FAIL"
+            print(f"  {status} thread {label}: "
+                  f"result bit-identical to solo despite bad sibling thread "
+                  f"({NORB_CONC} orbits)")
+            if not thread_ok:
+                all_ok = False
+
+    return all_ok
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -618,6 +902,9 @@ def main():
     all_ok = test_serial_cpu_openmp_identical(pot, ic, T, TRAJSIZE, all_ok)
     all_ok = test_error_cases(pot, ic, T, TRAJSIZE, cuda_available, all_ok)
     all_ok = test_two_single_potentials(cuda_available, all_ok)
+    all_ok = test_path_a_concurrency_parity(pot, cuda_available, all_ok)
+    all_ok = test_path_a_mixed_precision_concurrency(pot, cuda_available, all_ok)
+    all_ok = test_path_a_exception_safety(pot, cuda_available, all_ok)
 
     # Count OK/FAIL lines for a summary matching house style.
     # We can't count them directly (tests report inline), so derive from all_ok.

@@ -6,9 +6,10 @@ patterns do *not* help. The physics and outputs are identical across all
 patterns; only throughput differs.
 
 **Status:** the batch backends (`device='cpu'/'openmp'/'serial'/'cuda'`) are
-implemented and tested. Per-call CUDA streams ("Path A", which makes the
-threaded pattern in §3 fast) are the next increment; until they land, the
-threaded pattern is *safe and correct* but its kernels serialize on the GPU.
+implemented and tested. Per-call CUDA streams ("Path A") landed 2026-07-05,
+making the threaded pattern in §3 fast — each `agama.orbit(...)` call from a
+different Python thread runs on its own `cudaStream_t`, and kernels co-execute
+on the GPU.
 
 ---
 
@@ -108,21 +109,31 @@ def run_spray(seed):
                        trajsize=64, device='cuda',
                        dtype=np.float32, accuracy=1e-5)
 
-with ThreadPoolExecutor(max_workers=8) as pool:
-    results = list(pool.map(run_spray, range(10)))   # up to 8 calls in flight
+with ThreadPoolExecutor(max_workers=3) as pool:
+    # match to device capacity: ~2-3 concurrent 5K-orbit fp64 calls on a 48-SM card
+    results = list(pool.map(run_spray, range(10)))   # up to 3 calls in flight
 ```
 
-With Path A, each in-flight call runs on its own CUDA stream and the hardware
-scheduler co-executes the kernels — 8 × 5K orbits saturate the card
-automatically, at roughly the throughput of the equivalent one-big-batch call.
-**No code changes are needed in this snippet when Path A lands** — it is
-already the correct way to write concurrent calls; it simply becomes fast.
+Each in-flight call runs on its own CUDA stream and the hardware scheduler
+co-executes the kernels — up to 3 × 5K-orbit concurrent calls saturate the
+card automatically on this RTX 3080 Laptop (48 SMs, register-heavy DOP853), at
+roughly the throughput of the equivalent one-big-batch call.
+**No code changes are needed in this snippet** — it was already the correct way
+to write concurrent calls; Path A simply makes it fast.
+
+**How many threads?** Match your pool size to device capacity. On this RTX 3080
+Laptop, capacity is ~2–3 concurrent 5K-orbit fp64 calls before the warp queue
+backs up; 4 C++ threads beat the batched 20K call (214 ms vs 310 ms), a good
+practical knee. On larger cards (L40, A100 with more SMs or fast fp64) capacity
+is higher — re-measure at deployment. **Important:** fp32 kernels are much
+shorter (~16 ms for 5K at accuracy=1e-5) and benefit little from concurrency
+(2 threads 1.12×, ≥3 threads degrade to 0.2–0.7×) — for fp32, concatenate
+ICs into one batch instead. Results are bit-identical whether a call ran alone
+or concurrently — streams change scheduling, never arithmetic.
 
 Sampler integration is one line: hand `emcee`/`dynesty`/... a *thread* pool
 (`multiprocessing.pool.ThreadPool` or the executor above), **not** a process
-pool. Results are bit-identical whether a call ran alone or concurrently —
-streams change scheduling, never arithmetic. Threads beyond card saturation
-(~4–10 concurrent 5K-orbit calls) queue harmlessly.
+pool. Threads beyond card saturation queue harmlessly.
 
 ---
 

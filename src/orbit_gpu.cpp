@@ -156,6 +156,78 @@ void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc,
     });
 }
 
+#ifdef HAVE_CUDA
+/* ---- Path A: per-call CUDA streams --------------------------------------
+   Each integrateOrbitsGPU call runs on its OWN non-blocking stream with
+   stream-ordered allocation and copies, so concurrent calls issued from
+   different host threads (the Python binding releases the GIL around this
+   function) are co-scheduled by the GPU's hardware scheduler instead of
+   serializing on the legacy default stream. N small batches in flight then
+   fill the card like one big batch. Stream choice affects scheduling only,
+   never arithmetic: results are bit-identical to a solo run. */
+
+/// true iff the device supports stream-ordered memory pools
+/// (cudaMallocAsync); evaluated once, thread-safe per C++11 magic statics.
+/// Without pool support we fall back to plain cudaMalloc, which is correct
+/// but synchronizes the device and thus degrades (not breaks) overlap.
+bool gpu_mem_pools_supported()
+{
+    static const bool supported = [] {
+        int dev = 0, attr = 0;
+        if(cudaGetDevice(&dev) != cudaSuccess)
+            return false;
+        if(cudaDeviceGetAttribute(&attr, cudaDevAttrMemoryPoolsSupported, dev) != cudaSuccess)
+            return false;
+        return attr != 0;
+    }();
+    return supported;
+}
+
+/// RAII per-call stream, non-blocking w.r.t. the legacy default stream so
+/// that concurrent orbit calls never implicitly synchronize with stream 0
+struct OrbitCallStream {
+    cudaStream_t s = 0;
+    OrbitCallStream() { AGAMA_CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)); }
+    ~OrbitCallStream() { if(s) cudaStreamDestroy(s); }   // dtor: no-throw
+    OrbitCallStream(const OrbitCallStream&) = delete;
+    OrbitCallStream& operator=(const OrbitCallStream&) = delete;
+};
+
+/// RAII device buffer ordered on the call's stream: allocation, copies and
+/// deallocation are all enqueued on `s`, so nothing here synchronizes the
+/// whole device (unlike device_array's cudaMalloc/cudaMemcpy)
+template<typename T>
+struct StreamBuffer {
+    T* d = NULL;
+    cudaStream_t s;
+    StreamBuffer(std::size_t n, cudaStream_t stream) : s(stream) {
+        if(gpu_mem_pools_supported())
+            AGAMA_CUDA_CHECK(cudaMallocAsync(&d, n * sizeof(T), s));
+        else
+            AGAMA_CUDA_CHECK(cudaMalloc(&d, n * sizeof(T)));
+    }
+    ~StreamBuffer() {   // dtor: no-throw (errors here mean the context is dying anyway)
+        if(!d) return;
+        if(gpu_mem_pools_supported())
+            cudaFreeAsync(d, s);
+        else
+            cudaFree(d);
+    }
+    StreamBuffer(const StreamBuffer&) = delete;
+    StreamBuffer& operator=(const StreamBuffer&) = delete;
+    T*       data()       { return d; }
+    const T* data() const { return d; }
+    void from_host(const T* h, std::size_t n) {
+        // pageable-source async copy: the runtime returns after staging the
+        // pageable buffer, so the host source may be freed after this call
+        AGAMA_CUDA_CHECK(cudaMemcpyAsync(d, h, n * sizeof(T), cudaMemcpyHostToDevice, s));
+    }
+    void to_host(T* h, std::size_t n) const {
+        AGAMA_CUDA_CHECK(cudaMemcpyAsync(h, d, n * sizeof(T), cudaMemcpyDeviceToHost, s));
+    }
+};
+#endif  // HAVE_CUDA
+
 }  // anonymous namespace
 
 template<typename T>
@@ -206,18 +278,24 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
         std::vector<T> icT(Norb * 6);
         for(std::size_t j = 0; j < Norb * 6; j++)
             icT[j] = static_cast<T>(ic[j]);
-        // Per-call RAII buffers (no shared scratch, no mutex): orbit batches
-        // amortize the ~ms allocation cost over thousands of ODE steps, unlike
-        // the cheap one-shot potential evaluations in potential_gpu.cpp.
-        agama::device_array<T>      d_ic   (Norb * 6);
-        agama::device_array<double> d_times(Norb);
-        agama::device_array<T>      d_traj (Norb * trajsize * 6);
+        // Path A: the whole call (allocation, copies, kernel, teardown) is
+        // ordered on its own non-blocking stream, so concurrent calls from
+        // different host threads overlap on the GPU. Per-call RAII buffers,
+        // no shared scratch, no mutex: orbit batches amortize the allocation
+        // cost over thousands of ODE steps.
+        OrbitCallStream stream;
+        StreamBuffer<T>      d_ic   (Norb * 6,            stream.s);
+        StreamBuffer<double> d_times(Norb,                stream.s);
+        StreamBuffer<T>      d_traj (Norb * trajsize * 6, stream.s);
         d_ic.from_host(icT.data(), Norb * 6);
         d_times.from_host(times, Norb);
-        run_batch<T>(agama::Cuda{}, desc, Norb, d_ic.data(), d_times.data(),
+        agama::Cuda pol;
+        pol.stream = stream.s;
+        run_batch<T>(pol, desc, Norb, d_ic.data(), d_times.data(),
             trajsize, accT, maxNumSteps, d_traj.data());
-        // blocking D2H on the default stream doubles as the kernel sync point
         d_traj.to_host(traj, Norb * trajsize * 6);
+        // wait only for THIS call's work; other threads' streams keep running
+        AGAMA_CUDA_CHECK(cudaStreamSynchronize(stream.s));
         return ORBIT_GPU_OK;
 #else
         return ORBIT_GPU_ENOTBUILT;
