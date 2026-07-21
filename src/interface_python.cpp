@@ -8499,7 +8499,8 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
             haveDer          ? "der=True" :
             haveLyap         ? "lyapunov=True" :
             Omega != 0       ? "a rotating frame (Omega != 0)" :
-            params.method != orbit::OrbitIntParams::DOP853 ? "method other than 'dop853'" :
+            params.method == orbit::OrbitIntParams::HERMITE ?
+                "method='hermite' (needs the potential Hessian; use 'dop853' or 'dprkn8')" :
             dtype == NPY_OBJECT ? "dtype=object" :
             !haveTraj        ? "output without trajsize" : NULL;
         if(!unsupported) {
@@ -8610,19 +8611,23 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
             PyReleaseGIL unlock;
             // exceptions (e.g. CUDA errors) must not escape through the
             // GIL-released region -- captured and re-raised after it
+            // map the validated integrator choice onto the batch method enum
+            // (Hermite is rejected above; only DOP853 / DPRKN8 reach here)
+            const int gpuMethod = params.method == orbit::OrbitIntParams::DPRKN8
+                ? orbit::ORBIT_GPU_DPRKN8 : orbit::ORBIT_GPU_DOP853;
             try{
                 trajFlat.resize((size_t)numOrbits * trajsize * 6);
                 if(deviceFp32) {
                     std::vector<float> trajF((size_t)numOrbits * trajsize * 6);
                     rc = orbit::integrateOrbitsGPU<float>(*pot, numOrbits, icFlat.data(),
                         timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
-                        trajF.data(), deviceStr.c_str());
+                        trajF.data(), deviceStr.c_str(), gpuMethod);
                     for(size_t j=0; j<trajF.size(); j++)
                         trajFlat[j] = trajF[j];
                 } else
                     rc = orbit::integrateOrbitsGPU<double>(*pot, numOrbits, icFlat.data(),
                         timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
-                        trajFlat.data(), deviceStr.c_str());
+                        trajFlat.data(), deviceStr.c_str(), gpuMethod);
             }
             catch(std::exception& ex) {
                 errorMessage = ex.what();

@@ -65,6 +65,40 @@ struct GpuDescForce {
     }
 };
 
+/** Second-order force callable for the DPRKN8 core: the acceleration
+    d2x/dt2 = -grad Phi(x) as a function of position, mirroring
+    OrbitIntegrator<coord::Car>::eval2 with Omega = 0. The signature is
+    void force2(t, x[], d2xdt2[], d3xdt3, accFac):
+    - the three RK-stage evaluations pass x = positions only (3 elements) and
+      request neither the jerk nor the accuracy factor;
+    - the end-of-step evaluation requests accFac, and (exactly as in the CPU
+      OdeRhs2 path) is handed a buffer whose positions are immediately followed
+      in memory by the step's velocities, so x[3..5] are the velocities used
+      for Ekin -- see dprkn8_step's contiguous xn|vn scratch layout.
+    d3xdt3 (jerk) is never requested here: it needs the potential Hessian, which
+    the force descriptor does not carry, and only the Hermite scheme uses it. */
+template<typename T>
+struct GpuDescForce2 {
+    potential::GpuPotDesc<T> desc;
+
+    AGAMA_DEVICE_INLINE void operator()(T /*t*/, const T x[], T d2xdt2[],
+        T* /*d3xdt3 (unused: Hermite-only)*/, T* accFac) const
+    {
+        T Epot, acc[3];
+        potential::gpu_desc_phi_acc(desc, x[0], x[1], x[2],
+            accFac ? &Epot : (T*)NULL, acc);
+        d2xdt2[0] = acc[0];
+        d2xdt2[1] = acc[1];
+        d2xdt2[2] = acc[2];
+        if(accFac) {
+            // x[3..5] are the velocities (contiguous with the positions, see above)
+            T Ekin = T(0.5) * (pow_2(x[3]) + pow_2(x[4]) + pow_2(x[5]));
+            *accFac = std::fmin(T(1), std::fabs(Epot + Ekin) /
+                std::fmax(std::fabs(Epot), Ekin));
+        }
+    }
+};
+
 /** Integrate a single orbit and store its sampled trajectory.
     Runs identically as the body of a CUDA thread or a (Serial/OpenMP) CPU
     loop iteration. Integration state is in precision T; time bookkeeping is
@@ -138,21 +172,95 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(const GpuDescForce<T>& force,
     }
 }
 
+/** DPRKN8 counterpart of integrate_one_orbit: same trajectory-sampling logic,
+    but the 8th-order Runge-Kutta-Nystrom core (2nd-order ODE) from math_ode.h --
+    the same dprkn8_init / dprkn8_step / dprkn8_dense that the CPU class
+    OdeStepperDPRKN8 wraps. `accuracy` is the ALREADY-RESCALED tolerance
+    (10 * userAccuracy^0.9, matching the CPU stepper's constructor), so this body
+    is method-agnostic about that rescaling. force1 is used only for the initial
+    timestep estimate (as in dprkn8_init); force2 supplies the acceleration. */
+template<typename T>
+AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(const GpuDescForce<T>& force1,
+    const GpuDescForce2<T>& force2, const T ic6[6], double totalTime, T accuracy,
+    unsigned long long maxNumSteps, std::size_t trajsize, T* traj)
+{
+    const int NDIM = 6;         // full 2nd-order system size (numVar = 3)
+    for(std::size_t j = 0; j < trajsize * 6; j++)
+        traj[j] = T(NAN);
+
+    T state[18],   // persistent DPRKN8 storage: 3*NDIM (x, v, and the a/jerk/... blocks)
+      scratch[39]; // 13*numVar step scratch (also covers the 4*NDIM=24 init scratch)
+    T nextTimeStep = 0, qold = 0;
+    math::dprkn8_init(force1, force2, NDIM, ic6, accuracy,
+        state, nextTimeStep, qold, scratch);
+
+    const double sign = totalTime >= 0 ? +1 : -1;
+    const double interval = trajsize > 1 ? sign * totalTime / double(trajsize - 1) : 0;
+    const double ROUNDOFF = 10 * DBL_EPSILON;
+
+    double tcur = 0;
+    bool ok = totalTime != 0;
+    unsigned long long numSteps = 0;
+    while(tcur != totalTime) {
+        double timeRemaining = totalTime - tcur;
+        T h = math::dprkn8_step(force2, NDIM, accuracy,
+            state, scratch, nextTimeStep, qold, T(timeRemaining));
+        if(!(double(h) * sign > 0)) {   // stepper signalled an error
+            ok = false;
+            break;
+        }
+        double hd   = double(h);
+        double tend = h == T(timeRemaining) ? totalTime : tcur + hd;
+        if(trajsize > 1) {
+            double dtroundoff = ROUNDOFF * std::fmax(std::fabs(tend), std::fabs(tcur));
+            long long iout = (long long)std::ceil(sign * tcur / interval);
+            long long iend = (long long)((sign * tend + dtroundoff) / interval);
+            if(iend > (long long)trajsize - 1)
+                iend = (long long)trajsize - 1;
+            for(; iout <= iend; iout++) {
+                double timeout   = sign * interval * iout;
+                double offsetout = std::fmin(std::fmax(sign * (timeout - tcur), 0.0),
+                    sign * hd) * sign;
+                for(int k = 0; k < NDIM; k++)
+                    traj[iout*6 + k] =
+                        math::dprkn8_dense(state, NDIM, h, T(offsetout), k);
+            }
+        }
+        tcur = tend;
+        if(++numSteps >= maxNumSteps) {
+            ok = tcur == totalTime;
+            break;
+        }
+    }
+    if(trajsize == 1 && ok) {
+        // single-sample mode: final state is state[0..5] = {x(3), v(3)}
+        for(int k = 0; k < NDIM; k++)
+            traj[k] = state[k];
+    }
+}
+
 /** Launch the batch under the given execution policy. All pointers must be
     accessible by that policy's execution space (host pointers for
     Serial/OpenMP, device pointers for Cuda). */
 template<typename T, class Policy>
-void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc,
+void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc, int method,
     std::size_t Norb, const T* ic, const double* times, std::size_t trajsize,
     T accuracy, unsigned long long maxNumSteps, T* traj)
 {
-    GpuDescForce<T> force = { desc };
+    GpuDescForce<T>  force  = { desc };  // 1st-order r.h.s. (DOP853 + DPRKN8 init)
+    GpuDescForce2<T> force2 = { desc };  // 2nd-order r.h.s. (DPRKN8 stages)
+    // `method` is a kernel-uniform runtime value: every thread branches the same
+    // way, so there is no warp divergence from this test.
     agama::forall(pol, Norb, [=] AGAMA_DEVICE (std::size_t i) {
         T ic6[6];
         for(int k = 0; k < 6; k++)
             ic6[k] = ic[i*6 + k];
-        integrate_one_orbit(force, ic6, times[i], accuracy, maxNumSteps,
-            trajsize, traj + i * trajsize * 6);
+        if(method == orbit::ORBIT_GPU_DPRKN8)
+            integrate_one_orbit_dprkn8(force, force2, ic6, times[i], accuracy,
+                maxNumSteps, trajsize, traj + i * trajsize * 6);
+        else
+            integrate_one_orbit(force, ic6, times[i], accuracy, maxNumSteps,
+                trajsize, traj + i * trajsize * 6);
     });
 }
 
@@ -239,14 +347,23 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                        double accuracy,
                        std::size_t maxNumSteps,
                        T* traj,
-                       const char* device)
+                       const char* device,
+                       int method)
 {
     if(trajsize < 1)
+        return ORBIT_GPU_EUNSUPP;
+    if(method != ORBIT_GPU_DOP853 && method != ORBIT_GPU_DPRKN8)
         return ORBIT_GPU_EUNSUPP;
     potential::GpuPotDesc<double> desc0;
     if(!potential::buildGpuPotDesc(pot, desc0))
         return ORBIT_GPU_EUNSUPP;
     const potential::GpuPotDesc<T> desc = potential::castGpuPotDesc<T>(desc0);
+    // Per-method base tolerance (in double): DPRKN8 applies the SAME empirical
+    // rescaling as the CPU OdeStepperDPRKN8 constructor (10 * accuracy^0.9) so
+    // the user-facing `accuracy` has an identical meaning for both methods and
+    // the batch result matches the CPU stepper bit-for-bit in double.
+    const double accBase = method == ORBIT_GPU_DPRKN8
+        ? 10.0 * std::pow(accuracy, 0.9) : accuracy;
     // Working-precision floor on the accuracy parameter: an accRel near or below
     // one ULP of T (e.g. the fp64-oriented default 1e-8 under T=float) is
     // unattainable -- the error estimate sits at the rounding-noise floor, so the
@@ -254,8 +371,10 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
     // fp64, with NaNs when the stepper gives up). 10 ULP is the measured knee on
     // this workload: for T=float the default 1e-8 clamps to ~1.2e-6 (123k orbits/s,
     // |dE/E| ~ 8e-6 on the crosscheck workload; explicitly passing accuracy~1e-5
-    // reaches ~300k orbits/s). A no-op for T=double at any sane accuracy.
-    const T accT = T(std::max(accuracy, 10 * double(std::numeric_limits<T>::epsilon())));
+    // reaches ~300k orbits/s). A no-op for T=double at any sane accuracy. The
+    // clamp is applied AFTER the per-method rescaling so DPRKN8 in fp32 is guarded
+    // too.
+    const T accT = T(std::max(accBase, 10 * double(std::numeric_limits<T>::epsilon())));
 
     if(std::strcmp(device, "cpu") == 0 || std::strcmp(device, "openmp") == 0 ||
        std::strcmp(device, "serial") == 0) {
@@ -264,10 +383,10 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
         for(std::size_t j = 0; j < Norb * 6; j++)
             icT[j] = static_cast<T>(ic[j]);
         if(std::strcmp(device, "serial") == 0)
-            run_batch<T>(agama::Serial{}, desc, Norb, icT.data(), times,
+            run_batch<T>(agama::Serial{}, desc, method, Norb, icT.data(), times,
                 trajsize, accT, maxNumSteps, traj);
         else
-            run_batch<T>(agama::OpenMP{}, desc, Norb, icT.data(), times,
+            run_batch<T>(agama::OpenMP{}, desc, method, Norb, icT.data(), times,
                 trajsize, accT, maxNumSteps, traj);
         return ORBIT_GPU_OK;
     }
@@ -291,7 +410,7 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
         d_times.from_host(times, Norb);
         agama::Cuda pol;
         pol.stream = stream.s;
-        run_batch<T>(pol, desc, Norb, d_ic.data(), d_times.data(),
+        run_batch<T>(pol, desc, method, Norb, d_ic.data(), d_times.data(),
             trajsize, accT, maxNumSteps, d_traj.data());
         d_traj.to_host(traj, Norb * trajsize * 6);
         // wait only for THIS call's work; other threads' streams keep running
@@ -306,8 +425,8 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
 
 // Explicit instantiations for the two precisions the Python boundary exposes.
 template int integrateOrbitsGPU<float >(const potential::BasePotential&, std::size_t,
-    const double*, const double*, std::size_t, double, std::size_t, float*,  const char*);
+    const double*, const double*, std::size_t, double, std::size_t, float*,  const char*, int);
 template int integrateOrbitsGPU<double>(const potential::BasePotential&, std::size_t,
-    const double*, const double*, std::size_t, double, std::size_t, double*, const char*);
+    const double*, const double*, std::size_t, double, std::size_t, double*, const char*, int);
 
 }  // namespace orbit

@@ -40,6 +40,16 @@ enum OrbitGPUResult {
     ORBIT_GPU_EUNSUPP   = 3   ///< potential not representable as a GPU force descriptor
 };
 
+/** ODE integrator selectable on the batch path. Kept as a plain int on this
+    boundary header (no dependency on orbit.h's OrbitIntParams::Method); the
+    Python binding maps the method string to one of these. Only the two
+    force-only schemes are exposed: Hermite needs the potential Hessian (jerk =
+    -d(grad)/dx . v) which the GPU force descriptor does not provide. */
+enum OrbitGPUMethod {
+    ORBIT_GPU_DOP853 = 0,  ///< 8th-order Runge-Kutta (1st-order ODE, 6D state)
+    ORBIT_GPU_DPRKN8 = 1   ///< 8th-order Runge-Kutta-Nystrom (2nd-order ODE)
+};
+
 /** Integrate Norb orbits in the given potential, one thread per orbit.
     All buffers are host pointers in *internal* units; the caller handles unit
     conversion and (for the Python boundary) array validation.
@@ -57,13 +67,17 @@ enum OrbitGPUResult {
                        nonzero — a zero entry yields NAN samples for that orbit)
     \param  trajsize   number of trajectory samples per orbit (>= 1)
     \param  accuracy   relative accuracy parameter of the ODE integrator
-                       (OrbitIntParams::accuracy; accAbs is 0)
+                       (OrbitIntParams::accuracy; accAbs is 0). For the DPRKN8
+                       method the same empirical rescaling as the CPU stepper
+                       (10 * accuracy^0.9) is applied internally, so the value
+                       passed here has the identical meaning across methods.
     \param  maxNumSteps upper limit on the number of ODE steps per orbit
     \param  traj       output, packed Norb*trajsize*6:
                        traj[(i*trajsize + j)*6 + k] = component k of sample j
                        of orbit i. Samples not reached before an integrator
                        error or the step limit are filled with NAN.
     \param  device     "cpu"/"openmp" (OpenMP), "serial", or "cuda"
+    \param  method     an OrbitGPUMethod value (DOP853 or DPRKN8)
     \return an OrbitGPUResult code; ORBIT_GPU_OK on success.
 */
 template<typename T>
@@ -75,6 +89,7 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                        double accuracy,
                        std::size_t maxNumSteps,
                        T* traj,
-                       const char* device);
+                       const char* device,
+                       int method = ORBIT_GPU_DOP853);
 
 }  // namespace orbit

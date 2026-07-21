@@ -151,6 +151,47 @@ def test_fp64_parity(pot, ic, T, trajsize, cuda_available, all_ok):
     return all_ok
 
 
+def test_dprkn8_parity(pot, ic, T, trajsize, cuda_available, all_ok):
+    """DPRKN8 method on the device path: device={cpu,openmp,serial,cuda} with
+    method='dprkn8' must match the legacy CPU DPRKN8 integrator. The batch cores
+    share the exact same dprkn8_step/dense as the legacy OdeStepperDPRKN8 and the
+    same 10*accuracy^0.9 rescaling, so serial/cpu/openmp agree with legacy to
+    round-off (composite force summation order differs by ULPs, as for DOP853);
+    cuda agrees within the same fp64 tolerance."""
+    print("\n== DPRKN8 parity: {cpu, openmp, serial, cuda} vs legacy DPRKN8 ==")
+
+    # Reference: legacy CPU path, DPRKN8, explicit fp64.
+    ref = agama.orbit(potential=pot, ic=ic, time=T, trajsize=trajsize,
+                      method='dprkn8', dtype=np.float64, verbose=False)
+
+    devices = ["cpu", "openmp", "serial"]
+    if cuda_available:
+        devices.append("cuda")
+
+    for dev in devices:
+        try:
+            out = agama.orbit(potential=pot, ic=ic, time=T, trajsize=trajsize,
+                              method='dprkn8', device=dev, dtype=np.float64,
+                              verbose=False)
+            times_match = all(np.array_equal(out[k][0], ref[k][0])
+                              for k in range(len(ic)))
+            if not times_match:
+                print(f"  FAIL device={dev!r} dprkn8 : time arrays differ from legacy")
+                all_ok = False
+                continue
+            all_ok = _compare_trajectories(out, ref, tol_rel=1e-9,
+                                           tag=f"device={dev!r} dprkn8",
+                                           all_ok=all_ok)
+        except Exception as e:
+            print(f"  FAIL device={dev!r} dprkn8 : {type(e).__name__}: {e}")
+            all_ok = False
+
+    if not cuda_available:
+        print(f"  SKIP device='cuda' dprkn8 : no CUDA support in this build")
+
+    return all_ok
+
+
 def test_default_dtype_parity(pot, ic, T, trajsize, cuda_available, all_ok):
     """Default-dtype: device output must equal legacy at float32, bit-for-bit.
 
@@ -501,8 +542,10 @@ def test_error_cases(pot, ic, T, trajsize, cuda_available, all_ok):
             lambda: agama.orbit(potential=pot, ic=ic1, time=T1, trajsize=ts_arr,
                                 device='cpu', verbose=False))
 
-    # Unsupported potential type (Dehnen) -> NotImplementedError naming 'Dehnen'.
-    dehnen = agama.Potential(type='Dehnen', mass=1.0, scaleRadius=1.0)
+    # Unsupported potential -> NotImplementedError naming 'Dehnen'.
+    # Spherical Dehnen became GPU-capable in Tier 1; a non-spherical Dehnen
+    # (axisRatioZ != 1) is still rejected (buildGpuPotDesc gates on sphericity).
+    dehnen = agama.Potential(type='Dehnen', mass=1.0, scaleRadius=1.0, axisRatioZ=0.7)
     try:
         agama.orbit(potential=dehnen, ic=ic1, time=T1, trajsize=trajsize,
                     device='cpu', verbose=False)
@@ -518,10 +561,11 @@ def test_error_cases(pot, ic, T, trajsize, cuda_available, all_ok):
         print(f"  FAIL device + Dehnen : raised {type(e).__name__}: {e}")
         all_ok = False
 
-    # Composite containing Dehnen -> NotImplementedError naming the component.
+    # Composite containing a non-spherical (unsupported) Dehnen -> NotImplementedError
+    # naming the component.
     pot_bad = agama.Potential(
         dict(type='Plummer', mass=1.0, scaleRadius=1.0),
-        dict(type='Dehnen',  mass=1.0, scaleRadius=1.0),
+        dict(type='Dehnen',  mass=1.0, scaleRadius=1.0, axisRatioZ=0.7),
     )
     try:
         agama.orbit(potential=pot_bad, ic=ic1, time=T1, trajsize=trajsize,
@@ -751,9 +795,9 @@ def test_path_a_mixed_precision_concurrency(pot, cuda_available, all_ok):
 def test_path_a_exception_safety(pot, cuda_available, all_ok):
     """Exception safety under concurrency: one bad thread must not corrupt valid ones.
 
-    4 threads run concurrently.  Thread 0 uses an unsupported Dehnen potential
-    and must raise exactly NotImplementedError.  Threads 1-3 run valid cuda
-    calls and their results must be bit-identical to solo runs.
+    4 threads run concurrently.  Thread 0 uses an unsupported (non-spherical)
+    Dehnen potential and must raise exactly NotImplementedError.  Threads 1-3 run
+    valid cuda calls and their results must be bit-identical to solo runs.
     """
     print("\n== Path A exception safety: 1 bad thread + 3 valid threads concurrent ==")
 
@@ -765,7 +809,7 @@ def test_path_a_exception_safety(pot, cuda_available, all_ok):
     TRAJSIZE_CONC = 32
     T_CONC = 50.0
 
-    dehnen = agama.Potential(type='Dehnen', mass=1.0, scaleRadius=1.0)
+    dehnen = agama.Potential(type='Dehnen', mass=1.0, scaleRadius=1.0, axisRatioZ=0.7)
 
     ic_valid = []
     for seed in [901, 1002, 1103]:
@@ -893,6 +937,7 @@ def main():
     all_ok = True
 
     all_ok = test_fp64_parity(pot, ic, T, TRAJSIZE, cuda_available, all_ok)
+    all_ok = test_dprkn8_parity(pot, ic, T, TRAJSIZE, cuda_available, all_ok)
     all_ok = test_default_dtype_parity(pot, ic, T, TRAJSIZE, cuda_available, all_ok)
     all_ok = test_fp32_integration(pot, ic, T, TRAJSIZE, cuda_available, all_ok)
     all_ok = test_per_orbit_time(pot, ic, T, TRAJSIZE, cuda_available, all_ok)
