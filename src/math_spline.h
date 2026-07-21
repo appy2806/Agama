@@ -84,6 +84,7 @@ In the 3d case, the amplitudes are directly used with a cubic (N=3) 3d B-spline 
 #pragma once
 #include "math_base.h"
 #include "math_linalg.h"
+#include "math_core.h"    // binSearch (device-callable) for the raw-pointer spline evaluator
 #include "gpu_device.h"   // AGAMA_DEVICE_INLINE
 
 namespace math{
@@ -231,6 +232,47 @@ AGAMA_DEVICE_INLINE void evalQuinticSplines(
         if(d3f)
             d3f[k] = hi*hi * (60*hi-12*Px) * fd + hi*hi * (6-12*t) * f1d + (6*hi-Px) * f2d;
     }
+}
+
+/** Device-callable cubic-spline evaluation from RAW coefficient pointers -- the
+    stateless core of CubicSpline::evalDeriv (which is now a one-line wrapper over
+    this). The knots `xval[size]`, node values `fval[size]` and node derivatives
+    `fder[size]` are passed as plain pointers (`xval.data()` etc.), so a CUDA
+    kernel can evaluate a device-resident cubic spline -- e.g. a Shifted/Rotating/
+    Scaled/UniformAcceleration modifier's center(t)/angle(t)/ampl(t)/scale(t)
+    spline at the integration time. Any output pointer may be NULL. The below- and
+    above-grid linear extrapolation reproduces CubicSpline::evalDeriv exactly
+    (deriv2/deriv3 are 0 in the extrapolated regions; NaN for an empty spline or
+    NaN input). */
+AGAMA_DEVICE_INLINE void evalCubicSplineRaw(const double x,
+    const double* xval, const double* fval, const double* fder, const int size,
+    double* value, double* deriv = NULL, double* deriv2 = NULL, double* deriv3 = NULL)
+{
+    if(size == 0 || x != x) {           // empty spline or NaN input
+        if(value)  *value  = NAN;
+        if(deriv)  *deriv  = NAN;
+        if(deriv2) *deriv2 = NAN;
+        if(deriv3) *deriv3 = NAN;
+        return;
+    }
+    ptrdiff_t index = binSearch(x, xval, static_cast<size_t>(size));
+    if(index < 0) {                     // below grid: linear extrapolation from node 0
+        if(value)  *value  = fval[0] + (fder[0]==0 ? 0 : fder[0] * (x-xval[0]));
+        if(deriv)  *deriv  = fder[0];
+        if(deriv2) *deriv2 = 0;
+        if(deriv3) *deriv3 = 0;
+        return;
+    }
+    if(index >= size-1) {               // above grid: linear extrapolation from last node
+        if(value)  *value  = fval[size-1] + (fder[size-1]==0 ? 0 : fder[size-1] * (x-xval[size-1]));
+        if(deriv)  *deriv  = fder[size-1];
+        if(deriv2) *deriv2 = 0;
+        if(deriv3) *deriv3 = 0;
+        return;
+    }
+    evalCubicSplines<1>(x, xval[index], xval[index+1],
+        &fval[index], &fval[index+1], &fder[index], &fder[index+1],
+        value, deriv, deriv2, deriv3);
 }
 ///@}
 

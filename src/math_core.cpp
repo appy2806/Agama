@@ -170,48 +170,9 @@ double unwrapAngle(double x, double xprev)
 
 // sincos, atan1, atan, atan2 were promoted to math_core.h as AGAMA_DEVICE_INLINE
 // so they are callable from CUDA kernels (Tier 0 coord.h Phase 2).
-
-template<typename NumT>
-ptrdiff_t binSearch(const NumT x, const NumT arr[], size_t size)
-{
-    if(size<1 || !(x>=arr[0]))
-        return -1;
-    if(x>arr[size-1] || size<2)
-        return size-1;
-    // first guess the likely location in the case that the input grid is equally-spaced
-    ptrdiff_t index = static_cast<ptrdiff_t>( (x-arr[0]) / (arr[size-1]-arr[0]) * (size-1) );
-    ptrdiff_t indhi = size-1;
-    if(index==static_cast<ptrdiff_t>(size)-1)
-        return size-2;     // special case -- we are exactly at the end of array, return the previous node
-    if(x>=arr[index]) {
-        if(x<arr[index+1])
-            return index;  // guess correct, exiting
-        // otherwise the search is restricted to [ index .. indhi ]
-    } else {
-        indhi = index;     // search restricted to [ 0 .. index ]
-        index = 0;
-    }
-    // this will always end up with one grid node in O(log(N)) steps,
-    // even if the grid nodes were not monotonic (we don't check this assertion to avoid wasting time)
-    while(indhi > index + 1) {
-        ptrdiff_t i = (indhi + index)/2;
-        if(arr[i] > x)
-            indhi = i;
-        else
-            index = i;
-    }
-    return index;
-}
-
-// template instantiations
-template ptrdiff_t binSearch(const double,    const double[],    size_t);
-template ptrdiff_t binSearch(const float,     const float[],     size_t);
-template ptrdiff_t binSearch(const int,       const int[],       size_t);  // 32-bit
-template ptrdiff_t binSearch(const long,      const long[],      size_t);  // 32/64 depending on platform
-template ptrdiff_t binSearch(const long long, const long long[], size_t);  // 64-bit
-template ptrdiff_t binSearch(const unsigned int,       const unsigned int[],       size_t);
-template ptrdiff_t binSearch(const unsigned long,      const unsigned long[],      size_t);
-template ptrdiff_t binSearch(const unsigned long long, const unsigned long long[], size_t);
+// binSearch was likewise promoted to math_core.h as AGAMA_DEVICE_INLINE (Tier 0,
+// 2026-07): every TU that uses it now instantiates it implicitly from the header,
+// so the out-of-line definition and its 8 explicit instantiations are gone.
 
 
 /* ------ algebraic transformations of functions ------- */

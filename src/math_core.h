@@ -143,9 +143,43 @@ AGAMA_DEVICE_INLINE double atan2(double y, double x)
     \returns the index k of the bin such that x_k <= x < x_{k+1}, where the last strict inequality
     is replaced by <= for the last bin (x=x_N still returns N-1);
     if x is strictly outside the grid, return -1 if x<x_0, or N if x>x_N.
+
+    Tagged AGAMA_DEVICE_INLINE so it is callable from CUDA kernels (it is the
+    canonical bracket-search reused by the spline evaluators, Evolving, and the
+    time-interpolated BasisSet): the body is pure array indexing + arithmetic,
+    no std::/allocation/exceptions.
 */
 template<typename NumT>
-ptrdiff_t binSearch(const NumT x, const NumT arr[], const size_t size);
+AGAMA_DEVICE_INLINE ptrdiff_t binSearch(const NumT x, const NumT arr[], const size_t size)
+{
+    if(size<1 || !(x>=arr[0]))
+        return -1;
+    if(x>arr[size-1] || size<2)
+        return size-1;
+    // first guess the likely location in the case that the input grid is equally-spaced
+    ptrdiff_t index = static_cast<ptrdiff_t>( (x-arr[0]) / (arr[size-1]-arr[0]) * (size-1) );
+    ptrdiff_t indhi = size-1;
+    if(index==static_cast<ptrdiff_t>(size)-1)
+        return size-2;     // special case -- we are exactly at the end of array, return the previous node
+    if(x>=arr[index]) {
+        if(x<arr[index+1])
+            return index;  // guess correct, exiting
+        // otherwise the search is restricted to [ index .. indhi ]
+    } else {
+        indhi = index;     // search restricted to [ 0 .. index ]
+        index = 0;
+    }
+    // this will always end up with one grid node in O(log(N)) steps,
+    // even if the grid nodes were not monotonic (we don't check this assertion to avoid wasting time)
+    while(indhi > index + 1) {
+        ptrdiff_t i = (indhi + index)/2;
+        if(arr[i] > x)
+            indhi = i;
+        else
+            index = i;
+    }
+    return index;
+}
 
 /** linearly interpolate the value y(x) between y1 and y2, for x between x1 and x2 */
 inline double linearInterp(double x, double x1, double x2, double y1, double y2) {

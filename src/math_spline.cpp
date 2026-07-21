@@ -1198,28 +1198,10 @@ CubicSpline::CubicSpline(
 void CubicSpline::evalDeriv(const double x,
     double* value, double* deriv, double* deriv2, double* deriv3) const
 {
-    int size = xval.size();
-    if(size == 0 || x!=x) {
-        fillVals(value, deriv, deriv2, deriv3);
-        return;
-    }
-    int index = binSearch(x, &xval[0], size);
-    if(index < 0) {
-        fillVals(value, deriv, deriv2, deriv3,
-            // if der==0, will give correct result even for infinite x
-            fval[0] + (fder[0]==0 ? 0 : fder[0] * (x-xval[0])),
-            fder[0], 0, 0);
-        return;
-    }
-    if(index >= size-1) {
-        fillVals(value, deriv, deriv2, deriv3,
-            fval[size-1] + (fder[size-1]==0 ? 0 : fder[size-1] * (x-xval[size-1])),
-            fder[size-1], 0, 0);
-        return;
-    }
-    evalCubicSplines<1> (x, xval[index], xval[index+1],
-        &fval[index], &fval[index+1], &fder[index], &fder[index+1],
-        /*output*/ value, deriv, deriv2, deriv3);
+    // single source of math: the stateless raw-pointer core lives in math_spline.h
+    // (device-callable); this method is the thin std::vector-backed wrapper.
+    evalCubicSplineRaw(x, xval.data(), fval.data(), fder.data(),
+        static_cast<int>(xval.size()), value, deriv, deriv2, deriv3);
 }
 
 double CubicSpline::integrate(double x1, double x2, int n) const
