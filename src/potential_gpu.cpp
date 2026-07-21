@@ -8,6 +8,7 @@
 #include "potential_analytic.h"
 #include "potential_base.h"
 #include "potential_composite.h"
+#include "potential_dehnen.h"
 #include "gpu_policy.h"
 #include <cstring>
 #include <string>
@@ -88,6 +89,13 @@ bool can_dispatch(const BasePotential& pot)
         if(dynamic_cast<const PotClass*>(&pot) != NULL) return true;
     AGAMA_GPU_POT_LIST(AGAMA_GPU_CAN)
     #undef AGAMA_GPU_CAN
+    // Dehnen is deliberately NOT in AGAMA_GPU_POT_LIST above: it is only
+    // GPU-dispatchable in the spherical case (axisRatioY==axisRatioZ==1) --
+    // the triaxial potential needs math::integrate, which has no device path.
+    // Special-cased here (and in try_dispatch below) instead of folded into
+    // the blanket macro, which grants unconditional capability per type.
+    if(const Dehnen* p = dynamic_cast<const Dehnen*>(&pot))
+        return isSpherical(p->symmetry());
     if(const Composite* comp = dynamic_cast<const Composite*>(&pot)) {
         for(unsigned int c = 0; c < comp->size(); c++)
             if(!can_dispatch(*comp->component(c)))
@@ -147,6 +155,19 @@ bool try_dispatch(const BasePotential& pot, Policy pol,
         }
     AGAMA_GPU_POT_LIST(AGAMA_GPU_TRY)
     #undef AGAMA_GPU_TRY
+    if(const Dehnen* p = dynamic_cast<const Dehnen*>(&pot)) {
+        if(!isSpherical(p->symmetry()))
+            return false;   // triaxial: not GPU-dispatchable (see can_dispatch above)
+        switch(mode) {
+        case MODE_PHI:  p->template evalmanyCarT<T>(pol, N, xyz_p, out1, add);
+                        break;
+        case MODE_ACC:  p->template evalmanyPhiAccCarT<T>(pol, N, xyz_p, out1, out3, add);
+                        break;
+        case MODE_DENS: p->template evalmanyDensCarT<T>(pol, N, xyz_p, out1, add);
+                        break;
+        }
+        return true;
+    }
     if(const Composite* comp = dynamic_cast<const Composite*>(&pot)) {
         if(!can_dispatch(pot))   // all-or-nothing: don't partially write outputs
             return false;

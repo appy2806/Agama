@@ -24,20 +24,26 @@
 #include "potential_base.h"
 #include "potential_analytic.h"
 #include "potential_composite.h"
+#include "potential_dehnen.h"
 #include "gpu_device.h"
 #include <cmath>
 
 namespace potential {
 
 /// concrete potential types representable in a GpuPotTerm;
-/// must match the GPU-capable set in potential_gpu.cpp (AGAMA_GPU_POT_LIST)
+/// must match the GPU-capable set in potential_gpu.cpp (AGAMA_GPU_POT_LIST),
+/// EXCEPT GPU_POT_DEHNEN: Dehnen is only representable for the spherical case
+/// (axisRatioY==axisRatioZ==1) -- buildGpuPotDesc() checks isSpherical() before
+/// emitting this tag, and potential_gpu.cpp gates it the same way outside its
+/// AGAMA_GPU_POT_LIST macro (see the comment there for why it isn't listed).
 enum GpuPotTag {
     GPU_POT_PLUMMER,
     GPU_POT_ISOCHRONE,
     GPU_POT_NFW,
     GPU_POT_MIYAMOTONAGAI,
     GPU_POT_LOGARITHMIC,
-    GPU_POT_HARMONIC
+    GPU_POT_HARMONIC,
+    GPU_POT_DEHNEN
 };
 
 /// maximum number of flattened members a descriptor can hold; a composite
@@ -51,7 +57,8 @@ enum { GPU_POT_DESC_MAX_TERMS = 16 };
       PLUMMER / ISOCHRONE / NFW : p = { mass, scaleRadius }
       MIYAMOTONAGAI             : p = { mass, scaleRadius, scaleHeight }
       LOGARITHMIC               : p = { v0squared, coreRadius2, p2, q2, lengthUnit2 }
-      HARMONIC                  : p = { Omega2, p2, q2 }                     */
+      HARMONIC                  : p = { Omega2, p2, q2 }
+      DEHNEN (spherical only)   : p = { mass, scalerad, gamma }               */
 template<typename T>
 struct GpuPotTerm {
     int tag;   ///< a GpuPotTag value
@@ -118,6 +125,13 @@ AGAMA_DEVICE_INLINE void gpu_term_phi_acc(const GpuPotTerm<T>& t,
         a[0] = -g[0];  a[1] = -g[1];  a[2] = -g[2];
         break;
     }
+    case GPU_POT_DEHNEN: {   // spherical only, guaranteed by buildGpuPotDesc
+        const T r = std::sqrt(x*x + y*y + z*z);
+        T dPhidr;
+        dehnen_eval(t.p[0], t.p[1], t.p[2], r, phi ? &pot : (T*)NULL, &dPhidr, (T*)NULL);
+        sph_acc_car(dPhidr, x, y, z, r, a);
+        break;
+    }
     default:  // unreachable if the descriptor was built by buildGpuPotDesc
         a[0] = a[1] = a[2] = 0;
         break;
@@ -176,6 +190,14 @@ inline bool buildGpuPotDesc(const BasePotential& pot, GpuPotDesc<double>& desc,
         { term.tag = GPU_POT_LOGARITHMIC;    p->gpuTermParams(term.p); }
     else if(const Harmonic* p = dynamic_cast<const Harmonic*>(&pot))
         { term.tag = GPU_POT_HARMONIC;       p->gpuTermParams(term.p); }
+    else if(const Dehnen* p = dynamic_cast<const Dehnen*>(&pot)) {
+        // triaxial Dehnen needs math::integrate (no device path); fail cleanly
+        // instead of silently building a descriptor for the wrong potential
+        if(!isSpherical(p->symmetry()))
+            return false;
+        term.tag = GPU_POT_DEHNEN;
+        p->gpuTermParams(term.p);
+    }
     else
         return false;
     desc.nterms++;

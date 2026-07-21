@@ -7,8 +7,37 @@
 #include "potential_base.h"
 #include "smart.h"
 #include "math_spline.h"
+#include "gpu_policy.h"   // agama::forall for templated batch evaluators (Tier 1)
 
 namespace potential{
+
+// =====================================================================
+// Tier 1 leaf math for UniformAcceleration (single source: the same body is
+// called by the CPU evalCar below and by evalmanyCarT/evalmanyPhiAccCarT).
+// Unlike every other Tier 1 leaf in this codebase, UniformAcceleration is
+// genuinely time-dependent (the acceleration components are time-dependent
+// CubicSpline evaluations) -- but the spline evaluation itself is NOT part of
+// the leaf: the caller evaluates accx(time)/accy(time)/accz(time) ONCE on the
+// host (CubicSpline::operator() is not AGAMA_DEVICE-callable; math_spline.h is
+// out of scope for this migration) and passes the resulting three scalars in.
+// The leaf itself is then an ordinary POD-in/POD-out function like any other.
+// =====================================================================
+
+/** UniformAcceleration:  Phi(x,y,z) = x*dx + y*dy + z*dz  for a given (already
+    time-evaluated) acceleration-derived gradient (dx,dy,dz) = (-ax(t),-ay(t),-az(t)).
+    grad (length 3, nullable) is just (dx,dy,dz) -- constant in space. */
+template<typename T>
+AGAMA_DEVICE_INLINE void uniform_acceleration_eval(T dx, T dy, T dz, T x, T y, T z,
+    T* potential, T* grad /*[3]*/)
+{
+    if(potential)
+        *potential = x*dx + y*dy + z*dz;
+    if(grad) {
+        grad[0] = dx;
+        grad[1] = dy;
+        grad[2] = dz;
+    }
+}
 
 /** Interface for composite Density or Potential classes:
     these may contain multiple individual components, as in CompositeDensity or Composite potential,
@@ -136,19 +165,86 @@ public:
     virtual std::string name() const { return myName(); }
     static std::string myName() { return "UniformAcceleration"; }
 
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via the
+        uniform_acceleration_eval leaf, for a single given `time` shared by the
+        whole batch (mirrors BaseDensity::evalmanyDensityCar's single-scalar-time
+        convention). The three CubicSpline lookups happen ONCE here, host-side,
+        before the forall; NOT wired into the GPU dispatch tables in
+        potential_gpu.cpp / potential_descriptor.h -- see the class-level note
+        below for why. add=true accumulates into phi[] (composite support). */
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi, double time = 0, bool add = false) const
+    {
+        const T dx = static_cast<T>(-accx(time)),
+                dy = static_cast<T>(-accy(time)),
+                dz = static_cast<T>(-accz(time));
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            T pot;
+            uniform_acceleration_eval(dx, dy, dz, x, y, z, &pot, (T*)NULL);
+            phi[i] = add ? phi[i] + pot : pot;
+        });
+    }
+
+    /** Fused batch evaluator: Phi (optional) + Cartesian acceleration a = -grad
+        Phi = (ax(t),ay(t),az(t)) -- spatially uniform, so every point gets the
+        same acceleration; the leaf is still called per-point for a single
+        source of the Phi expression. add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double time = 0, bool add = false) const
+    {
+        const T dx = static_cast<T>(-accx(time)),
+                dy = static_cast<T>(-accy(time)),
+                dz = static_cast<T>(-accz(time));
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            T pot, grad[3];
+            uniform_acceleration_eval(dx, dy, dz, x, y, z, phi ? &pot : (T*)NULL, grad);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            acc[i*3+0] = add ? acc[i*3+0] - grad[0] : -grad[0];
+            acc[i*3+1] = add ? acc[i*3+1] - grad[1] : -grad[1];
+            acc[i*3+2] = add ? acc[i*3+2] - grad[2] : -grad[2];
+        });
+    }
+
 private:
     const math::CubicSpline accx, accy, accz;
+
+    // NOTE (read before wiring this class into potential_gpu.cpp's
+    // AGAMA_GPU_POT_LIST or potential_descriptor.h's GpuPotTag/GpuPotTerm):
+    // UniformAcceleration is genuinely time-dependent, but the entire Tier 1
+    // GPU batch dispatch (evalPotentialGPU/evalForceGPU/evalDensityGPU and
+    // their try_dispatch/can_dispatch plumbing in potential_gpu.cpp) and the
+    // Tier 3 force descriptor (GpuPotDesc/GpuPotTerm/buildGpuPotDesc in
+    // potential_descriptor.h) carry NO time parameter anywhere -- every other
+    // migrated potential is time-independent, so "time" was never threaded
+    // through those signatures, and gpuTermParams() takes a fixed snapshot of
+    // constructor doubles once, which cannot represent "the CubicSpline
+    // evaluated at whatever time the caller asks for". Wiring this class into
+    // either dispatch table today would either (a) silently freeze time=0 for
+    // every call -- exactly the "silently compute it wrong" outcome CLAUDE.md
+    // asks to avoid, or (b) require adding a time argument through
+    // evalPotentialGPU/evalForceGPU/evalDensityGPU (Python-facing, owned by
+    // interface_python.cpp -- out of scope here) and, for Tier 3, porting
+    // CubicSpline evaluation to device (math_spline.h -- also out of scope).
+    // The evalmanyCarT/evalmanyPhiAccCarT above are therefore usable directly
+    // (and are exercised by a Serial-vs-Cuda parity test), but deliberately
+    // NOT registered in either dispatch table until that design decision is made.
 
     virtual void evalCar(const coord::PosCar &pos,
         double* potential, coord::GradCar* deriv, coord::HessCar* deriv2, double time) const
     {
         double dx = -accx(time), dy = -accy(time), dz = -accz(time);
-        if(potential)
-            *potential = pos.x * dx + pos.y * dy + pos.z * dz;
+        double grad[3];
+        uniform_acceleration_eval(dx, dy, dz, pos.x, pos.y, pos.z,
+            potential, deriv ? grad : (double*)NULL);
         if(deriv) {
-            deriv->dx = dx;
-            deriv->dy = dy;
-            deriv->dz = dz;
+            deriv->dx = grad[0];
+            deriv->dy = grad[1];
+            deriv->dz = grad[2];
         }
         if(deriv2)
             coord::clear(*deriv2);

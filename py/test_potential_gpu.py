@@ -468,10 +468,14 @@ def main():
         all_ok = False
 
     # -- NotImplementedError on a composite with an unsupported member --
+    # Non-spherical Dehnen (axisRatioZ != 1) is the genuinely-unsupported member:
+    # spherical Dehnen became GPU-capable in Tier 1, but the dispatch gates Dehnen
+    # on isSpherical(symmetry()) across all ops (potential/force/density), so a
+    # flattened Dehnen still raises NotImplementedError naming 'Dehnen'.
     print("\n== NotImplementedError on composite containing unsupported member ==")
     composite_bad = agama.Potential(
         dict(type='Plummer', mass=1.0, scaleRadius=1.0),
-        dict(type='Dehnen',  mass=1.0, scaleRadius=1.0),
+        dict(type='Dehnen',  mass=1.0, scaleRadius=1.0, axisRatioZ=0.7),
     )
     try:
         composite_bad.potential(xyz, device='cuda', dtype=np.float64)

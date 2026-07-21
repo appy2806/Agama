@@ -36,9 +36,8 @@ Dehnen::Dehnen(double _mass, double _scalerad, double _gamma, double _axisRatioY
 
 double Dehnen::densityCar(const coord::PosCar& pos, double /*time*/) const
 {
-    double m = sqrt(pow_2(pos.x) + pow_2(pos.y/axisRatioY) + pow_2(pos.z/axisRatioZ));
-    return mass * scalerad * (3-gamma) / (4*M_PI*axisRatioY*axisRatioZ) *
-        math::pow(m, -gamma) * math::pow(scalerad+m, gamma-4);
+    // single source: same closed-form leaf as the GPU batch evalmanyDensCarT
+    return dehnen_rho(mass, scalerad, gamma, axisRatioY, axisRatioZ, pos.x, pos.y, pos.z);
 }
 
 namespace{  // internal
@@ -92,27 +91,21 @@ void Dehnen::evalCar(const coord::PosCar &pos,
     double* potential, coord::GradCar* deriv, coord::HessCar* deriv2, double /*time*/) const
 {
     if(axisRatioY==1 && axisRatioZ==1) {  // analytical expression for spherical potential
+        // single source: same dehnen_eval leaf as the GPU batch evalmanyCarT/evalmanyPhiAccCarT
         double r = sqrt(pos.x*pos.x + pos.y*pos.y + pos.z*pos.z);
-        double s = scalerad / r;
-        if(potential!=NULL) {
-            if(s > 2e-3/(4-gamma))
-                *potential = mass/scalerad *
-                    (gamma==2 ? -log(1+s) : (1 - math::pow(1+s, gamma-2)) / (gamma-2) );
-            else  // asymptotic expansion for r-->infinity, or equivalently s-->0
-                *potential = mass/scalerad *
-                    -s * (1 + s * (gamma-3)/2 * (1 + s * (gamma-4)/3 * (1 + s * (gamma-5)/4)));
-        }
+        double val, val2;
+        dehnen_eval(mass, scalerad, gamma, r, potential,
+            (deriv || deriv2) ? &val : (double*)NULL,
+            deriv2 ? &val2 : (double*)NULL);
         if(deriv==NULL && deriv2==NULL)
             return;
         double xr = pos.x/r, yr = pos.y/r, zr = pos.z/r;
-        double val = mass * math::pow(r, 1-gamma) * math::pow(r+scalerad, gamma-3);
         if(deriv!=NULL) {
             deriv->dx = r>0 ? val*xr : 0;
             deriv->dy = r>0 ? val*yr : 0;
             deriv->dz = r>0 ? val*zr : 0;
         }
         if(deriv2!=NULL) {
-            double val2  = -val * (gamma * s + 3) / (r+scalerad);
             deriv2->dx2  = val2 * xr * xr + val/r;
             deriv2->dy2  = val2 * yr * yr + val/r;
             deriv2->dz2  = val2 * zr * zr + val/r;

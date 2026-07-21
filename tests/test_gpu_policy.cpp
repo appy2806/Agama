@@ -14,7 +14,8 @@
 #include "math_sphharm.h"        // for math::trigMultiAngle (Tier 0 device-inline leaf)
 #include "coord.h"               // toPos<Car,Cyl>, toPos<Car,Sph> (Tier 0 Phase 2 device-inline)
 #include "potential_analytic.h"  // potential::NFW + nfw_phi leaf (Tier 1 worked example)
-#include "potential_composite.h"    // Composite for the Tier 3 orbit workload
+#include "potential_dehnen.h"    // potential::Dehnen (spherical GPU path) + dehnen_eval leaf
+#include "potential_composite.h"    // Composite for the Tier 3 orbit workload; UniformAcceleration
 #include "potential_descriptor.h"   // GpuPotDesc + gpu_desc_phi_acc (Tier 3 force descriptor)
 #include "orbit.h"                  // orbit::integrateTraj (CPU reference integrator)
 #include "orbit_gpu.h"              // orbit::integrateOrbitsGPU (Tier 3 batch path)
@@ -424,13 +425,17 @@ int main() {
         potential::Logarithmic   logp    (/*v0=*/1.0, /*core=*/0.1,
                                           /*p=*/0.9, /*q=*/0.7, /*L=*/1.0);
         potential::Harmonic      harm    (/*Omega=*/1.0, /*p=*/0.8, /*q=*/0.5);
+        // spherical case only (axisRatioY=axisRatioZ=1) -- the GPU batch path
+        // rejects triaxial Dehnen (see potential_dehnen.h / potential_gpu.cpp)
+        potential::Dehnen        dehnen  (/*mass=*/1.0, /*scalerad=*/1.0, /*gamma=*/1.0);
         bool ok_pots =
             check_pot_parity(plummer, "Plummer",       xyz_h) &&
             check_pot_parity(iso,     "Isochrone",     xyz_h) &&
             check_pot_parity(nfw,     "NFW",           xyz_h) &&
             check_pot_parity(mn,      "MiyamotoNagai", xyz_h) &&
             check_pot_parity(logp,    "Logarithmic",   xyz_h) &&
-            check_pot_parity(harm,    "Harmonic",      xyz_h);
+            check_pot_parity(harm,    "Harmonic",      xyz_h) &&
+            check_pot_parity(dehnen,  "Dehnen(sph)",   xyz_h);
         if(!ok_pots) {
             std::fprintf(stderr, "FAIL (Tier 1 analytic potential parity)\n");
             return 1;
@@ -464,6 +469,124 @@ int main() {
                 NN, max_err, ACC_TOL, ok_acc ? "OK" : "FAIL");
             if(!ok_acc) {
                 std::fprintf(stderr, "FAIL (NFW fused Phi+acc parity)\n");
+                return 1;
+            }
+        }
+
+        // ----- Dehnen (spherical) fused Phi+acc batch, Serial vs Cuda -----
+        // Same fused-kernel pattern as NFW above, via the dehnen_eval leaf.
+        {
+            std::vector<double> phi_s(NN), acc_s(NN * 3);
+            dehnen.evalmanyPhiAccCarT<double>(Serial{}, NN, xyz_h.data(),
+                phi_s.data(), acc_s.data());
+            device_array<double> d_xyz2(NN * 3);
+            d_xyz2.from_host(xyz_h.data(), NN * 3);
+            device_array<double> d_phi2(NN), d_acc2(NN * 3);
+            dehnen.evalmanyPhiAccCarT<double>(Cuda{}, NN, d_xyz2.data(),
+                d_phi2.data(), d_acc2.data());
+            std::vector<double> phi_c(NN), acc_c(NN * 3);
+            d_phi2.to_host(phi_c.data(), NN);
+            d_acc2.to_host(acc_c.data(), NN * 3);
+            double max_err = 0.0;
+            for(std::size_t i = 0; i < NN; ++i)
+                max_err = std::max(max_err, std::fabs(phi_s[i] - phi_c[i]));
+            for(std::size_t i = 0; i < NN * 3; ++i)
+                max_err = std::max(max_err, std::fabs(acc_s[i] - acc_c[i]));
+            const double ACC_TOL = 1e-13;
+            bool ok_acc = (max_err <= ACC_TOL);
+            std::printf("[CUDA]  Dehnen(sph) evalmanyPhiAccCarT (fused Phi+acc, N=%zu): "
+                "Serial-vs-Cuda max |err| = %.3e, tol = %.1e -> %s\n",
+                NN, max_err, ACC_TOL, ok_acc ? "OK" : "FAIL");
+            if(!ok_acc) {
+                std::fprintf(stderr, "FAIL (Dehnen fused Phi+acc parity)\n");
+                return 1;
+            }
+        }
+
+        // ----- Dehnen density (triaxial-general leaf), Serial vs Cuda -----
+        // evalmanyDensCarT supports arbitrary axis ratios (density has a closed
+        // form even where the potential does not); exercise it on a genuinely
+        // triaxial instance to confirm the leaf itself (not just the spherical
+        // gate) is correct -- this instance is NOT dispatched through
+        // potential_gpu.cpp/try_dispatch (which gates the whole type on
+        // sphericity), only called directly here.
+        {
+            potential::Dehnen dehnenTri(/*mass=*/1.0, /*scalerad=*/1.0, /*gamma=*/1.2,
+                /*axisRatioY=*/0.8, /*axisRatioZ=*/0.6);
+            std::vector<double> rho_s(NN);
+            dehnenTri.evalmanyDensCarT<double>(Serial{}, NN, xyz_h.data(), rho_s.data());
+            device_array<double> d_xyz3(NN * 3);
+            d_xyz3.from_host(xyz_h.data(), NN * 3);
+            device_array<double> d_rho3(NN);
+            dehnenTri.evalmanyDensCarT<double>(Cuda{}, NN, d_xyz3.data(), d_rho3.data());
+            std::vector<double> rho_c(NN);
+            d_rho3.to_host(rho_c.data(), NN);
+            double max_rho = 1e-300, max_err = 0.0, max_virt_err = 0.0;
+            for(std::size_t i = 0; i < NN; ++i)
+                max_rho = std::max(max_rho, std::fabs(rho_s[i]));
+            for(std::size_t i = 0; i < NN; ++i)
+                max_err = std::max(max_err, std::fabs(rho_s[i] - rho_c[i]));
+            for(std::size_t i = 0; i < 8 && i < NN; ++i) {
+                const coord::PosCar p(xyz_h[i*3+0], xyz_h[i*3+1], xyz_h[i*3+2]);
+                max_virt_err = std::max(max_virt_err,
+                    std::fabs(dehnenTri.density(p) - rho_s[i]));
+            }
+            const double RHO_TOL = 1e-13 * max_rho;
+            bool ok_rho = (max_err <= RHO_TOL) && (max_virt_err <= RHO_TOL);
+            std::printf("[CUDA]  Dehnen(triaxial) evalmanyDensCarT: max|rho|=%.3e   "
+                "Serial-vs-Cuda |err|=%.3e   leaf-vs-virtual |err|=%.3e   tol=%.1e -> %s\n",
+                max_rho, max_err, max_virt_err, RHO_TOL, ok_rho ? "OK" : "FAIL");
+            if(!ok_rho) {
+                std::fprintf(stderr, "FAIL (Dehnen triaxial density parity)\n");
+                return 1;
+            }
+        }
+
+        // ----- UniformAcceleration: Serial vs Cuda + leaf-vs-virtual -----
+        // Not registered in potential_gpu.cpp/potential_descriptor.h (see the
+        // class-level comment in potential_composite.h for why -- it is
+        // genuinely time-dependent and the dispatch tables carry no time
+        // parameter), so this is a direct call, not a check_pot_parity() /
+        // try_dispatch() exercise. accx/accy/accz are non-constant splines so
+        // that evaluating at a nonzero, non-grid-point `time` is a meaningful
+        // check of the host-side spline evaluation feeding the device leaf.
+        {
+            std::vector<double> tk = {0.0, 1.0, 2.0, 3.0};
+            math::CubicSpline accx(tk, {0.1, 0.3, -0.2, 0.5});
+            math::CubicSpline accy(tk, {-0.4, 0.2, 0.1, -0.1});
+            math::CubicSpline accz(tk, {0.05, -0.05, 0.2, 0.0});
+            potential::UniformAcceleration ua(accx, accy, accz);
+            const double T_EVAL = 1.35;   // interior, non-grid-point time
+            std::vector<double> phi_s(NN), acc_s(NN * 3);
+            ua.evalmanyPhiAccCarT<double>(Serial{}, NN, xyz_h.data(),
+                phi_s.data(), acc_s.data(), T_EVAL);
+            device_array<double> d_xyz4(NN * 3);
+            d_xyz4.from_host(xyz_h.data(), NN * 3);
+            device_array<double> d_phi4(NN), d_acc4(NN * 3);
+            ua.evalmanyPhiAccCarT<double>(Cuda{}, NN, d_xyz4.data(),
+                d_phi4.data(), d_acc4.data(), T_EVAL);
+            std::vector<double> phi_c(NN), acc_c(NN * 3);
+            d_phi4.to_host(phi_c.data(), NN);
+            d_acc4.to_host(acc_c.data(), NN * 3);
+            double max_phi = 1e-300, max_err = 0.0, max_virt_err = 0.0;
+            for(std::size_t i = 0; i < NN; ++i)
+                max_phi = std::max(max_phi, std::fabs(phi_s[i]));
+            for(std::size_t i = 0; i < NN; ++i)
+                max_err = std::max(max_err, std::fabs(phi_s[i] - phi_c[i]));
+            for(std::size_t i = 0; i < NN * 3; ++i)
+                max_err = std::max(max_err, std::fabs(acc_s[i] - acc_c[i]));
+            for(std::size_t i = 0; i < 8 && i < NN; ++i) {
+                const coord::PosCar p(xyz_h[i*3+0], xyz_h[i*3+1], xyz_h[i*3+2]);
+                max_virt_err = std::max(max_virt_err,
+                    std::fabs(ua.value(p, T_EVAL) - phi_s[i]));
+            }
+            const double UA_TOL = 1e-13 * max_phi;
+            bool ok_ua = (max_err <= UA_TOL) && (max_virt_err <= UA_TOL);
+            std::printf("[CUDA]  UniformAcceleration evalmanyPhiAccCarT: max|phi|=%.3e   "
+                "Serial-vs-Cuda |err|=%.3e   leaf-vs-virtual |err|=%.3e   tol=%.1e -> %s\n",
+                max_phi, max_err, max_virt_err, UA_TOL, ok_ua ? "OK" : "FAIL");
+            if(!ok_ua) {
+                std::fprintf(stderr, "FAIL (UniformAcceleration parity)\n");
                 return 1;
             }
         }
