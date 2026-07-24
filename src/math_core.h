@@ -152,19 +152,19 @@ AGAMA_DEVICE_INLINE double atan2(double y, double x)
 template<typename NumT>
 AGAMA_DEVICE_INLINE ptrdiff_t binSearch(const NumT x, const NumT arr[], const size_t size)
 {
-    if(size<1 || !(x>=arr[0]))
+    if(size < 1 || !(x >= arr[0]))  // before the beginning of the array, or x is NAN
         return -1;
-    if(x>arr[size-1] || size<2)
+    if(x > arr[size-1] || size < 2)
         return size-1;
     // first guess the likely location in the case that the input grid is equally-spaced
-    ptrdiff_t index = static_cast<ptrdiff_t>( (x-arr[0]) / (arr[size-1]-arr[0]) * (size-1) );
-    ptrdiff_t indhi = size-1;
-    if(index==static_cast<ptrdiff_t>(size)-1)
-        return size-2;     // special case -- we are exactly at the end of array, return the previous node
-    if(x>=arr[index]) {
-        if(x<arr[index+1])
+    size_t index = static_cast<ptrdiff_t>( (x-arr[0]) / (arr[size-1]-arr[0]) * ((ptrdiff_t)size-1) );
+    size_t indhi = size-1;
+    if(index == indhi)
+        return size-2;  // special case (exactly at the end of the array), return the penultimate node
+    if(x >= arr[index]) {
+        if(x < arr[index+1])
             return index;  // guess correct, exiting
-        // otherwise the search is restricted to [ index .. indhi ]
+        // otherwise the search is restricted to [ index .. size-1 ]
     } else {
         indhi = index;     // search restricted to [ 0 .. index ]
         index = 0;
@@ -172,11 +172,9 @@ AGAMA_DEVICE_INLINE ptrdiff_t binSearch(const NumT x, const NumT arr[], const si
     // this will always end up with one grid node in O(log(N)) steps,
     // even if the grid nodes were not monotonic (we don't check this assertion to avoid wasting time)
     while(indhi > index + 1) {
-        ptrdiff_t i = (indhi + index)/2;
-        if(arr[i] > x)
-            indhi = i;
-        else
-            index = i;
+        size_t i = (indhi + index) / 2;
+        indhi = arr[i] > x ? i : indhi;  // possible optimization (depends on the compiler):
+        index = arr[i] > x ? index : i;  // replace an unpredictable branch by two conditional moves
     }
     return index;
 }
