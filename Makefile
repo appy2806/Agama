@@ -106,7 +106,7 @@ ifdef HAVE_CUDA
 define CUDA_TU_RULE
 $(OBJDIR)/$(1).o:  $(SRCDIR)/$(1).cpp Makefile.local
 	@mkdir -p $(OBJDIR)
-	$(NVCC) $(NVCC_FLAGS_ALL) -c -x cu "$$<" -o "$$@"
+	$(NVCC) $(NVCC_FLAGS_ALL) -MMD -MF "$$(@:.o=.d)" -c -x cu "$$<" -o "$$@"
 endef
 $(foreach tu,$(CUDA_TUS),$(eval $(call CUDA_TU_RULE,$(tu))))
 endif
