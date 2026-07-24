@@ -25,6 +25,7 @@
 #include "potential_analytic.h"
 #include "potential_composite.h"
 #include "potential_dehnen.h"
+#include "potential_disk.h"
 #include "gpu_device.h"
 #include <cmath>
 
@@ -32,10 +33,12 @@ namespace potential {
 
 /// concrete potential types representable in a GpuPotTerm;
 /// must match the GPU-capable set in potential_gpu.cpp (AGAMA_GPU_POT_LIST),
-/// EXCEPT GPU_POT_DEHNEN: Dehnen is only representable for the spherical case
-/// (axisRatioY==axisRatioZ==1) -- buildGpuPotDesc() checks isSpherical() before
-/// emitting this tag, and potential_gpu.cpp gates it the same way outside its
-/// AGAMA_GPU_POT_LIST macro (see the comment there for why it isn't listed).
+/// EXCEPT GPU_POT_DEHNEN and GPU_POT_DISK_ANSATZ: Dehnen is only representable
+/// for the spherical case (axisRatioY==axisRatioZ==1), and DiskAnsatz only for
+/// the 5 recognized closed-form radial/vertical functor types -- both are
+/// special-cased in buildGpuPotDesc() below (and in potential_gpu.cpp outside
+/// its AGAMA_GPU_POT_LIST macro; see the comment there) rather than folded
+/// into the blanket per-type capability of the X-macro list.
 enum GpuPotTag {
     GPU_POT_PLUMMER,
     GPU_POT_ISOCHRONE,
@@ -43,7 +46,8 @@ enum GpuPotTag {
     GPU_POT_MIYAMOTONAGAI,
     GPU_POT_LOGARITHMIC,
     GPU_POT_HARMONIC,
-    GPU_POT_DEHNEN
+    GPU_POT_DEHNEN,
+    GPU_POT_DISK_ANSATZ
 };
 
 /// maximum number of flattened members a descriptor can hold; a composite
@@ -58,11 +62,19 @@ enum { GPU_POT_DESC_MAX_TERMS = 16 };
       MIYAMOTONAGAI             : p = { mass, scaleRadius, scaleHeight }
       LOGARITHMIC               : p = { v0squared, coreRadius2, p2, q2, lengthUnit2 }
       HARMONIC                  : p = { Omega2, p2, q2 }
-      DEHNEN (spherical only)   : p = { mass, scalerad, gamma }               */
+      DEHNEN (spherical only)   : p = { mass, scalerad, gamma }
+      DISK_ANSATZ (recognized radial/vertical functors only):
+          aux = (radialType | verticalType << 4), a DiskRadialType/DiskVerticalType
+                pair (see potential_disk.h), NOT a double -- kept as a separate
+                int field rather than packed into p[] since it selects which
+                closed-form leaf to call, not a continuous parameter;
+          p = { surfaceDensity, invScaleRadius, innerCutoffRadius,
+                modulationAmplitude, invSersicIndex, invScaleHeight }        */
 template<typename T>
 struct GpuPotTerm {
     int tag;   ///< a GpuPotTag value
-    T p[5];    ///< constructor parameters, layout per tag (unused slots zero)
+    int aux;   ///< auxiliary integer sub-selector; only DISK_ANSATZ uses this (see above); 0 otherwise
+    T p[6];    ///< constructor parameters, layout per tag (unused slots zero)
 };
 
 /** Flattened by-value snapshot of a (possibly Composite) potential. */
@@ -132,6 +144,17 @@ AGAMA_DEVICE_INLINE void gpu_term_phi_acc(const GpuPotTerm<T>& t,
         sph_acc_car(dPhidr, x, y, z, r, a);
         break;
     }
+    case GPU_POT_DISK_ANSATZ: {   // recognized functor pair only, guaranteed by buildGpuPotDesc
+        const T R = std::sqrt(x*x + y*y);
+        const int radialType = t.aux & 0xF, verticalType = (t.aux >> 4) & 0xF;
+        DiskRadialParams<T>   rp = { t.p[0], t.p[1], t.p[2], t.p[3], t.p[4] };
+        DiskVerticalParams<T> vp = { t.p[5] };
+        T dR, dz;
+        disk_ansatz_eval(radialType, rp, verticalType, vp, R, z,
+            phi ? &pot : (T*)NULL, &dR, &dz, (T*)NULL, (T*)NULL, (T*)NULL);
+        cyl_acc_car(dR, dz, x, y, R, a);
+        break;
+    }
     default:  // unreachable if the descriptor was built by buildGpuPotDesc
         a[0] = a[1] = a[2] = 0;
         break;
@@ -176,7 +199,8 @@ inline bool buildGpuPotDesc(const BasePotential& pot, GpuPotDesc<double>& desc,
     if(desc.nterms >= GPU_POT_DESC_MAX_TERMS)
         return false;
     GpuPotTerm<double>& term = desc.terms[desc.nterms];
-    for(int k = 0; k < 5; k++)
+    term.aux = 0;
+    for(int k = 0; k < 6; k++)
         term.p[k] = 0;
     if(const Plummer* p = dynamic_cast<const Plummer*>(&pot))
         { term.tag = GPU_POT_PLUMMER;        p->gpuTermParams(term.p); }
@@ -198,6 +222,21 @@ inline bool buildGpuPotDesc(const BasePotential& pot, GpuPotDesc<double>& desc,
         term.tag = GPU_POT_DEHNEN;
         p->gpuTermParams(term.p);
     }
+    else if(const DiskAnsatz* p = dynamic_cast<const DiskAnsatz*>(&pot)) {
+        // arbitrary-user-function DiskAnsatz (second constructor) needs no
+        // device path; fail cleanly instead of building a wrong descriptor
+        DiskAnsatzDesc<double> d;
+        if(!p->gpuDesc(d))
+            return false;
+        term.tag = GPU_POT_DISK_ANSATZ;
+        term.aux = (d.radialType & 0xF) | ((d.verticalType & 0xF) << 4);
+        term.p[0] = d.radial.surfaceDensity;
+        term.p[1] = d.radial.invScaleRadius;
+        term.p[2] = d.radial.innerCutoffRadius;
+        term.p[3] = d.radial.modulationAmplitude;
+        term.p[4] = d.radial.invSersicIndex;
+        term.p[5] = d.vertical.invScaleHeight;
+    }
     else
         return false;
     desc.nterms++;
@@ -213,7 +252,8 @@ inline GpuPotDesc<T> castGpuPotDesc(const GpuPotDesc<double>& d)
     out.nterms = d.nterms;
     for(int c = 0; c < d.nterms; c++) {
         out.terms[c].tag = d.terms[c].tag;
-        for(int k = 0; k < 5; k++)
+        out.terms[c].aux = d.terms[c].aux;
+        for(int k = 0; k < 6; k++)
             out.terms[c].p[k] = static_cast<T>(d.terms[c].p[k]);
     }
     return out;

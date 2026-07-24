@@ -66,7 +66,11 @@ is provided in potential_factory.h, taking the name of parameter file and the Un
 
 #pragma once
 #include "potential_base.h"
+#include "potential_analytic.h"  // cyl_acc_car (Cartesian acceleration helper) + gpu_policy pull-through
 #include "smart.h"
+#include "gpu_policy.h"          // agama::forall for templated batch evaluators (Tier 1)
+#include <cmath>
+#include <stdexcept>
 #include <vector>
 
 namespace potential{
@@ -125,6 +129,358 @@ math::PtrFunction createRadialDiskFnc(const DiskParam& params);
 /** helper routine to create an instance of vertical density function */
 math::PtrFunction createVerticalDiskFnc(const DiskParam& params);
 
+// =====================================================================
+// Tier 1 leaf math: AGAMA_DEVICE_INLINE, single-source with the evalDeriv
+// methods of the 5 concrete radial/vertical functor classes below (moved here
+// from potential_disk.cpp so DiskAnsatz can recognize them via dynamic_cast --
+// see recognizeDiskAnsatz() further down) and with DiskAnsatz::evalCyl /
+// DiskAnsatz::densityCyl (potential_disk.cpp), which continue to call the
+// functors' evalDeriv virtuals exactly as before (unchanged) -- those virtuals
+// are now thin wrappers over the leaves here, so the CPU virtual path and the
+// tagged-descriptor GPU batch path share one set of expressions.
+//
+// Unlike a single spherical/cylindrical analytic potential, DiskAnsatz's f(R)
+// and H(z) factors are each one of several closed-form functor types (the
+// disk profile is user-selectable via DiskParam), so recognizing which pair
+// is in use and dispatching to the matching leaf is itself part of the
+// "leaf" layer here: disk_radial_dispatch / disk_vertical_dispatch switch on
+// a small tag enum, and disk_ansatz_eval / disk_ansatz_rho are the combining
+// leaves that replicate DiskAnsatz::evalCyl / DiskAnsatz::densityCyl exactly.
+// =====================================================================
+
+/** Mirrors math::pow(double,double)'s fast-path special cases (see math_core.cpp)
+    so that the device leaf and the CPU virtual method -- which used to call
+    math::pow directly -- produce bit-for-bit identical results. Same mirror as
+    dehnen_powT in potential_dehnen.h (math::pow itself is a plain host function,
+    not device-callable, hence the local reproduction here too). */
+template<typename T>
+AGAMA_DEVICE_INLINE T disk_powT(T x, T n)
+{
+    if(n == T(0))    return T(1);
+    if(n == T(1))    return x;
+    if(n == T(-1))   return T(1) / x;
+    if(n == T(2))    return x*x;
+    if(n == T(-2))   return T(1) / (x*x);
+    if(n == T(0.5))  return std::sqrt(x);
+    if(n == T(-0.5)) return T(1) / std::sqrt(x);
+    if(n == T(3))    return x*x*x;
+    if(n == T(-3))   return T(1) / (x*x*x);
+    return std::pow(x, n);
+}
+
+/** Mirrors math::sign(T) (math_core.h), which is a plain (non-device-tagged)
+    template; DiskDensityVertical{Exp,Isothermal} need it inside a device leaf,
+    so it is reproduced locally rather than calling math::sign directly. */
+template<typename T>
+AGAMA_DEVICE_INLINE T disk_signT(T x) { return x > T(0) ? T(1) : x < T(0) ? T(-1) : T(0); }
+
+/// which closed-form radial functor a DiskAnsatz/DiskDensity instance uses
+enum DiskRadialType   { DISK_RADIAL_EXP, DISK_RADIAL_RICHEXP };
+/// which closed-form vertical functor a DiskAnsatz/DiskDensity instance uses
+enum DiskVerticalType { DISK_VERTICAL_EXP, DISK_VERTICAL_ISOTHERMAL, DISK_VERTICAL_THIN };
+
+/** POD parameters for the radial functor; unused fields for DISK_RADIAL_EXP
+    (innerCutoffRadius, modulationAmplitude, invSersicIndex) are set to their
+    neutral values (0, 0, 1) by the owning functor's constructor but never
+    read by disk_radial_exp_eval. */
+template<typename T>
+struct DiskRadialParams {
+    T surfaceDensity, invScaleRadius, innerCutoffRadius, modulationAmplitude, invSersicIndex;
+};
+
+/** POD parameters for the vertical functor; invScaleHeight is unused (set to 0)
+    for DISK_VERTICAL_THIN. */
+template<typename T>
+struct DiskVerticalParams {
+    T invScaleHeight;
+};
+
+/** Tagged descriptor for a DiskAnsatz recognized as one of the 5x... (2 radial
+    x 3 vertical = 6) supported combinations; consumed by disk_ansatz_eval /
+    disk_ansatz_rho below and by the Tier 3 force descriptor (potential_descriptor.h). */
+template<typename T>
+struct DiskAnsatzDesc {
+    int radialType;    ///< a DiskRadialType value
+    int verticalType;  ///< a DiskVerticalType value
+    DiskRadialParams<T>   radial;
+    DiskVerticalParams<T> vertical;
+};
+
+/** simple exponential radial density profile without inner hole or wiggles:
+    same expression as DiskDensityRadialExp::evalDeriv. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_radial_exp_eval(T surfaceDensity, T invScaleRadius, T R,
+    T* f, T* fprime, T* fpprime)
+{
+    T val = surfaceDensity * std::exp(-R * invScaleRadius);
+    if(f)
+        *f = val;
+    if(fprime)
+        *fprime = -val * invScaleRadius;
+    if(fpprime)
+        *fpprime = val * pow_2(invScaleRadius);
+}
+
+/** more complex radial density profile - exponential/Sersic with possible inner
+    hole and modulation: same expression as DiskDensityRadialRichExp::evalDeriv,
+    including the disk_powT mirror of math::pow used for the Sersic term. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_radial_richexp_eval(T surfaceDensity, T invScaleRadius,
+    T innerCutoffRadius, T modulationAmplitude, T invSersicIndex, T R,
+    T* f, T* fprime, T* fpprime)
+{
+    if((innerCutoffRadius && R==T(0)) || R==T(INFINITY)) {
+        if(f) *f=T(0);
+        if(fprime)  *fprime=T(0);
+        if(fpprime) *fpprime=T(0);
+        return;
+    }
+    const T
+        Rinv = T(1) / R,
+        Rrel = R * invScaleRadius,
+        Rrn  = disk_powT(Rrel, invSersicIndex),
+        RrnR = R>T(0) ? Rrn * Rinv : invSersicIndex==T(1) ? T(1) : invSersicIndex>T(1) ? T(0) : T(INFINITY),
+        Rcut = innerCutoffRadius ? innerCutoffRadius * Rinv : T(0),
+        cr   = modulationAmplitude ? modulationAmplitude * std::cos(Rrel) : T(0),
+        sr   = modulationAmplitude ? modulationAmplitude * std::sin(Rrel) : T(0),
+        val  = surfaceDensity * std::exp(-Rcut - Rrn + cr),
+        fp   = Rcut * Rinv - invSersicIndex * RrnR - sr * invScaleRadius;
+    if(fpprime)
+        *fpprime = val ?
+            val * (fp*fp - T(2)*Rcut*pow_2(Rinv) - cr * pow_2(invScaleRadius) +
+            (invSersicIndex==T(1) ? T(0) : RrnR * Rinv * invSersicIndex * (T(1)-invSersicIndex)) ) :
+            T(0);  // if val==0, the bracket could be NaN
+    if(fprime)
+        *fprime  = val ? fp*val : T(0);
+    if(f)
+        *f = val;
+}
+
+/** exponential vertical disk density profile: same expression as
+    DiskDensityVerticalExp::evalDeriv. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_vertical_exp_eval(T invScaleHeight, T z,
+    T* H, T* Hprime, T* Hpprime)
+{
+    T x = std::fabs(z * invScaleHeight);
+    T h = std::exp(-x);
+    if(H)       *H       = T(0.5) / invScaleHeight *  // use asymptotic expansion for small x
+        (x>T(1e-5) ? h-T(1)+x : x*x * (T(0.5) - T(1./6)*x));   // to avoid roundoff errors
+    if(Hprime)  *Hprime  = T(0.5) * disk_signT(z) * (T(1)-h);
+    if(Hpprime) *Hpprime = T(0.5) * h * invScaleHeight;
+}
+
+/** isothermal (sech^2) vertical disk density profile: same expression as
+    DiskDensityVerticalIsothermal::evalDeriv. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_vertical_isothermal_eval(T invScaleHeight, T z,
+    T* H, T* Hprime, T* Hpprime)
+{
+    T x = std::fabs(z * invScaleHeight);
+    T h = std::exp(-x);
+    T sh1 = T(1) + h,  invsh1 = T(1)/sh1;
+    if(H)       *H       = T(1)/invScaleHeight *
+        (x>T(1e-3) ? T(0.5)*x + std::log(T(0.5)*sh1) : x*x * (T(1./8) - T(1./192)*x*x));
+    if(Hprime)  *Hprime  = T(0.5) * disk_signT(z) * (T(1)-h) * invsh1;
+    if(Hpprime) *Hpprime = h * invScaleHeight * pow_2(invsh1);
+}
+
+/** vertically thin disk profile: same expression as DiskDensityVerticalThin::evalDeriv. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_vertical_thin_eval(T z, T* H, T* Hprime, T* Hpprime)
+{
+    if(H)       *H       = T(0.5) * std::fabs(z);
+    if(Hprime)  *Hprime  = T(0.5) * disk_signT(z);
+    if(Hpprime) *Hpprime = T(0);
+}
+
+/** Dispatch on DiskRadialType, calling the matching leaf above. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_radial_dispatch(int radialType, const DiskRadialParams<T>& p,
+    T r, T* f, T* fp, T* fpp)
+{
+    if(radialType == DISK_RADIAL_EXP)
+        disk_radial_exp_eval(p.surfaceDensity, p.invScaleRadius, r, f, fp, fpp);
+    else
+        disk_radial_richexp_eval(p.surfaceDensity, p.invScaleRadius, p.innerCutoffRadius,
+            p.modulationAmplitude, p.invSersicIndex, r, f, fp, fpp);
+}
+
+/** Dispatch on DiskVerticalType, calling the matching leaf above. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_vertical_dispatch(int verticalType, const DiskVerticalParams<T>& p,
+    T z, T* H, T* Hp, T* h)
+{
+    switch(verticalType) {
+    case DISK_VERTICAL_EXP:         disk_vertical_exp_eval(p.invScaleHeight, z, H, Hp, h); break;
+    case DISK_VERTICAL_ISOTHERMAL:  disk_vertical_isothermal_eval(p.invScaleHeight, z, H, Hp, h); break;
+    default /*DISK_VERTICAL_THIN*/: disk_vertical_thin_eval(z, H, Hp, h); break;
+    }
+}
+
+/** Combining leaf: Phi(R,z) = 4 pi f(r) H(z) and its cylindrical derivatives,
+    where r = sqrt(R^2+z^2) is the SPHERICAL radius (not R) -- same combination
+    and the same r=0 / f=0 guards as DiskAnsatz::evalCyl (potential_disk.cpp),
+    which this leaf reproduces exactly (only relocated, not rederived). dR2/dz2/
+    dRdz (and the fpp/h second-derivative terms feeding them) are computed only
+    if at least one of dR2/dz2/dRdz is requested, matching the original
+    deriv2!=NULL branch; dR/dz/fp/Hp are computed if any of dR/dz/dR2/dz2/dRdz
+    is requested, matching the original deriv!=NULL||deriv2!=NULL branch. */
+template<typename T>
+AGAMA_DEVICE_INLINE void disk_ansatz_eval(int radialType, const DiskRadialParams<T>& rp,
+    int verticalType, const DiskVerticalParams<T>& vp, T R, T z,
+    T* potential, T* dR, T* dz, T* dR2, T* dz2, T* dRdz)
+{
+    T r = std::sqrt(R*R + z*z);
+    T h=T(0), H=T(0), Hp=T(0), f=T(0), fp=T(0), fpp=T(0);
+    bool deriv1 = dR!=NULL || dz!=NULL || dR2!=NULL || dz2!=NULL || dRdz!=NULL;
+    bool deriv2 = dR2!=NULL || dz2!=NULL || dRdz!=NULL;
+    disk_vertical_dispatch(verticalType, vp, z, &H, deriv1 ? &Hp : (T*)NULL, deriv2 ? &h : (T*)NULL);
+    disk_radial_dispatch  (radialType,  rp, r, &f, deriv1 ? &fp : (T*)NULL, deriv2 ? &fpp : (T*)NULL);
+    f  *= T(4*M_PI);
+    fp *= T(4*M_PI);
+    fpp*= T(4*M_PI);
+    T rinv = r>T(0) ? T(1)/r : T(1);  // if r==0, avoid indeterminacy in 0/0
+    T Rr   = R * rinv;
+    T zr   = z * rinv;
+    if(potential)
+        *potential = f==T(0) ? T(0) : f * H;
+    if(dR)
+        *dR = H * Rr * fp;
+    if(dz)
+        *dz = H * zr * fp + Hp * f;
+    if(dR2)
+        *dR2 = H * (fpp * pow_2(Rr) + fp * rinv * pow_2(zr));
+    if(dz2)
+        *dz2 = H * (fpp * pow_2(zr) + fp * rinv * pow_2(Rr)) + fp * Hp * zr * T(2) + f * h;
+    if(dRdz)
+        *dRdz= H * Rr * zr * (fpp - fp * rinv) + fp * Hp * Rr;
+}
+
+/** Combining leaf for the density: same expression as DiskAnsatz::densityCyl. */
+template<typename T>
+AGAMA_DEVICE_INLINE T disk_ansatz_rho(int radialType, const DiskRadialParams<T>& rp,
+    int verticalType, const DiskVerticalParams<T>& vp, T R, T z)
+{
+    T r = std::sqrt(R*R + z*z);
+    T h, H, Hp, f, fp, fpp;
+    disk_vertical_dispatch(verticalType, vp, z, &H, &Hp, &h);
+    disk_radial_dispatch  (radialType,  rp, r, &f, &fp, &fpp);
+    return f*h + (z!=T(0) ? T(2)*fp*(H+z*Hp)/r : T(0)) + fpp*H;
+}
+
+/** simple exponential radial density profile without inner hole or wiggles */
+class DiskDensityRadialExp: public math::IFunction {
+public:
+    explicit DiskDensityRadialExp(const DiskParam& dp) :
+        params{ dp.surfaceDensity, 1./dp.scaleRadius, 0., 0., 1. } {}
+    /// exported params, consumed by DiskAnsatz's GPU-recognition helper (Tier 1)
+    const DiskRadialParams<double> params;
+private:
+    /**  evaluate  f(R) and optionally its two derivatives, if these arguments are not NULL  */
+    virtual void evalDeriv(double R, double* f=NULL, double* fprime=NULL, double* fpprime=NULL) const {
+        disk_radial_exp_eval(params.surfaceDensity, params.invScaleRadius, R, f, fprime, fpprime);
+    }
+    virtual unsigned int numDerivs() const { return 2; }
+};
+
+/** more complex radial density profile - exponential/Sersic with possible inner hole and modulation */
+class DiskDensityRadialRichExp: public math::IFunction {
+public:
+    explicit DiskDensityRadialRichExp(const DiskParam& dp) :
+        params{ dp.surfaceDensity, 1./dp.scaleRadius, dp.innerCutoffRadius,
+                dp.modulationAmplitude, 1./dp.sersicIndex } {}
+    /// exported params, consumed by DiskAnsatz's GPU-recognition helper (Tier 1)
+    const DiskRadialParams<double> params;
+private:
+    /**  evaluate  f(R) and optionally its two derivatives, if these arguments are not NULL  */
+    virtual void evalDeriv(double R, double* f=NULL, double* fprime=NULL, double* fpprime=NULL) const {
+        disk_radial_richexp_eval(params.surfaceDensity, params.invScaleRadius,
+            params.innerCutoffRadius, params.modulationAmplitude, params.invSersicIndex,
+            R, f, fprime, fpprime);
+    }
+    virtual unsigned int numDerivs() const { return 2; }
+};
+
+/** exponential vertical disk density profile */
+class DiskDensityVerticalExp: public math::IFunction {
+public:
+    explicit DiskDensityVerticalExp(double scaleHeight) : params{ 1./scaleHeight } {}
+    /// exported params, consumed by DiskAnsatz's GPU-recognition helper (Tier 1)
+    const DiskVerticalParams<double> params;
+private:
+    /**  evaluate  H(z) and optionally its two derivatives, if these arguments are not NULL  */
+    virtual void evalDeriv(double z, double* H=NULL, double* Hprime=NULL, double* Hpprime=NULL) const {
+        disk_vertical_exp_eval(params.invScaleHeight, z, H, Hprime, Hpprime);
+    }
+    virtual unsigned int numDerivs() const { return 2; }
+};
+
+/** isothermal (sech^2) vertical disk density profile */
+class DiskDensityVerticalIsothermal: public math::IFunction {
+public:
+    explicit DiskDensityVerticalIsothermal(double scaleHeight) : params{ 1./scaleHeight } {}
+    /// exported params, consumed by DiskAnsatz's GPU-recognition helper (Tier 1)
+    const DiskVerticalParams<double> params;
+private:
+    /**  evaluate  H(z) and optionally its two derivatives, if these arguments are not NULL  */
+    virtual void evalDeriv(double z, double* H=NULL, double* Hprime=NULL, double* Hpprime=NULL) const {
+        disk_vertical_isothermal_eval(params.invScaleHeight, z, H, Hprime, Hpprime);
+    }
+    virtual unsigned int numDerivs() const { return 2; }
+};
+
+/** vertically thin disk profile */
+class DiskDensityVerticalThin: public math::IFunction {
+public:
+    DiskDensityVerticalThin() : params{ 0. } {}
+    /// exported params (trivial/unused), for uniformity with the other two vertical functors
+    const DiskVerticalParams<double> params;
+private:
+    /**  evaluate  H(z) and optionally its two derivatives, if these arguments are not NULL  */
+    virtual void evalDeriv(double z, double* H=NULL, double* Hprime=NULL, double* Hpprime=NULL) const {
+        disk_vertical_thin_eval(z, H, Hprime, Hpprime);
+    }
+    virtual unsigned int numDerivs() const { return 2; }
+};
+
+/** Recognize a DiskAnsatz's stored radial/vertical functors as one of the 5
+    known concrete types above and build the tagged POD descriptor consumed by
+    disk_ansatz_eval/disk_ansatz_rho (the GPU batch path) and by the Tier 3
+    force descriptor (potential_descriptor.h). Returns false (desc left
+    unmodified) for a DiskAnsatz/DiskDensity constructed via the second,
+    arbitrary-functions constructor -- there is no device path for an
+    arbitrary virtual math::IFunction, so the caller (potential_gpu.cpp's
+    can_dispatch / potential_descriptor.h's buildGpuPotDesc) must report those
+    instances as unsupported rather than compute anything. */
+inline bool recognizeDiskAnsatz(const math::PtrFunction& radialFnc,
+    const math::PtrFunction& verticalFnc, DiskAnsatzDesc<double>& desc)
+{
+    if(const DiskDensityRadialExp* p = dynamic_cast<const DiskDensityRadialExp*>(radialFnc.get())) {
+        desc.radialType = DISK_RADIAL_EXP;
+        desc.radial = p->params;
+    } else if(const DiskDensityRadialRichExp* p =
+              dynamic_cast<const DiskDensityRadialRichExp*>(radialFnc.get())) {
+        desc.radialType = DISK_RADIAL_RICHEXP;
+        desc.radial = p->params;
+    } else
+        return false;
+    if(const DiskDensityVerticalExp* p = dynamic_cast<const DiskDensityVerticalExp*>(verticalFnc.get())) {
+        desc.verticalType = DISK_VERTICAL_EXP;
+        desc.vertical = p->params;
+    } else if(const DiskDensityVerticalIsothermal* p =
+              dynamic_cast<const DiskDensityVerticalIsothermal*>(verticalFnc.get())) {
+        desc.verticalType = DISK_VERTICAL_ISOTHERMAL;
+        desc.vertical = p->params;
+    } else if(const DiskDensityVerticalThin* p =
+              dynamic_cast<const DiskDensityVerticalThin*>(verticalFnc.get())) {
+        desc.verticalType = DISK_VERTICAL_THIN;
+        desc.vertical = p->params;
+    } else
+        return false;
+    return true;
+}
+
 /** Density profile of a separable disk model */
 class DiskDensity: public BaseDensity {
 public:
@@ -163,6 +519,84 @@ public:
     virtual coord::SymmetryType symmetry() const { return coord::ST_AXISYMMETRIC; }
     virtual std::string name() const { return "DiskAnsatz"; }
     virtual double totalMass() const { return 0; }  // all the mass is contained in the residual density
+
+    /** Tier 1 batch evaluator: Phi at N Cartesian positions via the
+        disk_ansatz_eval leaf. Throws std::runtime_error if the stored
+        radial/vertical functors are not one of the 5 recognized closed-form
+        types (an instance built from the second, arbitrary-functions
+        constructor has no device path). The GPU dispatch layer
+        (potential_gpu.cpp / potential_descriptor.h) checks recognizability via
+        gpuDesc() before ever reaching this method, so this is a second,
+        defensive check. add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* phi, bool add = false) const
+    {
+        DiskAnsatzDesc<T> d = gpuDescT<T>();
+        const int radialType = d.radialType, verticalType = d.verticalType;
+        const DiskRadialParams<T>   rp = d.radial;
+        const DiskVerticalParams<T> vp = d.vertical;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T R = std::sqrt(x*x + y*y);
+            T pot;
+            disk_ansatz_eval(radialType, rp, verticalType, vp, R, z,
+                &pot, (T*)NULL, (T*)NULL, (T*)NULL, (T*)NULL, (T*)NULL);
+            phi[i] = add ? phi[i] + pot : pot;
+        });
+    }
+
+    /** Fused batch evaluator: Phi (optional, may be NULL) + Cartesian
+        acceleration, one kernel. Cylindrical leaf derivatives (dR, dz) are
+        converted to Cartesian via cyl_acc_car (R=0 guard included). acc
+        packed length 3*N; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+    {
+        DiskAnsatzDesc<T> d = gpuDescT<T>();
+        const int radialType = d.radialType, verticalType = d.verticalType;
+        const DiskRadialParams<T>   rp = d.radial;
+        const DiskVerticalParams<T> vp = d.vertical;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T R = std::sqrt(x*x + y*y);
+            T pot, dR, dz;
+            disk_ansatz_eval(radialType, rp, verticalType, vp, R, z,
+                phi ? &pot : (T*)NULL, &dR, &dz, (T*)NULL, (T*)NULL, (T*)NULL);
+            T a[3];
+            cyl_acc_car(dR, dz, x, y, R, a);
+            if(phi) phi[i] = add ? phi[i] + pot : pot;
+            for(int k=0; k<3; k++)
+                acc[i*3+k] = add ? acc[i*3+k] + a[k] : a[k];
+        });
+    }
+
+    /** Batch density evaluator via the disk_ansatz_rho leaf; add=true accumulates. */
+    template<typename T, class Policy>
+    inline void evalmanyDensCarT(Policy pol, std::size_t N,
+        const T* xyz, /*out*/ T* rho, bool add = false) const
+    {
+        DiskAnsatzDesc<T> d = gpuDescT<T>();
+        const int radialType = d.radialType, verticalType = d.verticalType;
+        const DiskRadialParams<T>   rp = d.radial;
+        const DiskVerticalParams<T> vp = d.vertical;
+        agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
+            const T x = xyz[i*3+0], y = xyz[i*3+1], z = xyz[i*3+2];
+            const T R = std::sqrt(x*x + y*y);
+            const T v = disk_ansatz_rho(radialType, rp, verticalType, vp, R, z);
+            rho[i] = add ? rho[i] + v : v;
+        });
+    }
+
+    /** Recognize the stored radial/vertical functors (see recognizeDiskAnsatz)
+        and export the tagged descriptor consumed by the GPU force descriptor
+        (Tier 3, potential_descriptor.h) and by potential_gpu.cpp's
+        can_dispatch/try_dispatch. Returns false for a DiskAnsatz built from
+        arbitrary user functions (second constructor). */
+    bool gpuDesc(DiskAnsatzDesc<double>& desc) const {
+        return recognizeDiskAnsatz(radialFnc, verticalFnc, desc);
+    }
 private:
     math::PtrFunction radialFnc;     ///< function describing radial dependence of surface density
     math::PtrFunction verticalFnc;   ///< function describing vertical density profile
@@ -170,6 +604,31 @@ private:
     virtual void evalCyl(const coord::PosCyl &pos,
         double* potential, coord::GradCyl* deriv, coord::HessCyl* deriv2, double /*time*/) const;
     virtual double densityCyl(const coord::PosCyl &pos, double /*time*/) const;
+
+    /** gpuDesc() above, cast to precision T; throws std::runtime_error if the
+        functors are not recognized (used by the three evalmany*T methods,
+        which have no other way to signal "unsupported" to their caller --
+        the boolean-returning gpuDesc() is for can_dispatch-style callers that
+        can fall back cleanly instead). */
+    template<typename T>
+    inline DiskAnsatzDesc<T> gpuDescT() const {
+        DiskAnsatzDesc<double> d0;
+        if(!gpuDesc(d0))
+            throw std::runtime_error("DiskAnsatz: GPU batch evaluation only supports the "
+                "closed-form radial/vertical density profiles (DiskDensityRadial{Exp,RichExp} "
+                "x DiskDensityVertical{Exp,Isothermal,Thin}); an instance built from arbitrary "
+                "user functions has no device path");
+        DiskAnsatzDesc<T> d;
+        d.radialType   = d0.radialType;
+        d.verticalType = d0.verticalType;
+        d.radial.surfaceDensity      = static_cast<T>(d0.radial.surfaceDensity);
+        d.radial.invScaleRadius      = static_cast<T>(d0.radial.invScaleRadius);
+        d.radial.innerCutoffRadius   = static_cast<T>(d0.radial.innerCutoffRadius);
+        d.radial.modulationAmplitude = static_cast<T>(d0.radial.modulationAmplitude);
+        d.radial.invSersicIndex      = static_cast<T>(d0.radial.invSersicIndex);
+        d.vertical.invScaleHeight    = static_cast<T>(d0.vertical.invScaleHeight);
+        return d;
+    }
 };
 
 ///@}

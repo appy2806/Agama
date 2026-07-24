@@ -28,72 +28,21 @@ Version 0.8    24. June      2005
 
 namespace potential{
 
+// Tier 1 GPU migration note: the 5 concrete radial/vertical functor classes
+// (DiskDensityRadialExp, DiskDensityRadialRichExp, DiskDensityVerticalExp,
+// DiskDensityVerticalIsothermal, DiskDensityVerticalThin) that used to live in
+// this file's anonymous namespace have moved to potential_disk.h (no longer
+// anonymous), alongside the AGAMA_DEVICE_INLINE leaf functions their
+// evalDeriv methods now thin-wrap. This lets DiskAnsatz::gpuDesc()
+// dynamic_cast the stored radialFnc/verticalFnc against these types to build
+// the tagged descriptor consumed by the GPU batch path -- an anonymous-
+// namespace type has no linkage visible outside this translation unit, so it
+// could not be dynamic_cast-recognized from potential_disk.h. The formulas
+// themselves are unchanged (only relocated); DiskAnsatz::evalCyl and
+// DiskAnsatz::densityCyl below still call the functors' evalDeriv virtuals
+// exactly as before.
+
 namespace{  // internal
-
-/** simple exponential radial density profile without inner hole or wiggles */
-class DiskDensityRadialExp: public math::IFunction {
-public:
-    DiskDensityRadialExp(const DiskParam& params): 
-        surfaceDensity(params.surfaceDensity),
-        invScaleRadius(1./params.scaleRadius)
-    {};
-private:
-    const double surfaceDensity, invScaleRadius;
-    /**  evaluate  f(R) and optionally its two derivatives, if these arguments are not NULL  */
-    virtual void evalDeriv(double R, double* f=NULL, double* fprime=NULL, double* fpprime=NULL) const {
-        double val = surfaceDensity * exp(-R * invScaleRadius);
-        if(f)
-            *f = val;
-        if(fprime)
-            *fprime = -val * invScaleRadius;
-        if(fpprime)
-            *fpprime = val * pow_2(invScaleRadius);
-    }
-    virtual unsigned int numDerivs() const { return 2; }
-};
-
-/** more complex radial density profile - exponential/Sersic with possible inner hole and modulation */
-class DiskDensityRadialRichExp: public math::IFunction {
-public:
-    DiskDensityRadialRichExp(const DiskParam& params):
-        surfaceDensity     (params.surfaceDensity),
-        invScaleRadius  (1./params.scaleRadius),
-        innerCutoffRadius  (params.innerCutoffRadius),
-        modulationAmplitude(params.modulationAmplitude),
-        invSersicIndex  (1./params.sersicIndex)
-    {};
-private:
-    const double surfaceDensity, invScaleRadius, innerCutoffRadius, modulationAmplitude, invSersicIndex;
-    /**  evaluate  f(R) and optionally its two derivatives, if these arguments are not NULL  */
-    virtual void evalDeriv(double R, double* f=NULL, double* fprime=NULL, double* fpprime=NULL) const {
-        if((innerCutoffRadius && R==0.) || R==INFINITY) {
-            if(f) *f=0;
-            if(fprime)  *fprime=0;
-            if(fpprime) *fpprime=0;
-            return;
-        }
-        const double
-            Rinv = 1 / R,
-            Rrel = R * invScaleRadius,
-            Rrn  = math::pow(Rrel, invSersicIndex),
-            RrnR = R>0 ? Rrn * Rinv : invSersicIndex==1 ? 1. : invSersicIndex>1 ? 0. : INFINITY,
-            Rcut = innerCutoffRadius ? innerCutoffRadius * Rinv : 0,
-            cr   = modulationAmplitude ? modulationAmplitude * cos(Rrel) : 0,
-            sr   = modulationAmplitude ? modulationAmplitude * sin(Rrel) : 0,
-            val  = surfaceDensity * exp(-Rcut - Rrn + cr),
-            fp   = Rcut * Rinv - invSersicIndex * RrnR - sr * invScaleRadius;
-        if(fpprime)
-            *fpprime = val ?
-                val * (fp*fp - 2*Rcut*pow_2(Rinv) - cr * pow_2(invScaleRadius) +
-                (invSersicIndex==1 ? 0 : RrnR * Rinv * invSersicIndex * (1-invSersicIndex)) ) :
-                0;  // if val==0, the bracket could be NaN
-        if(fprime)
-            *fprime  = val ? fp*val : 0;
-        if(f)
-            *f = val;
-    }
-    virtual unsigned int numDerivs() const { return 2; }
-};
 
 /** integrand for computing the total mass:  2pi R Sigma(R); x=R/scaleRadius */
 class DiskDensityRadialRichExpIntegrand: public math::IFunctionNoDeriv {
@@ -108,57 +57,6 @@ private:
             exp(-params.innerCutoffRadius/params.scaleRadius/Rrel - math::pow(Rrel, 1/params.sersicIndex)
                 +params.modulationAmplitude*cos(Rrel));
     }
-};
-
-/** exponential vertical disk density profile */
-class DiskDensityVerticalExp: public math::IFunction {
-public:
-    DiskDensityVerticalExp(double scaleHeight): invScaleHeight(1./scaleHeight) {};
-private:
-    const double invScaleHeight;
-    /**  evaluate  H(z) and optionally its two derivatives, if these arguments are not NULL  */
-    virtual void evalDeriv(double z, double* H=NULL, double* Hprime=NULL, double* Hpprime=NULL) const {
-        double      x        = fabs(z * invScaleHeight);
-        double      h        = exp(-x);
-        if(H)       *H       = 0.5 / invScaleHeight *  // use asymptotic expansion for small x
-            (x>1e-5 ? h-1+x : x*x * (0.5 - 1./6*x));   // to avoid roundoff errors
-        if(Hprime)  *Hprime  = 0.5 * math::sign(z) * (1.-h);
-        if(Hpprime) *Hpprime = 0.5 * h * invScaleHeight;
-    }
-    virtual unsigned int numDerivs() const { return 2; }
-};
-
-/** isothermal (sech^2) vertical disk density profile */
-class DiskDensityVerticalIsothermal: public math::IFunction {
-public:
-    DiskDensityVerticalIsothermal(double scaleHeight): invScaleHeight(1./scaleHeight) {};
-private:
-    const double invScaleHeight;
-    /**  evaluate  H(z) and optionally its two derivatives, if these arguments are not NULL  */
-    virtual void evalDeriv(double z, double* H=NULL, double* Hprime=NULL, double* Hpprime=NULL) const {
-        double      x        = fabs(z * invScaleHeight);
-        double      h        = exp(-x);
-        double      sh1      = 1 + h,  invsh1 = 1./sh1;
-        if(H)       *H       = 1./invScaleHeight *
-            (x>1e-3 ? 0.5*x + log(0.5*sh1) : x*x * (1./8 - 1./192*x*x));
-        if(Hprime)  *Hprime  = 0.5 * math::sign(z) * (1.-h) * invsh1;
-        if(Hpprime) *Hpprime = h * invScaleHeight * pow_2(invsh1);
-    }
-    virtual unsigned int numDerivs() const { return 2; }
-};
-
-/** vertically thin disk profile */
-class DiskDensityVerticalThin: public math::IFunction {
-public:
-    DiskDensityVerticalThin() {};
-private:
-    /**  evaluate  H(z) and optionally its two derivatives, if these arguments are not NULL  */
-    virtual void evalDeriv(double z, double* H=NULL, double* Hprime=NULL, double* Hpprime=NULL) const {
-        if(H)       *H       = 0.5 * fabs(z);
-        if(Hprime)  *Hprime  = 0.5 * math::sign(z);
-        if(Hpprime) *Hpprime = 0;
-    }
-    virtual unsigned int numDerivs() const { return 2; }
 };
 
 }  // internal ns

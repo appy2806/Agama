@@ -15,6 +15,7 @@
 #include "coord.h"               // toPos<Car,Cyl>, toPos<Car,Sph> (Tier 0 Phase 2 device-inline)
 #include "potential_analytic.h"  // potential::NFW + nfw_phi leaf (Tier 1 worked example)
 #include "potential_dehnen.h"    // potential::Dehnen (spherical GPU path) + dehnen_eval leaf
+#include "potential_disk.h"      // potential::DiskAnsatz + disk_ansatz_eval/_rho leaves
 #include "potential_composite.h"    // Composite for the Tier 3 orbit workload; UniformAcceleration
 #include "potential_descriptor.h"   // GpuPotDesc + gpu_desc_phi_acc (Tier 3 force descriptor)
 #include "orbit.h"                  // orbit::integrateTraj (CPU reference integrator)
@@ -588,6 +589,165 @@ int main() {
             if(!ok_ua) {
                 std::fprintf(stderr, "FAIL (UniformAcceleration parity)\n");
                 return 1;
+            }
+        }
+
+        // ----- DiskAnsatz (Tier 1): 5 recognized radial/vertical functor
+        // combinations, Serial-vs-Cuda parity + leaf-vs-virtual, via the
+        // disk_ansatz_eval/disk_ansatz_rho leaves (potential_disk.h). Exercises
+        // both radial types (Exp, RichExp with innerCutoffRadius>0 AND
+        // sersicIndex!=1) crossed with all 3 vertical types (Exp, Isothermal,
+        // Thin) -- check_pot_parity() below cross-checks against the existing
+        // CPU virtual eval, which still calls the SAME functor evalDeriv
+        // methods (now thin leaf wrappers, see potential_disk.h), so this also
+        // confirms the relocation didn't change anything CPU-side.
+        {
+            potential::DiskAnsatz diskExpExp(potential::DiskParam(
+                /*surfaceDensity=*/1.0, /*scaleRadius=*/1.0, /*scaleHeight=*/0.3));
+            potential::DiskAnsatz diskExpIso(potential::DiskParam(
+                /*surfaceDensity=*/2.0, /*scaleRadius=*/1.5, /*scaleHeight=*/-0.4));
+            potential::DiskAnsatz diskExpThin(potential::DiskParam(
+                /*surfaceDensity=*/1.5, /*scaleRadius=*/1.0, /*scaleHeight=*/0.0));
+            potential::DiskAnsatz diskRichExp(potential::DiskParam(
+                /*surfaceDensity=*/1.0, /*scaleRadius=*/1.0, /*scaleHeight=*/0.3,
+                /*innerCutoffRadius=*/0.2, /*modulationAmplitude=*/0.1, /*sersicIndex=*/1.5));
+            potential::DiskAnsatz diskRichIso(potential::DiskParam(
+                /*surfaceDensity=*/1.0, /*scaleRadius=*/1.0, /*scaleHeight=*/-0.3,
+                /*innerCutoffRadius=*/0.15, /*modulationAmplitude=*/0.0, /*sersicIndex=*/2.0));
+            bool ok_disk =
+                check_pot_parity(diskExpExp,  "Disk(Exp,Exp)",     xyz_h) &&
+                check_pot_parity(diskExpIso,  "Disk(Exp,Iso)",     xyz_h) &&
+                check_pot_parity(diskExpThin, "Disk(Exp,Thin)",    xyz_h) &&
+                check_pot_parity(diskRichExp, "Disk(RichExp,Exp)", xyz_h) &&
+                check_pot_parity(diskRichIso, "Disk(RichExp,Iso)", xyz_h);
+            if(!ok_disk) {
+                std::fprintf(stderr, "FAIL (DiskAnsatz potential parity)\n");
+                return 1;
+            }
+
+            // ----- DiskAnsatz fused Phi+acc + density, Serial vs Cuda -----
+            // Same fused-kernel pattern as NFW/Dehnen above, via the
+            // disk_ansatz_eval/disk_ansatz_rho leaves, on the RichExp+Exp
+            // combination (exercises the Sersic/inner-cutoff/modulation branch).
+            {
+                std::vector<double> phi_s(NN), acc_s(NN * 3), rho_s(NN);
+                diskRichExp.evalmanyPhiAccCarT<double>(Serial{}, NN, xyz_h.data(),
+                    phi_s.data(), acc_s.data());
+                diskRichExp.evalmanyDensCarT<double>(Serial{}, NN, xyz_h.data(), rho_s.data());
+                device_array<double> d_xyz5(NN * 3);
+                d_xyz5.from_host(xyz_h.data(), NN * 3);
+                device_array<double> d_phi5(NN), d_acc5(NN * 3), d_rho5(NN);
+                diskRichExp.evalmanyPhiAccCarT<double>(Cuda{}, NN, d_xyz5.data(),
+                    d_phi5.data(), d_acc5.data());
+                diskRichExp.evalmanyDensCarT<double>(Cuda{}, NN, d_xyz5.data(), d_rho5.data());
+                std::vector<double> phi_c(NN), acc_c(NN * 3), rho_c(NN);
+                d_phi5.to_host(phi_c.data(), NN);
+                d_acc5.to_host(acc_c.data(), NN * 3);
+                d_rho5.to_host(rho_c.data(), NN);
+                double max_err = 0.0, max_rho = 1e-300, max_rho_err = 0.0, max_virt_rho_err = 0.0;
+                for(std::size_t i = 0; i < NN; ++i)
+                    max_err = std::max(max_err, std::fabs(phi_s[i] - phi_c[i]));
+                for(std::size_t i = 0; i < NN * 3; ++i)
+                    max_err = std::max(max_err, std::fabs(acc_s[i] - acc_c[i]));
+                for(std::size_t i = 0; i < NN; ++i) {
+                    max_rho = std::max(max_rho, std::fabs(rho_s[i]));
+                    max_rho_err = std::max(max_rho_err, std::fabs(rho_s[i] - rho_c[i]));
+                }
+                for(std::size_t i = 0; i < 8 && i < NN; ++i) {
+                    const coord::PosCar p(xyz_h[i*3+0], xyz_h[i*3+1], xyz_h[i*3+2]);
+                    max_virt_rho_err = std::max(max_virt_rho_err,
+                        std::fabs(diskRichExp.density(p) - rho_s[i]));
+                }
+                const double ACC_TOL = 1e-13;
+                const double RHO_TOL = 1e-13 * max_rho;
+                bool ok_disk2 = (max_err <= ACC_TOL) && (max_rho_err <= RHO_TOL) &&
+                    (max_virt_rho_err <= RHO_TOL);
+                std::printf("[CUDA]  Disk(RichExp,Exp) evalmanyPhiAccCarT+evalmanyDensCarT: "
+                    "Phi/acc Serial-vs-Cuda |err|=%.3e (tol %.1e)   "
+                    "dens Serial-vs-Cuda |err|=%.3e   leaf-vs-virtual |err|=%.3e (tol %.1e) -> %s\n",
+                    max_err, ACC_TOL, max_rho_err, max_virt_rho_err, RHO_TOL, ok_disk2 ? "OK" : "FAIL");
+                if(!ok_disk2) {
+                    std::fprintf(stderr, "FAIL (DiskAnsatz fused Phi+acc / density parity)\n");
+                    return 1;
+                }
+            }
+
+            // ----- DiskAnsatz edge cases: R=0, z=0, full origin -----
+            // The combine leaf has explicit guards for r=0 (rinv fallback,
+            // matching DiskAnsatz::evalCyl) that the generic xyz_h grid above
+            // never exercises (z is never exactly 0 there); check leaf-vs-
+            // virtual directly at these points via the fused batch method (N=1).
+            {
+                const double edge_xyz[5][3] = {
+                    {0.0,  0.0,  0.0},   // full origin: r=0, R=0, z=0
+                    {0.0,  0.0,  1.3},   // R=0, z!=0 (on the symmetry axis)
+                    {1.7,  0.0,  0.0},   // z=0, R!=0 (in the disk plane)
+                    {0.9, -0.4,  0.0},   // z=0, R!=0 (general in-plane point)
+                    {0.3,  0.2, -2.1},   // ordinary point
+                };
+                double max_edge_err = 0.0;
+                for(int i = 0; i < 5; i++) {
+                    const coord::PosCar p(edge_xyz[i][0], edge_xyz[i][1], edge_xyz[i][2]);
+                    double phi_v, phi_l;
+                    coord::GradCar grad_v;
+                    diskRichIso.eval(p, &phi_v, &grad_v, NULL);
+                    double acc_l[3];
+                    diskRichIso.evalmanyPhiAccCarT<double>(Serial{}, 1, edge_xyz[i], &phi_l, acc_l);
+                    max_edge_err = std::max(max_edge_err, std::fabs(phi_v - phi_l));
+                    max_edge_err = std::max(max_edge_err, std::fabs(-grad_v.dx - acc_l[0]));
+                    max_edge_err = std::max(max_edge_err, std::fabs(-grad_v.dy - acc_l[1]));
+                    max_edge_err = std::max(max_edge_err, std::fabs(-grad_v.dz - acc_l[2]));
+                }
+                const double EDGE_TOL = 1e-12;
+                bool ok_edge = max_edge_err <= EDGE_TOL;
+                std::printf("[CUDA]  Disk(RichExp,Iso) edge cases (R=0 / z=0 / origin), "
+                    "leaf-vs-virtual: max |err| = %.3e, tol = %.1e -> %s\n",
+                    max_edge_err, EDGE_TOL, ok_edge ? "OK" : "FAIL");
+                if(!ok_edge) {
+                    std::fprintf(stderr, "FAIL (DiskAnsatz edge-case parity)\n");
+                    return 1;
+                }
+            }
+
+            // ----- DiskAnsatz Tier 3 force descriptor vs virtual eval -----
+            // Exercises the GPU_POT_DISK_ANSATZ case in gpu_term_phi_acc
+            // (potential_descriptor.h), including the radialType/verticalType
+            // pair packed into GpuPotTerm::aux -- buildGpuPotDesc/
+            // gpu_desc_phi_acc are called directly on a bare DiskAnsatz (no
+            // Composite wrapper needed; buildGpuPotDesc handles a single
+            // non-composite potential too).
+            {
+                potential::GpuPotDesc<double> desc;
+                bool ok_desc = potential::buildGpuPotDesc(diskRichExp, desc);
+                double max_rel = 0;
+                if(ok_desc && desc.nterms == 1) {
+                    for(int i = 0; i < 64; i++) {
+                        const double x = 0.05 + 0.037 * i,
+                                     y = -0.3 + 0.021 * (i % 17),
+                                     z = 0.4 - 0.013 * (i % 23);
+                        double phi_d, acc_d[3];
+                        potential::gpu_desc_phi_acc(desc, x, y, z, &phi_d, acc_d);
+                        double phi_v;
+                        coord::GradCar grad;
+                        diskRichExp.eval(coord::PosCar(x, y, z), &phi_v, &grad, NULL);
+                        const double acc_v[3] = { -grad.dx, -grad.dy, -grad.dz };
+                        double scale = std::max(1e-300, std::fabs(phi_v));
+                        max_rel = std::max(max_rel, std::fabs(phi_d - phi_v) / scale);
+                        for(int k = 0; k < 3; k++) {
+                            scale = std::max(1e-300, std::fabs(acc_v[k]));
+                            max_rel = std::max(max_rel, std::fabs(acc_d[k] - acc_v[k]) / scale);
+                        }
+                    }
+                }
+                const double DESC_TOL = 1e-13;
+                bool ok_desc_parity = ok_desc && desc.nterms == 1 && max_rel <= DESC_TOL;
+                std::printf("[T3]    DiskAnsatz force descriptor vs virtual eval (64 pts): "
+                    "max rel err = %.3e, tol = %.1e -> %s\n",
+                    max_rel, DESC_TOL, ok_desc_parity ? "OK" : "FAIL");
+                if(!ok_desc_parity) {
+                    std::fprintf(stderr, "FAIL (DiskAnsatz force descriptor parity)\n");
+                    return 1;
+                }
             }
         }
     }

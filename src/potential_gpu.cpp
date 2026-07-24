@@ -9,6 +9,7 @@
 #include "potential_base.h"
 #include "potential_composite.h"
 #include "potential_dehnen.h"
+#include "potential_disk.h"
 #include "gpu_policy.h"
 #include <cstring>
 #include <string>
@@ -96,6 +97,15 @@ bool can_dispatch(const BasePotential& pot)
     // the blanket macro, which grants unconditional capability per type.
     if(const Dehnen* p = dynamic_cast<const Dehnen*>(&pot))
         return isSpherical(p->symmetry());
+    // DiskAnsatz is likewise not in AGAMA_GPU_POT_LIST above: it is only
+    // GPU-dispatchable when its stored radial/vertical functors are one of
+    // the 5 recognized closed-form types (see recognizeDiskAnsatz /
+    // DiskAnsatz::gpuDesc in potential_disk.h); an instance built from
+    // arbitrary user functions (the second constructor) has no device path.
+    if(const DiskAnsatz* p = dynamic_cast<const DiskAnsatz*>(&pot)) {
+        DiskAnsatzDesc<double> d;
+        return p->gpuDesc(d);
+    }
     if(const Composite* comp = dynamic_cast<const Composite*>(&pot)) {
         for(unsigned int c = 0; c < comp->size(); c++)
             if(!can_dispatch(*comp->component(c)))
@@ -158,6 +168,20 @@ bool try_dispatch(const BasePotential& pot, Policy pol,
     if(const Dehnen* p = dynamic_cast<const Dehnen*>(&pot)) {
         if(!isSpherical(p->symmetry()))
             return false;   // triaxial: not GPU-dispatchable (see can_dispatch above)
+        switch(mode) {
+        case MODE_PHI:  p->template evalmanyCarT<T>(pol, N, xyz_p, out1, add);
+                        break;
+        case MODE_ACC:  p->template evalmanyPhiAccCarT<T>(pol, N, xyz_p, out1, out3, add);
+                        break;
+        case MODE_DENS: p->template evalmanyDensCarT<T>(pol, N, xyz_p, out1, add);
+                        break;
+        }
+        return true;
+    }
+    if(const DiskAnsatz* p = dynamic_cast<const DiskAnsatz*>(&pot)) {
+        DiskAnsatzDesc<double> d;
+        if(!p->gpuDesc(d))
+            return false;   // arbitrary user functions: not GPU-dispatchable (see can_dispatch above)
         switch(mode) {
         case MODE_PHI:  p->template evalmanyCarT<T>(pol, N, xyz_p, out1, add);
                         break;

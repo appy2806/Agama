@@ -492,6 +492,40 @@ def main():
         print(f"  FAIL Composite+Dehnen cuda raised wrong type {type(e).__name__}: {e}")
         all_ok = False
 
+    # -- DiskAnsatz (Tier 1) is GPU-capable, but not reachable bare from Python --
+    # There is no Python-level positive-parity test for DiskAnsatz in this file.
+    # The only way to construct one from Python is agama.Potential(type='Disk',
+    # ...), and potential_factory.cpp's GalPot scheme (see potential_factory.cpp,
+    # PT_DISK case) ALWAYS pairs it with a Multipole potential holding the
+    # residual density -- there is no "type=DiskAnsatz" factory entry and no
+    # other Python-visible way to obtain a bare DiskAnsatz. Multipole eval/fit is
+    # Tier 2 (not yet migrated), so the resulting Composite{DiskAnsatz, Multipole}
+    # can never fully dispatch today (can_dispatch requires ALL members
+    # dispatchable) -- this is a real, not host-side, blocker, so we do not work
+    # around it. What we CAN verify at the Python level: the composite's
+    # NotImplementedError now names 'Multipole' as the unsupported member, NOT
+    # 'DiskAnsatz' -- confirming DiskAnsatz itself is recognized as GPU-capable
+    # by the C++ dispatch tables end-to-end through the Python binding, and the
+    # sole remaining blocker is the (expected, Tier-2-pending) Multipole residual.
+    print("\n== type='Disk' composite: DiskAnsatz recognized, Multipole still blocks (Tier 2 pending) ==")
+    disk_composite = agama.Potential(type='Disk', surfaceDensity=1.0, scaleRadius=2.0, scaleHeight=0.2)
+    try:
+        disk_composite.potential(xyz, device='cuda', dtype=np.float64)
+        print("  FAIL Disk composite cuda : unexpectedly succeeded (Multipole should not dispatch yet)")
+        all_ok = False
+    except NotImplementedError as e:
+        names_multipole = 'Multipole' in str(e)
+        names_diskansatz = 'DiskAnsatz' in str(e)
+        ok = names_multipole and not names_diskansatz
+        print(f"  {'OK  ' if ok else 'FAIL'} Disk composite cuda raised NotImplementedError "
+              f"(names Multipole: {names_multipole}, wrongly names DiskAnsatz: {names_diskansatz}):")
+        print(f"         {e}")
+        if not ok:
+            all_ok = False
+    except Exception as e:
+        print(f"  FAIL Disk composite cuda raised wrong type {type(e).__name__}: {e}")
+        all_ok = False
+
     # -- Force + density parity: 6 potentials + Composite3, device x dtype --
     # References are the LEGACY CPU paths (pot.force(xyz) -> (N,3),
     # pot.density(xyz) -> (N,)), not the device='cpu' path, so this closes the
