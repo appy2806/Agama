@@ -17,9 +17,11 @@
     close to the separatrix between box and tube orbits in x-z plane).
 */
 #include "potential_perfect_ellipsoid.h"
+#include "potential_factory.h"
 #include "actions_staeckel.h"
 #include "orbit.h"
 #include "math_core.h"
+#include "math_random.h"
 #include "debug_utils.h"
 #include "utils.h"
 #include <iostream>
@@ -134,6 +136,42 @@ bool test(const potential::OblatePerfectEllipsoid& potential,
     return oks && okf && oki;
 }
 
+void testPerformance()
+{
+    potential::PtrPotential pot = potential::createPotential(utils::KeyValueMap("type=disk scaleradius=1 scaleheight=0.1"));
+    actions::ActionFinderAxisymFudge af(pot, false);
+    const size_t N = 100000;
+    std::vector<coord::PosVelCyl> points(N);
+    for(size_t i=0; i<N; i++) {
+        double R, z, vR, vphi;
+        math::getNormalRandomNumbers(R, z);
+        math::getNormalRandomNumbers(vR, vphi);
+        R*=R;
+        double vesc = sqrt(-2*pot->value(coord::PosCyl(R, z, 0)));
+        points[i] = coord::PosVelCyl(R, z, 0, vesc*vR*0.2, 0, vesc*vphi*0.2);
+    }
+    std::cout << "Testing the performance of " << af.name() << std::endl;
+    utils::Timer timer;
+    actions::Actions ac;
+    actions::Angles an;
+    actions::Frequencies fr;
+    for(size_t i=0; i<N; i++) {
+        af.eval(points[i], &ac);
+    }
+    double t1 = timer.deltaSeconds();
+    std::cout << "Evaluate actions: " << utils::toString(N/t1, 3) << " points/s" << std::flush;
+    for(size_t i=0; i<N; i++) {
+        af.eval(points[i], &ac, NULL, &fr);
+    }
+    double t2 = timer.deltaSeconds();
+    std::cout << ", +frequencies: " << utils::toString(N/(t2-t1), 3) << " points/s" << std::flush;
+    for(size_t i=0; i<N; i++) {
+        af.eval(points[i], &ac, &an, &fr);
+    }
+    double t3 = timer.deltaSeconds();
+    std::cout << ", +angles: " << utils::toString(N/(t3-t2), 3) << " points/s" << std::endl;
+}
+
 int main() {
     potential::PtrOblatePerfectEllipsoid pot(new potential::OblatePerfectEllipsoid(1.0, axis_a, axis_c));
     const actions::ActionFinderAxisymFudge af(pot, true);
@@ -148,6 +186,7 @@ int main() {
     allok &= test(*pot, af, coord::PosVelCar(1, 0.3, 0. , 0.1, 0.4, 0.    ), "exactly in-plane orbit (Jz=0)");
     allok &= test(*pot, af, coord::PosVelCar(1, 0. , 0. , 0. ,.296, 0.    ), "almost circular in-plane orbit (Jz=0,Jr~0)");
     allok &= test(*pot, af, coord::PosVelCar(1, 0. , 0. , 0. , 0. , 0.    ), "exactly radial in-plane orbit (Jz=0,Jphi=0)");
+    testPerformance();
     if(allok)
         std::cout << "\033[1;32mALL TESTS PASSED\033[0m\n";
     else

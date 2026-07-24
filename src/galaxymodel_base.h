@@ -40,15 +40,25 @@ public:
 /** A single instance of the trivial selection function used as a default ingredient in GalaxyModel */
 extern const SelectionFunctionTrivial selectionFunctionTrivial;
 
-/** A rather simple selection function that depends on the distance from a given point x0:
-    S(x) = exp[ - (|x-x0|/R0)^xi ],
-    where R0 is the cutoff radius and xi is the cutoff steepness
+/** A rather simple selection function that depends on the distance from a given point x_0:
+    \f$  S(x) = \exp[ - (|x-x_0|/r_{cut})^\xi ] / [1 + (|x-x_0|/r_0)^\gamma]  \f$,
+    where  r_cut & xi  are the characteristic radius and strength of the exponential cutoff,
+    and   r_0 & gamma  are similar parameters of the power-law cutoff.
+    To use only the power-law cutoff, set r_cut=INFINITY (or xi=0) and adjust r_0 & gamma,
+    while to use only the exponential cutoff, set r_0=INFINITY and gamma>0.
+    A combination of both cutoffs enables more complicated selections; in particular, when gamma<0,
+    the SF increases with radius from 0 to 1, before being (optionally) exponentially-suppressed.
+    Allowed parameter ranges:
+    0 < r_cut <= INFINITY,  0 < r_0 <= INFINITY,  0 <= xi <= INFINITY,  any gamma
+    (when r_0=INFINITY and gamma=0, the 0^0 indeterminacy is treated as 1);
+    xi=INFINITY and gamma=+-INFINITY create stepwise transitions.
 */
 class SelectionFunctionDistance: public BaseSelectionFunction {
     const coord::PosCar point0;
-    const double radius, steepness;
+    const double r_cut_sq, xi, r_0_sq, gamma;
 public:
-    SelectionFunctionDistance(const coord::PosCar& point0, double radius, double steepness);
+    SelectionFunctionDistance(
+        const coord::PosCar& point0, double r_cut, double xi, double r_0, double gamma);
     virtual double value(const coord::PosVelCar& point) const;
 };
 

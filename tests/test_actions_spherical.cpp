@@ -15,6 +15,7 @@
 #include "potential_factory.h"
 #include "potential_composite.h"
 #include "math_core.h"
+#include "math_random.h"
 #include "utils.h"
 #include <iostream>
 #include <fstream>
@@ -96,6 +97,42 @@ bool testPotential(const potential::BasePotential& pot)
     return okR && okJ && okE;
 }
 
+void testPerformance(const potential::BasePotential& pot)
+{
+    actions::ActionFinderSpherical af(pot);
+    const size_t N = 200000;
+    std::vector<coord::PosVelCyl> points(N);
+    std::vector<actions::ActionAngles> acts(N);
+    for(size_t i=0; i<N; i++) {
+        double R, z, vR, vphi;
+        math::getNormalRandomNumbers(R, z);
+        math::getNormalRandomNumbers(vR, vphi);
+        R*=R;
+        double vesc = sqrt(-2*pot.value(coord::PosCyl(R, z, 0)));
+        points[i] = coord::PosVelCyl(R, z, 0, vesc*vR*0.2, 0, vesc*vphi*0.2);
+    }
+    std::cout << "Testing the performance of " << af.name() << " action finder/mapper" << std::endl;
+    utils::Timer timer;
+    actions::Actions ac;
+    actions::Angles an;
+    for(size_t i=0; i<N; i++) {
+        af.eval(points[i], &ac);
+    }
+    double t1 = timer.deltaSeconds();
+    std::cout << "Evaluate actions: " << utils::toString(N/t1, 3) << " points/s" << std::flush;
+    for(size_t i=0; i<N; i++) {
+        af.eval(points[i], &ac, &an);
+        acts[i] = actions::ActionAngles(ac, an);
+    }
+    double t2 = timer.deltaSeconds();
+    std::cout << ", +angles: " << utils::toString(N/(t2-t1), 3) << " points/s" << std::flush;
+    for(size_t i=0; i<N; i++) {
+        points[i] = af.map(acts[i]);
+    }
+    double t3 = timer.deltaSeconds();
+    std::cout << ", mapping: " << utils::toString(N/(t3-t2), 3) << " points/s" << std::endl;
+}
+
 inline void addPot(std::vector<potential::PtrPotential>& pots, const char* params) {
     pots.push_back(potential::createPotential(utils::KeyValueMap(params))); }
 
@@ -120,6 +157,7 @@ int main()
     // a very mild case (cored density)
     addPot(pots, "type=Isochrone scaleradius=1e-3");
     allok &= testPotential(*pots.back());
+    testPerformance(*pots[4]);
     if(allok)
         std::cout << "\033[1;32mALL TESTS PASSED\033[0m\n";
     else

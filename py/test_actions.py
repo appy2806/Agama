@@ -112,7 +112,7 @@ print('Spherical (interpol.), rms error in actions: %s, angles: %s, frequencies:
 print('Action finding with spherical (standalone):   %.3g s, frequencies: %.3g s, actions+freq: %.3g s, act+ang+freq: %.3g s' %
     (t7a-t6d, t7b-t7a, t7c-t7b, t7d-t7c))
 print('Spherical (st/alone),  rms error in actions: %s, angles: %s, frequencies: %s' %
-    (checkLess(act_sps - act, 1e-10), checkLess(ang_sps - ang, 1e-11), checkLess(omf_sps - omm_iso, 1e-11)))
+    (checkLess(act_sps - act, 1e-11), checkLess(ang_sps - ang, 1e-11), checkLess(omf_sps - omm_iso, 1e-11)))
 print('Action finding with axisym. Staeckel fudge:  %.3g s, frequencies: %.3g s, actions+freq: %.3g s, act+ang+freq: %.3g s' %
     (t8a-t7d, t8b-t8a, t8c-t8b, t8d-t8c))
 print('Axisym Staeckel fudge, rms error in actions: %s, angles: %s, frequencies: %s' %

@@ -162,16 +162,13 @@ degree    = int  (args.get('DEGREE', 2))        # [OPT] degree of B-splines  (0 
 symmetry  = 'a'                                 # [OPT] symmetry of the model ('s'pherical, 'a'xisymmetric, 't'riaxial)
 addnoise  =      (args.get('ADDNOISE', 'True')  # [OPT] whether to add a realistic amount of noise in generating mock datacubes
     .upper() in ('TRUE', 'T', 'YES', 'Y'))
-nbody     = int  (args.get('NBODY', 100000))    # [OPT] number of particles for the N-body representation of the best-fit model
+nbody     = int  (args.get('NBODY', 0))         # [OPT] number of particles for the N-body representation of the best-fit model (0 to disable)
 nbodyFormat = args.get('NBODYFORMAT', 'text')   # [OPT] format for storing N-body snapshots (text/nemo/gadget)
 command   = args.get('DO', '').upper()          # [REQ] operation mode: 'RUN' - run a model, 'PLOT' - show the model grid and maps, 'TEST' - show diagnostic plots, 'MOCK' - create mock maps
 variant   = args.get('VARIANT', 'GH').upper()   # [OPT] choice between three ways of representing and fitting LOSVDs (see below)
 if 'HIST' not in variant and 'GH' not in variant and 'VS' not in variant:
     raise RuntimeError('parameter "variant" should be one of "GH" (Gauss-Hermite moments), "VS" (classical moments - v & sigma), or "HIST" (LOSVD histograms)')
 fileResult= 'results%s.txt' % variant           # [OPT] filename for collecting summary results for the entire model grid
-seed      = int  (args.get('SEED', 99))         # [OPT] random seed (different values will create different realizations of mock data when do=MOCK, or initial conditions for the orbit library when do=RUN)
-agama.setRandomSeed(seed)                       # note that Agama has its own
-numpy.random.seed(seed)                         # make things repeatable when generating mock data (*not* related to the seed for the orbit library)
 numpy.set_printoptions(precision=4, linewidth=9999, suppress=True)
 
 # In this example, we use the Multi-Gaussian Expansion to parametrize
@@ -204,9 +201,10 @@ kinemParams1 = dict(          # parameters passed to the constructor of the Targ
 )
 filenameVorBin1 = 'voronoi_bins_i%.0f_lr.txt' % incl # [REQ] Voronoi binning scheme for this dataset
 filenameHist1   = 'kinem_hist_i%.0f_lr.txt'   % incl # [REQ] histogrammed representation of observed LOSVDs
-filenameGH1     = 'kinem_gh_i%.0f_lr.txt'     % incl # [REQ] Gauss-Hermite parametrization of observed LOSVDs (usually only one of these two files is given)
-filenameVS1     = 'kinem_vs_i%.0f_lr.txt'     % incl # [REQ] 
-
+filenameGH1     = 'kinem_gh_i%.0f_lr.txt'     % incl # [REQ] Gauss-Hermite parametrization of observed LOSVDs
+filenameVS1     = 'kinem_vs_i%.0f_lr.txt'     % incl # [REQ] representation of the LOSVD in terms of classical moments (mean v and its dispersion)
+# in the real case, the observational data come in one of the three forms above
+ 
 ### same for the 2nd kinematic dataset [OPT] - may have only one dataset, or as many as needed
 gamma2 = -10.0 * numpy.pi/180
 psf2   = 0.1                  # in this case it's a high-resolution IFU datacube
@@ -261,6 +259,7 @@ def makeMockKin(kinemParams, gridxy, nbins, filenameVorBin, filenameHist, filena
     # to propagate the uncertainties throughout subsequent computations, construct "nboot" realizations
     # of the original datacube perturbed by Gaussian noise
     nboot = 16
+    numpy.random.seed(42)  # make things repeatable when generating mock data
     datacubes = datacube + numpy.random.normal(size=(nboot,)+datacube.shape) * noise * oneparticle
     if addnoise:
         datacube = datacubes[0]   # take one perturbed realization as the input (noisy) data
@@ -292,8 +291,8 @@ def makeMockKin(kinemParams, gridxy, nbins, filenameVorBin, filenameHist, filena
     ind = (1,2,6,7,8,9)  # keep only these columns, corresponding to v,sigma,h3,h4,h5,h6
     numpy.savetxt(filenameGH,
         numpy.dstack((ghm_val, ghm_err))[:,ind,:].reshape(len(apertures), -1),
-        fmt='%8.3f', header='v        v_err    sigma    sigma_err '+
-        'h3       h3_err    h4       h4_err    h5       h5_err    h6       h6_err')
+        fmt='%8.3f', header='     v    v_err    sigma sigma_err'+
+        '      h3   h3_err       h4   h4_err       h5   h5_err       h6   h6_err')
 
     # 3th step, variant C: convert the B-splines to V and sigma
     i0 = agama.bsplineIntegrals(degree, gridv)
@@ -318,8 +317,8 @@ if command == 'MOCK':
     # among other things, it outputs two N-body snapshot files - one for the disk, the other for the bulge component
     try:
         print('Reading input snapshot')
-        snapshot1 = agama.readSnapshot('model_disk_final')
-        snapshot2 = agama.readSnapshot('model_bulge_final')
+        snapshot1 = agama.readSnapshot('model_disk_final.snap')
+        snapshot2 = agama.readSnapshot('model_bulge_final.snap')
         posvel    = numpy.vstack((snapshot1[0], snapshot2[0]))  # 2d Nx6 array of positions and velocities
         mass      = numpy.hstack((snapshot1[1], snapshot2[1]))  # 1d array of N particle masses
         # if your N-body snapshot is contained in a single file, just load it and assign posvel,mass arrays as specified above
@@ -367,12 +366,11 @@ except:
     exit()
 
 densityStars = agama.schwarzlib.makeDensityMGE(mge, distance, arcsec2kpc, beta)
-#densityStars = agama.Density(agama.Density('dens_disk'), agama.Density('dens_bulge'))  # true profiles of this mock dataset
 
 ### parameters for the density dataset
 # the choice of discretization scheme depends on the morphological type of the galaxy being modelled:
-# for disky systems, DensityCylindrical[TopHat/Linear] is preferred, either in the axisymmetric regime
-# (mmax=0), or more generally with mmax>0;
+# for disky systems with (nearly-)separable density profiles in R & z, DensityCylindrical[TopHat/Linear]
+# is preferred, either in the axisymmetric regime (mmax=0), or more generally with mmax>0;
 # for spheroidal systems, DensityClassic[TopHat/Linear] or DensitySphHarm may be more suitable,
 # and in any case, the choice of radial [and possibly vertical] grid requires careful consideration.
 # Here we do it automatically to ensure that the grid covers almost the entire model
@@ -384,13 +382,15 @@ densityParams = dict(type = (
     'DensityClassicLinear',
     'DensitySphHarm',
     'DensityCylindricalTopHat',
-    'DensityCylindricalLinear')[4])   # [REQ] choose one of these types!
+    'DensityCylindricalLinear')[1])   # [REQ] choose one of these types!
 # use the discrete samples from the density profile to choose the grid parameters
 samples = densityStars.sample(10000)[0]
-if densityParams['type'] == 'DensityClassicTopHat' or densityParams['type'] == 'DensityClassicLinear':
+if densityParams['type'] in ('DensityClassicTopHat', 'DensityClassicLinear', 'DensitySphHarm'):
     # create a grid in elliptical radius with axis ratio chosen to [roughly] match those of the density profile
     axes = numpy.percentile(numpy.abs(samples), 90, axis=0)  # three principal axes in the outer part of the profile
-    axes/= numpy.exp(numpy.mean(numpy.log(axes)))  # normalize so that the product of three axes is unity
+    axes/= numpy.prod(axes)**(1./3)  # normalize so that the product of three axes is unity
+    if abs(numpy.log(axes[0]/axes[1])) < 0.1:  # if the two major axes are close enough, make them exactly equal
+        axes[0] = axes[1] = (axes[0]*axes[1])**0.5
     ellrad = numpy.sum((samples / axes)**2, axis=1)**0.5
     # [OPT] make the inner grid segment contain 1% of the total mass
     # (to better constrain the density near the black hole, though this may need some further tuning),
@@ -398,22 +398,19 @@ if densityParams['type'] == 'DensityClassicTopHat' or densityParams['type'] == '
     densityParams['gridr'] = numpy.hstack([0, numpy.percentile(ellrad, tuple(numpy.linspace(1, 99, 24))) ])
     densityParams['axisRatioY'] = axes[1] / axes[0]
     densityParams['axisRatioZ'] = axes[2] / axes[0]
-    print('%s grid in elliptical radius: %s, axis ratios: y/x=%.3g, z/x=%.3g' %
-        (densityParams['type'], densityParams['gridr'], densityParams['axisRatioY'], densityParams['axisRatioZ']))
-    # [OPT] each shell in the elliptical radius is divided in three equal 'panes'
-    # adjacent to each of the principal axes, and then each pane is further divided
-    # into a square grid of cells with stripsPerPane elements on each side
-    densityParams['stripsPerPane'] = 2
-elif densityParams['type'] == 'DensitySphHarm':
-    # this discretization scheme uses a grid in spherical radius and a spherical-harmonic expansion in angles
-    sphrad = numpy.sum(samples**2, axis=1)**0.5
-    # [OPT] same procedure as above, using roughly equal-mass bins in spherical radius except the innermost one
-    densityParams['gridr'] = numpy.hstack([0, numpy.percentile(sphrad, tuple(numpy.linspace(1, 99, 24))) ])
-    # [OPT] order of angular spherical-harmonic expansion in theta and phi (must be even)
-    densityParams['lmax'] = 0 if symmetry[0]=='s' else 8
-    densityParams['mmax'] = 0 if symmetry[0]!='t' else 6
-    print('%s grid in spherical radius: %s, lmax=%i, mmax=%i' %
-        (densityParams['type'], densityParams['gridr'], densityParams['lmax'], densityParams['mmax']))
+    if densityParams['type'] == 'DensitySphHarm':
+        # [OPT] order of angular spherical-harmonic expansion in theta and phi (must be even)
+        densityParams['lmax'] = 0 if symmetry[0]=='s' else 12
+        densityParams['mmax'] = 0 if symmetry[0]!='t' else 8
+        addstr = 'lmax=%i, mmax=%i' % (densityParams['lmax'], densityParams['mmax'])
+    else:
+        # [OPT] each shell in the elliptical radius is divided in three equal 'panes'
+        # adjacent to each of the principal axes, and then each pane is further divided
+        # into a square grid of cells with stripsPerPane elements on each side
+        densityParams['stripsPerPane'] = 2
+        addstr = '%i strips per pane' % densityParams['stripsPerPane']
+    print('%s grid in elliptical radius: %s, axis ratios: y/x=%.3g, z/x=%.3g; %s' %
+        (densityParams['type'], densityParams['gridr'], densityParams['axisRatioY'], densityParams['axisRatioZ'], addstr))
 elif densityParams['type'] == 'DensityCylindricalTopHat' or densityParams['type'] == 'DensityCylindricalLinear':
     sampleR = (samples[:,0]**2 + samples[:,1]**2)**0.5
     samplez = abs(samples[:,2])
@@ -644,7 +641,7 @@ elif command == 'TEST':
     # values of discretized density constraints: this is rather technical, but a large spread in values
     # (more than a few orders of magnitude) may present trouble for the solution - then one would need
     # to change some grid parameters, so that the distribution of cell masses is more uniform
-    ax[1].plot(datasets[0].cons_val[1:])
+    ax[1].plot(abs(datasets[0].cons_val[1:]))
     ax[1].set_xlabel('constraint index')
     ax[1].set_ylabel('density constraint value')
     ax[1].set_yscale('log')

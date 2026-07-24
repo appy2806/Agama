@@ -1,6 +1,6 @@
 /** \file    galaxymodel_densitygrid.h
     \brief   Spatial discretization schemes for Schwarzschild/FEM models
-    \date    2009-2017
+    \date    2009-2026
     \author  Eugene Vasiliev
 
 */
@@ -20,12 +20,6 @@ public:
 
     /// compute the projection of a DF-based model onto the basis elements of the spatial grid
     virtual void computeDFProjection(const GalaxyModel& model, StorageNumT* output) const;
-
-    /// compute the projections of the input density onto all basis elements of the grid
-    /// (by default uses a 3d numerical integration for all basis functions computed via `eval()`,
-    /// but derived classes may provide optimized versions taking into account the structure
-    /// of basis functions and their support)
-    virtual std::vector<double> computeDensityProjection(const potential::BaseDensity& density) const;
 };
 
 
@@ -64,15 +58,15 @@ public:
 */
 template<int N>
 class TargetDensityClassic: public BaseTargetDensity {
-    const unsigned int stripsPerPane;     ///< number of strips in each direction in one pane
-    const unsigned int valuesPerShell;    ///< number of basis functions in each spheroidal shell
-    const std::vector<double> shellRadii; ///< spheroidal radii of the shells
-    const double axisX, axisY, axisZ;     ///< flattening of the grid in each cartesian direction
+    const unsigned int stripsPerPane;  ///< number of strips in each direction in one pane
+    const unsigned int valuesPerShell; ///< number of basis functions in each spheroidal shell
+    const std::vector<double> gridr;   ///< spheroidal radii of the shells
+    const double axisX, axisY, axisZ;  ///< flattening of the grid in each cartesian direction
 public:
     /** construct the grid with given parameters.
         \param[in]  stripsPerPane  is the number of strips in each direction in one pane
         (so that the total number of grid cells is 3 * stripsPerPane^2), should be positive.
-        \param[in]  shellRadii  is the array of grid nodes in spheroidal radius, should be increasing;
+        \param[in]  gridr  is the array of grid nodes in spheroidal radius, should be increasing;
         if the first element is not at zero, then an additional node at zero is implied.
         \param[in]  axisYtoX, axisZtoX  are optional flattening parameters for the grid:
         the grid is geometrically scaled by these numbers in Y and Z directions,
@@ -81,26 +75,28 @@ public:
     */
     TargetDensityClassic(
         const unsigned int stripsPerPane,
-        const std::vector<double>& shellRadii,
+        const std::vector<double>& gridr,
         const double axisYtoX=1., const double axisZtoX=1.);
 
     virtual const char* name() const;
     virtual std::string coefName(unsigned int index) const;
 
     /// total number of basis functions
-    virtual unsigned int numValues() const { return valuesPerShell * shellRadii.size() + N; }
+    virtual unsigned int numValues() const { return valuesPerShell * gridr.size() + N; }
 
     /// adds the values of all nonzero basis functions at the input point, weighted by mult,
     /// to the output array; at most 1 (for N=0) or 8 (for N=1) values are non-zero at any point.
     virtual void addPoint(const double point[3], const double mult, double values[]) const;
 
-    /// an optimized routine for computing the projection of the density profile
-    /// onto the basis functions (in the case N=0 these are the masses contained in each cell)
+    /// compute the projection of the density profile onto basis functions
+    /// (in the case N=0 these are the masses contained in each cell,
+    /// while for N=1 these are masses in a pyramid-shaped region associated with each node).
     virtual std::vector<double> computeDensityProjection(const potential::BaseDensity& density) const;
 };
 
 
-/** Representation of a spheroidal density profile in terms of spherical harmonics.
+/** Representation of a spheroidal density profile in terms of spherical harmonics,
+    using elliptical radius (dividing x,y,z by corresponding axis lengths before computing angles).
     The radial basis functions are triangular-shaped blocks (i.e., B-splines of degree one),
     and the angular dependence is provided by a reduced set of spherical-harmonic functions
     (using only even l,m, 0 <= m <= mmax, m <= l <= lmax, and mmax <= lmax).
@@ -108,9 +104,10 @@ public:
     plus a single function for r=0 (only the 0th harmonic is used).
 */
 class TargetDensitySphHarm: public BaseTargetDensity {
-    const int lmax, mmax;             ///< order of angular expansion in theta and phi
-    const unsigned int angularCoefs;  ///< number of angular coefs at each radius
-    const std::vector<double> gridr;  ///< grid in spherical radius
+    const int lmax, mmax;              ///< order of angular expansion in theta and phi
+    const unsigned int angularCoefs;   ///< number of angular coefs at each radius
+    const std::vector<double> gridr;   ///< grid in spherical radius
+    const double axisX, axisY, axisZ;  ///< flattening of the grid in each cartesian direction
 public:
     /** construct the grid with given parameters.
         \param[in]  lmax  is the order of expansion in theta:
@@ -121,9 +118,16 @@ public:
         are used in the expansion, so the actual order is rounded down to the nearest even number.
         \param[in]  gridr  is the radial grid used in the expansion, should be in increasing order;
         if the first element is not at zero, then an additional node at zero is implied.
+        \param[in]  axisYtoX, axisZtoX  are optional flattening parameters for the grid:
+        the grid is geometrically scaled by these numbers in Y and Z directions,
+        and at the same time all three directions are multiplied by a compensating factor
+        (axisYtoX*axisZtoX)^{-1/3}  that brings the overall volume scaling to unity.
         \throw  std::invalid_argument  if the parameters are not valid.
     */
-    TargetDensitySphHarm(const int lmax, const int mmax, const std::vector<double>& gridr);
+    TargetDensitySphHarm(
+        const int lmax, const int mmax,
+        const std::vector<double>& gridr,
+        const double axisYtoX=1., const double axisZtoX=1.);
 
     virtual const char* name() const;
     virtual std::string coefName(unsigned int index) const;
@@ -134,8 +138,7 @@ public:
     /// compute the values of all basis functions at the point specified by its cartesian coordinates
     virtual void addPoint(const double point[3], const double mult, double values[]) const;
 
-    /// an optimized routine for computing the projection of the density profile
-    /// onto the basis functions
+    /// compute the projection of the density profile onto basis functions
     virtual std::vector<double> computeDensityProjection(const potential::BaseDensity& density) const;
 };
 
@@ -178,7 +181,7 @@ public:
     /// compute the values of all basis functions at the point specified by its cartesian coordinates
     virtual void addPoint(const double point[3], const double mult, double values[]) const;
 
-    /// compute the projections of the density profile onto the basis functions
+    /// compute the projection of the density profile onto basis functions
     virtual std::vector<double> computeDensityProjection(const potential::BaseDensity& density) const;
 };
 

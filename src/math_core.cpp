@@ -6,7 +6,6 @@
 #include <gsl/gsl_min.h>
 #include <gsl/gsl_integration.h>
 #include <gsl/gsl_version.h>
-#include <gsl/gsl_sf_gamma.h>
 #include <stdexcept>
 #include <cassert>
 #include <cmath>
@@ -373,42 +372,95 @@ void Gaussian::evalDeriv(const double x, double *val, double *der, double *der2)
         *der2 = (pow_2(x / sigma) - 1) / pow_2(sigma) * v;
 }
 
+namespace{
+
+/// compute the upper incomplete gamma function Q((n+1)/2, 0.5*y*y) for a half-integer first argument
+double upper_gamma_inc(int n, double y)
+{
+    // this recursion relation is stable for all x; it is not the most efficient when n is large,
+    // but the expected usage scenario is for relatively small n
+    y = fabs(y);
+    double x = 0.5 * y * y;
+    double e = exp(-x);
+    int    m = n % 2 + 1;
+    double v = m == 2  ?  e  :  M_SQRTPI * math::erfc(1/M_SQRT2 * y);
+    double z = m == 2  ?  x  :  1/M_SQRT2 * y;
+    while(m <= n) {
+        v  = 0.5 * m * v + z * e;
+        m += 2;
+        z *= x;
+    }
+    return v;
+}
+
+/// compute the lower incomplete gamma function P((n+1)/2, 0.5*y*y) for a half-integer first argument
+double lower_gamma_inc(int n, double y)
+{
+    //return gsl_sf_gamma_inc_P(0.5*(n+1), 0.5*y*y) * gsl_sf_gamma(0.5*(n+1));
+    double x = 0.5 * y * y;
+    double e = exp(-x);
+    double s = 0.5 * (n+1);
+    if(y*y > s) {
+        // this recursion relation is unstable for small x,
+        // but remains adequate when x >~ (0.5-0.7) s, or when n<=1 (but this case is already covered)
+        y = fabs(y);
+        int    m = n % 2 + 1;
+        double v = m == 2  ?  -expm1(-x)  :  M_SQRTPI * math::erf(1/M_SQRT2 * y);
+        double z = m == 2  ?  x  :  1/M_SQRT2 * y;
+        while(m <= n) {
+            v  = 0.5 * m * v - z * e;
+            m += 2;
+            z *= x;
+        }
+        return v;
+    } else {
+        // series expansion works well for small x, but requires too many terms when x >~ s
+        double r = s, c = 1., v = 1.;
+        do{
+            r += 1.0;
+            c *= x / r;
+            v += c;
+        } while(c > DBL_EPSILON * v);
+        return v * pow(x, s) / s * e;
+    }
+}
+
+}
+
 double Gaussian::integrate(double x1, double x2, int n) const
 {
-    if(n<0)
+    // TODO: when x1 and x2 are very close, use a Taylor expansion for accuracy and lower cost
+    if(n < 0)
         return NAN;  // undefined
-    if(sigma==0)
+    if(sigma == 0)
         return (n==0 && x1<=0 && x2>=0) ? 1 : (n==0 && x1>=0 && x2<=0) ? -1 : 0;
-    if(x1+x2==0 && n%2==1)
+    if(x1+x2 == 0 && n%2 == 1)
         return 0;  // avoid roundoff errors if the integral is symmetrically zero
     // not easy at all...
     double y1 = x1 / sigma, y2 = x2 / sigma;  // first, normalize the input
-    double e1 = exp(-0.5*y1*y1), e2 = exp(-0.5*y2*y2);
-    double deltaf = fmin(y1, y2) >= 7.0 || fmax(y1, y2) <= -7.0 ?
-        e1 / y1 * (1 - 1/pow_2(y1)) - e2 / y2 * (1 - 1/pow_2(y2)) :    // asymptotic expansion
-        (math::erf(y2/M_SQRT2) - math::erf(y1/M_SQRT2)) * (M_SQRTPI/M_SQRT2);
-    double val= NAN;
-    switch(n) {
-        case 0: val = deltaf;  break;
-        case 1: val = e1 - e2;  break;
-        case 2: val = y1 * e1 - y2 * e2  +  deltaf;  break;
-        case 3: val = (2 + y1 * y1) * e1  -  (2 + y2 * y2) * e2;  break;
-        case 4: val = y1 * (3 + y1 * y1) * e1  -  y2 * (3 + y2 * y2) * e2  +  3 * deltaf;  break;
-        case 5: val = (8 + y1 * y1 * (4 + y1 * y1)) * e1  -  (8 + y2 * y2 * (4 + y2 * y2)) * e2;  break;
-        case 6: val = y1 * (15 + y1 * y1 * (5 + y1 * y1)) * e1
-                    - y2 * (15 + y2 * y2 * (5 + y2 * y2)) * e2  +  15 * deltaf;  break;
-        case 7: val = (48 + y1 * y1 * (24 + y1 * y1 * (6 + y1 * y1))) * e1
-                    - (48 + y2 * y2 * (24 + y2 * y2 * (6 + y2 * y2))) * e2; break;
-        default: {  // general case
-            exceptionFlag = false;
-            double v0 = gsl_sf_gamma(0.5*(n+1));
-            double v1 = (v0 - gsl_sf_gamma_inc(0.5*(n+1), 0.5*y1*y1)) * (y1>0 || n%2==1 ? 1 : -1);
-            double v2 = (v0 - gsl_sf_gamma_inc(0.5*(n+1), 0.5*y2*y2)) * (y2>0 || n%2==1 ? 1 : -1);
-            if(!exceptionFlag)
-                val = pow(M_SQRT2, n-1) * (v2 - v1);
-        }
+    if(n == 0) {
+        return 0.5 * (
+        // use either erf or erfc depending on the range, to avoid roundoff errors
+        // (avoid subtracting two numbers that are both close to 1)
+        fmin(y1, y2) >=  1 ? (math::erfc(1/M_SQRT2 * y1) - math::erfc(1/M_SQRT2 * y2)) :
+        fmax(y1, y2) <= -1 ? (math::erfc(1/M_SQRT2 *-y2) - math::erfc(1/M_SQRT2 *-y1)) :
+        (math::erf(1/M_SQRT2 * y2) - math::erf(1/M_SQRT2 * y1)) );
     }
-    return val * pow(sigma, n) / (M_SQRTPI * M_SQRT2);
+    if(n == 1) {
+        double y1sq = y1*y1, y2sq = y2*y2;
+        return 1 / (M_SQRTPI * M_SQRT2) * sigma * ( (y1sq >= 1 || y2sq >= 1) ?
+            exp(  -0.5 * y1sq) - exp  (-0.5 * y2sq) :
+            expm1(-0.5 * y1sq) - expm1(-0.5 * y2sq) );  // avoid roundoff when both y1,y2 are small
+    }
+    // general case
+    double sign1 = y1>0 || n%2==1 ? 1 : -1, sign2 = y2>0 || n%2==1 ? 1 : -1;
+    double dif = (sign1 == sign2 && fmin(y1*y1, y2*y2) > n) ?
+        // subtract two upper incomplete gamma functions, at least one of them is not close to 1
+        upper_gamma_inc(n, y1) * sign1 - upper_gamma_inc(n, y2) * sign2
+    :   // otherwise subtract two lower (complementary) incomplete gamma functions,
+        // which either have different signs or at least are not both close to 1
+        lower_gamma_inc(n, y2) * sign2 - lower_gamma_inc(n, y1) * sign1;
+    return 0.5/M_SQRTPI * math::pow(M_SQRT2 * sigma, n) * dif;
 }
 
 // ------- tools for analyzing the behaviour of a function around a particular point ------- //

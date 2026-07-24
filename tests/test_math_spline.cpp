@@ -741,10 +741,16 @@ bool testGaussianIntegral(double x1, double x2, double sigma, int n)
 {
     math::Gaussian gauss(sigma);
     // numerical integration
-    double intnum = math::integrate(math::FncProduct(math::Monomial(n), gauss), x1, x2, 1e-12);
+    double intnum = math::integrate(math::FncProduct(math::Monomial(n), gauss), x1, x2, 1e-13);
     // analytic integration provided by the IFunctionIntegral interface
     double intan  = gauss.integrate(x1, x2, n);
-    return fabs(intnum-intan) <= fmax(1.5e-15, fabs(intan) * 1e-12);
+    double reldif = (intnum - intan) * 2 / (intnum + intan + 1e-300);
+    if(fabs(reldif) < 1e-14)
+        return true;
+    std::cout << "Integral of x^" << n << "*Gaussian(x,sigma=" << sigma << 
+        ") on [" << x1 << ".." << x2 << "]: numeric=" << utils::toString(intnum,16) <<
+        ", analytic=" << utils::toString(intan,16) << ", rel.difference=" << reldif << "\n";
+    return false;
 }
 
 template<class Kernel>
@@ -793,6 +799,7 @@ bool testFiniteElement()
 {
     // test the analytic integration provided by the IFunctionIntegral interface of math::Gaussian
     if( !testGaussianIntegral( 1.0, 2.0, 0.5, 0) ||
+        !testGaussianIntegral(-3.5,-4.0, 0.5, 0) ||
         !testGaussianIntegral( 3.5, 4.0, 0.5, 0) ||
         !testGaussianIntegral( 0.2, 2.0, 0.6, 1) ||
         !testGaussianIntegral(-3.0, 2.0, 0.7, 2) ||
@@ -809,7 +816,10 @@ bool testFiniteElement()
         !testGaussianIntegral( 0.0, 2.0, 0.5, 8) ||
         !testGaussianIntegral(-2.0, 0.0, 0.5, 8) ||
         !testGaussianIntegral(-2.0, 2.0, 0.5, 8) ||
-        !testGaussianIntegral( 2.0,-2.0, 0.5, 8) )
+        !testGaussianIntegral( 2.0,-2.0, 0.5, 8) ||
+        !testGaussianIntegral(-0.1, 0.2, 0.5,15) ||
+        !testGaussianIntegral( 0.1, 0.2, 1.0,16) ||
+        !testGaussianIntegral( 3.5, 4.0, 0.5,16))
     {
         std::cout << "Analytic integration of a Gaussian times monomial function "
             "\033[1;31m failed\033[0m\n";

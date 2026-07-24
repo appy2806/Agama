@@ -17,44 +17,28 @@ namespace galaxymodel{
 
 namespace{
 
-/// relative accuracy of 3d integration for computing the projections of density onto basis functions
+/// relative accuracy of computing density from DF
 static const double EPSREL_DENSITY_INT = 1e-3;
 
-/// max number of density evaluations per basis function
-static const unsigned int MAX_NUM_EVAL = 1000;
+/// max number of DF evaluations for computing density from DF
+static const unsigned int MAX_NUM_EVAL = 1e4;
 
-/// order of Gauss-Legendre integration in radial direction for optimized projection implementations
-static const unsigned int GLORDER_RAD  = 6;
+/// order of Gauss-Legendre integration in radial (or vertical) directions for all schemes
+static const unsigned int GLORDER_RAD  = 8;
 
 /// order of Gauss-Legendre integration in angular direction for the classical grid scheme
 static const unsigned int GLORDER_ANG  = 4;
 
 /// minimum order of spherical-harmonic or Fourier expansion for computing the density projection
-static const int LMIN_SPHHARM = 16;
+static const int LMIN_SPHHARM = 12;
 
-/// Helper class for 3-dimensional integration of a density multiplied by basis functions of the grid
-class TargetDensityIntegrand: public math::IFunctionNdim {
-    const potential::BaseDensity& dens;
-    const BaseTargetDensity& grid;
-    const unsigned int nval;
-public:
-    TargetDensityIntegrand(const potential::BaseDensity& _dens, const BaseTargetDensity& _grid) :
-        dens(_dens), grid(_grid), nval(grid.numValues()) {}
+/// number of additional sph.-harm. or Fourier terms on top of the requested output order of expansion
+/// (to improve the accuracy of integration in angles)
+static const int LADD_SPHHARM = 6;
 
-    virtual void eval(const double vars[], double values[]) const {
-        std::fill(values, values + nval, 0.);
-        double val;
-        const coord::PosCyl pcyl = potential::unscaleCoords(vars, &val /*jacobian of coord scaling*/);
-        if(val!=0) val *= dens.density(pcyl);
-        if(val!=0) {
-            coord::PosCar pcar(toPosCar(pcyl));
-            double xyz[3] = {pcar.x, pcar.y, pcar.z};
-            grid.addPoint(xyz, val, values);
-        }
-    }
-    virtual unsigned int numVars()   const { return 3; }
-    virtual unsigned int numValues() const { return nval; }
-};
+/// eliminate spherical-harmonic or Fourier terms whose relative amplitude is less than this number
+static const double EPS_COEF = 1e-12;
+
 
 // decode the index of the cell for TargetDensityClassic<0>,
 // or its four corners for TargetDensityClassic<1>
@@ -121,25 +105,13 @@ template<> inline void getCornerIndicesCylindrical<1>(
 
 void BaseTargetDensity::computeDFProjection(const GalaxyModel& model, StorageNumT* output) const
 {
+    // derived classes implement computeDensityProjection using vectorized collection of
+    // input density values at all points, and DensityFromDF internally OpenMP-parallelizes
+    // the computation over all input points, making it as efficient as it could be.
     std::vector<double> result =
-        // TODO: this routine should be OpenMP-parallelized in each of the descendant classes
-        // update: DensityFromDF is itself parallelized when using evalmanyDensity***,
-        // but in the current implementations of computeDensityProjection, the input density
-        // is queried one point at a time - this needs to be replaced with evalmany...
         computeDensityProjection(DensityFromDF(model, EPSREL_DENSITY_INT, MAX_NUM_EVAL));
     for(size_t i=0; i<result.size(); i++)
         output[i] = static_cast<StorageNumT>(result[i]);
-}
-
-std::vector<double> BaseTargetDensity::computeDensityProjection(
-    const potential::BaseDensity& density) const
-{
-    double xlower[3] = {0,0,0};   // boundaries of integration region in scaled coordinates
-    double xupper[3] = {1,1,1};
-    std::vector<double> result(numValues());
-    math::integrateNdim(TargetDensityIntegrand(density, *this),
-        xlower, xupper, EPSREL_DENSITY_INT, MAX_NUM_EVAL * numValues(), &result[0]);
-    return result;
 }
 
 
@@ -154,25 +126,25 @@ TargetDensityClassic<N>::TargetDensityClassic(
     stripsPerPane(_stripsPerPane),
     valuesPerShell(3 * stripsPerPane * (stripsPerPane + N) + N),
     // if the input grid starts from zero, skip this first array element, otherwise take the whole array
-    shellRadii(_gridr.empty() || _gridr[0] > 0 ? _gridr.begin() : _gridr.begin()+1, _gridr.end()),
+    gridr(_gridr.empty() || _gridr[0] > 0 ? _gridr.begin() : _gridr.begin()+1, _gridr.end()),
     axisX(1. / cbrt(axisYtoX*axisZtoX)),
     axisY(axisYtoX * axisX),
     axisZ(axisZtoX * axisX)   // the product axisX*axisY*axisZ is unity
 {
-    bool ok = shellRadii.size() >= 1 && shellRadii[0] > 0;
-    for(unsigned int i=1; i<shellRadii.size(); i++)
-        ok &= shellRadii[i] > shellRadii[i-1];
-    if(!ok || stripsPerPane<1 || shellRadii.size()<1 || axisYtoX<=0 || axisZtoX<=0)
+    bool ok = gridr.size() >= 1 && gridr[0] > 0;
+    for(unsigned int i=1; i<gridr.size(); i++)
+        ok &= gridr[i] > gridr[i-1];
+    if(!ok || stripsPerPane<1 || axisYtoX<=0 || axisZtoX<=0)
         throw std::invalid_argument("TargetDensityClassic: invalid grid parameters");
 }
 
 template<int N>
 void TargetDensityClassic<N>::addPoint(const double point[3], const double mult, double values[]) const
 {
-    const int numShells = shellRadii.size();
+    const int numShells = gridr.size();
     double X = fabs(point[0] / axisX), Y = fabs(point[1]) / axisY, Z = fabs(point[2]) / axisZ;
     double r = sqrt(X*X + Y*Y + Z*Z);
-    int indShell = math::binSearch(r, &shellRadii[0], numShells) + 1;
+    int indShell = math::binSearch(r, &gridr[0], numShells) + 1;
     assert(indShell>=0);
     if(indShell >= numShells || mult == 0) {
         return;  // outside the grid
@@ -214,8 +186,8 @@ void TargetDensityClassic<N>::addPoint(const double point[3], const double mult,
         ratio1 -= ind1;
         ratio2 -= ind2;
         double val = indShell == 0 ?
-            mult *  r / shellRadii[0] :
-            mult * (r - shellRadii[indShell-1]) / (shellRadii[indShell] - shellRadii[indShell-1]);
+            mult *  r / gridr[0] :
+            mult * (r - gridr[indShell-1]) / (gridr[indShell] - gridr[indShell-1]);
         // contribution to the basis functions at the upper end of the radial segment
         double* valOff = &values[indShell * valuesPerShell + 1];  // offset in the output array
         valOff[indll] += (1-ratio1) * (1-ratio2) * val;
@@ -241,6 +213,9 @@ template<int N>
 std::vector<double> TargetDensityClassic<N>::computeDensityProjection(
     const potential::BaseDensity& density) const
 {
+    if(!isTriaxial(density))
+        throw std::runtime_error("TargetDensityClassic: input density should have triaxial symmetry");
+
     const double *glnodesRad = math::GLPOINTS[GLORDER_RAD], *glweightsRad = math::GLWEIGHTS[GLORDER_RAD];
     const double *glnodesAng = math::GLPOINTS[GLORDER_ANG], *glweightsAng = math::GLWEIGHTS[GLORDER_ANG];
     // pre-compute nodes and weigths for all strips in the integration over angles
@@ -251,11 +226,36 @@ std::vector<double> TargetDensityClassic<N>::computeDensityProjection(
         weightsAng[iA] = glweightsAng[glindex] * (1 + pow_2(nodesAng[iA])) / stripsPerPane * M_PI/4;
     }
     std::vector<double> result(numValues());
-    for(unsigned int iR=0; iR < shellRadii.size() * GLORDER_RAD; iR++) {
+
+    // 1. prepare coordinates of all points where the input density values should be collected
+    std::vector<coord::PosCar> pos(gridr.size() * GLORDER_RAD * pow_2(GLORDER_ANG * stripsPerPane) * 3);
+    for(unsigned int iR=0, ip=0; iR < gridr.size() * GLORDER_RAD; iR++) {
         int indShell = iR / GLORDER_RAD, offShell = iR % GLORDER_RAD;
         double
-        radius1 = indShell == 0 ? 0. : shellRadii[indShell-1],
-        radius2 = shellRadii[indShell],
+        offsetR = glnodesRad[offShell],
+        radius  = (indShell == 0 ? 0. : gridr[indShell-1]) * (1-offsetR) + gridr[indShell] * offsetR;
+        for(unsigned int i1 = 0; i1 < GLORDER_ANG * stripsPerPane; i1++) {
+            for(unsigned int i2 = 0; i2 < GLORDER_ANG * stripsPerPane; i2++) {
+                double
+                denom    = 1. / sqrt(1 + pow_2(nodesAng[i1]) + pow_2(nodesAng[i2])),
+                coord[3] = {radius * denom, radius * denom * nodesAng[i1], radius * denom * nodesAng[i2]};
+                for(int pane=0; pane<3; pane++, ip++)
+                    pos.at(ip) = coord::PosCar(
+                        coord[(3-pane)%3] * axisX, coord[(4-pane)%3] * axisY, coord[(5-pane)%3] * axisZ);
+            }
+        }
+    }
+
+    // 2. collect density values at all points at once
+    std::vector<double> densValues(pos.size());
+    density.evalmanyDensityCar(pos.size(), &pos.front(), &densValues.front());
+
+    // 3. convert these values into the array of cell masses
+    for(unsigned int iR=0, ip=0; iR < gridr.size() * GLORDER_RAD; iR++) {
+        int indShell = iR / GLORDER_RAD, offShell = iR % GLORDER_RAD;
+        double
+        radius1 = indShell == 0 ? 0. : gridr[indShell-1],
+        radius2 = gridr[indShell],
         offsetR = glnodesRad[offShell],
         radius  = radius1 * (1-offsetR) + radius2 * offsetR,
         weightRad = 8/*octants*/ * pow_2(radius) * glweightsRad[offShell] * (radius2 - radius1);
@@ -265,12 +265,10 @@ std::vector<double> TargetDensityClassic<N>::computeDensityProjection(
                 offset1  = glnodesAng[i1 % GLORDER_ANG],  // fractional coords within the current cell
                 offset2  = glnodesAng[i2 % GLORDER_ANG],
                 denom    = 1. / sqrt(1 + pow_2(nodesAng[i1]) + pow_2(nodesAng[i2])),
-                weight   = weightRad * weightsAng[i1] * weightsAng[i2] * pow_3(denom),
-                coord[3] = {radius * denom, radius * denom * nodesAng[i1], radius * denom * nodesAng[i2]};
+                weight   = weightRad * weightsAng[i1] * weightsAng[i2] * pow_3(denom);
                 int ind1 = i1 / GLORDER_ANG, ind2 = i2 / GLORDER_ANG;
-                for(int pane=0; pane<3; pane++) {
-                    double value = weight * density.density(coord::PosCar(
-                        coord[(3-pane)%3] * axisX, coord[(4-pane)%3] * axisY, coord[(5-pane)%3] * axisZ));
+                for(int pane=0; pane<3; pane++, ip++) {
+                    double value = weight * densValues[ip];
                     int indll, indul, indlu, induu;
                     getCornerIndicesClassic<N>(pane, ind1, ind2, stripsPerPane,
                         /*output*/indll, indul, indlu, induu);
@@ -316,14 +314,14 @@ std::string TargetDensityClassic<N>::coefName(unsigned int index) const
         pane     = index % valuesPerShell / (stripsPerPane * stripsPerPane);
         coord[1] = tan(M_PI/4 * (ind1 + 0.5) / stripsPerPane);
         coord[2] = tan(M_PI/4 * (ind2 + 0.5) / stripsPerPane);
-        radius   = 0.5 * (shellRadii.at(indShell) + (indShell>0 ? shellRadii[indShell-1] : 0.));
+        radius   = 0.5 * (gridr.at(indShell) + (indShell>0 ? gridr[indShell-1] : 0.));
     } else if(N==1) {
         if(index==0) {  // the node at origin
             coord[1] = coord[2] = radius = 0.;
             pane = 0;
         } else {
             index--;
-            radius = shellRadii.at(index / valuesPerShell);
+            radius = gridr.at(index / valuesPerShell);
             index %= valuesPerShell;
             if(index == valuesPerShell-1) {  // the central node
                 pane  = 0;
@@ -354,23 +352,30 @@ template class TargetDensityClassic<1>;
 //----- Spherical-harmonic density representation -----//
 
 TargetDensitySphHarm::TargetDensitySphHarm(
-    const int _lmax, const int _mmax, const std::vector<double>& _gridr)
+    const int _lmax, const int _mmax,
+    const std::vector<double>& _gridr,
+    const double axisYtoX, const double axisZtoX)
 :
     lmax(_lmax), mmax(_mmax),
     angularCoefs( (lmax/2+1) * (mmax/2+1) - mmax/2 * (mmax/2+1) / 2 ),
     // if the input grid starts from zero, skip this first array element, otherwise take the whole array
-    gridr(_gridr.empty() || _gridr[0] > 0 ? _gridr.begin() : _gridr.begin()+1, _gridr.end())
+    gridr(_gridr.empty() || _gridr[0] > 0 ? _gridr.begin() : _gridr.begin()+1, _gridr.end()),
+    axisX(1. / cbrt(axisYtoX*axisZtoX)),
+    axisY(axisYtoX * axisX),
+    axisZ(axisZtoX * axisX)   // the product axisX*axisY*axisZ is unity
 {
-    bool ok = lmax >= 0 && mmax >= 0 && mmax <= lmax && gridr.size() >= 1 && gridr[0] > 0;
+    bool ok = gridr.size() >= 1 && gridr[0] > 0;
     for(unsigned int i=1; i<gridr.size(); i++)
         ok &= gridr[i] > gridr[i-1];
-    if(!ok)
+    if(!ok || axisYtoX<=0 || axisZtoX<=0 ||
+        lmax < 0 || lmax%2 != 0 || mmax < 0 || mmax%2 != 0 || mmax > lmax)
         throw std::invalid_argument("TargetDensitySphHarm: invalid grid parameters");
 }
 
 void TargetDensitySphHarm::addPoint(const double point[3], double mult, double values[]) const
 {
-    const coord::PosCyl pcyl = toPosCyl(coord::PosCar(point[0], point[1], point[2]));
+    const coord::PosCyl pcyl = toPosCyl(
+        coord::PosCar(point[0] / axisX, point[1] / axisY, point[2] / axisZ));
     double r   = sqrt(pow_2(pcyl.R) + pow_2(pcyl.z));
     double tau = pcyl.z / (r + pcyl.R);
     if(r==0) {
@@ -413,43 +418,62 @@ void TargetDensitySphHarm::addPoint(const double point[3], double mult, double v
 std::vector<double> TargetDensitySphHarm::computeDensityProjection(
     const potential::BaseDensity& density) const
 {
+    if(!isTriaxial(density))
+        throw std::runtime_error("TargetDensitySphHarm: input density should have triaxial symmetry");
+
     // the integration in radius follows the Gauss-Legendre rule
     const double *glnodesRad = math::GLPOINTS[GLORDER_RAD], *glweightsRad = math::GLWEIGHTS[GLORDER_RAD];
 
     // to improve accuracy of SH coefficient computation, we may increase the order of expansion
     // that determines the number of integration points in angles
-    int lmax_tmp =     isSpherical(density) ? 0 : std::max(lmax, LMIN_SPHHARM);
-    int mmax_tmp = isZRotSymmetric(density) ? 0 : std::max(mmax, LMIN_SPHHARM);
+    int lmax_tmp = std::max<int>(lmax+LADD_SPHHARM, LMIN_SPHHARM);
+    int mmax_tmp = std::max<int>(mmax+LADD_SPHHARM, LMIN_SPHHARM);
+    if(isSpherical(density) && axisX==1 && axisY==1) lmax_tmp = 0;
+    if(isZRotSymmetric(density) && axisX==axisY)     mmax_tmp = 0;
     math::SphHarmIndices ind(lmax_tmp, mmax_tmp, coord::ST_TRIAXIAL);
     math::SphHarmTransformForward trans(ind);
-    unsigned int numSamplesAngles = trans.size();  // size of array of density values at each r
-    std::vector<double> densValues(numSamplesAngles);
+    const unsigned int numSamplesAngles = trans.size();  // size of array of density values at each r
+    const int gridrsize = gridr.size();
+
+    // 1. prepare coordinates of all points where the input density values should be collected
+    std::vector<coord::PosCar> pos(gridrsize * GLORDER_RAD * numSamplesAngles);
+    for(unsigned int ir=0, ip=0; ir < gridrsize * GLORDER_RAD; ir++) {
+        // 0. assign the radius of this point and its weigth in the total integral
+        int indr = ir / GLORDER_RAD, subr = ir % GLORDER_RAD;
+        double
+        offr    = glnodesRad[subr],  // fractional offset [0..1] within the current grid segment
+        radius  = (indr == 0 ? 0. : gridr[indr-1]) * (1-offr) + gridr[indr] * offr;
+        for(unsigned int ia=0; ia<numSamplesAngles; ia++, ip++)  {
+            double z   = radius * trans.costheta(ia);
+            double R   = sqrt(pow_2(radius) - z*z);
+            double phi = trans.phi(ia);
+            coord::PosCar tp = toPosCar(coord::PosCyl(R, z, phi));
+            pos.at(ip) = coord::PosCar(tp.x * axisX, tp.y * axisY, tp.z * axisZ);
+        }
+    }
+
+    // 2. collect density values at all points at once
+    std::vector<double> densValues(pos.size());
+    density.evalmanyDensityCar(pos.size(), &pos.front(), &densValues.front());
+
+    // 3. convert these values into the array of expansion coefficients
     std::vector<double> shcoefs(std::max<int>(ind.size(), pow_2(lmax+1)));
     std::vector<double> result(numValues());
-    const int gridrsize = gridr.size();
     for(unsigned int ir=0; ir < gridrsize * GLORDER_RAD; ir++) {
-        // 0. assign the radius of this point and its weigth in the total integral
+        // transform the array of values at each radius to spherical-harmonic expansion coefficients
+        trans.transform(&densValues.at(ir * numSamplesAngles), /*output*/ &shcoefs[0]);
+        math::eliminateNearZeros(shcoefs, EPS_COEF);
+
         int indr = ir / GLORDER_RAD, subr = ir % GLORDER_RAD;
         double
         radius1 = indr == 0 ? 0. : gridr[indr-1],
         radius2 = gridr[indr],
-        offr    = glnodesRad[subr],  // fractional [0..1] offset inside the current grid segment
+        offr    = glnodesRad[subr],
         radius  = radius1 * (1-offr) + radius2 * offr,
         weight  = 4*M_PI * pow_2(radius) * glweightsRad[subr] * (radius2 - radius1);
 
-        // 1. collect the density values at the prescribed set of points in angles
-        for(unsigned int iA=0; iA<numSamplesAngles; iA++)  {
-            double z   = radius * trans.costheta(iA);
-            double R   = sqrt(pow_2(radius) - z*z);
-            double phi = trans.phi(iA);
-            densValues[iA] = density.density(coord::PosCyl(R, z, phi));
-        }
-
-        // 2. transform these values to spherical-harmonic expansion coefficients
-        trans.transform(&densValues[0], &shcoefs[0]);
-
-        // 3. store the contribution of each SH coef to the relevant radial basis functions
-        // (which are simply triangular-shaped blocks, so that at most two of them are used per each l,m)
+        // store the contribution of each SH coef to the relevant radial basis functions
+        // (they are simply triangular-shaped blocks, so at most two of them are used at each radius)
         for(int m=0, offset=indr+1; m<=mmax; m+=2) {
             for(int l=m; l<=lmax; l+=2, offset+=gridrsize) {
                 double val = shcoefs[ind.index(l, m)] * weight;
@@ -459,6 +483,7 @@ std::vector<double> TargetDensitySphHarm::computeDensityProjection(
             }
         }
     }
+
     return result;
 }
 
@@ -547,38 +572,60 @@ template<int N>
 std::vector<double> TargetDensityCylindrical<N>::computeDensityProjection(
     const potential::BaseDensity& density) const
 {
+    if(!isTriaxial(density))
+        throw std::runtime_error("TargetDensityCylindrical: input density should have triaxial symmetry");
+
     // the integration in R and z follows the Gauss-Legendre rule
     const double *glnodesRad = math::GLPOINTS[GLORDER_RAD], *glweightsRad = math::GLWEIGHTS[GLORDER_RAD];
     // select a sufficiently high order of integration in angles
-    int mmax_tmp = isZRotSymmetric(density) ? 0 : std::max(mmax, LMIN_SPHHARM);
+    int mmax_tmp = isZRotSymmetric(density) ? 0 : std::max(mmax+LADD_SPHHARM, LMIN_SPHHARM);
     math::FourierTransformForward trans(mmax_tmp, false/*no odd terms*/);
-    unsigned int numSamplesAngles = trans.size();      // size of array of density values at each (R,z)
-    std::vector<double> densValues(numSamplesAngles);  // temp.storage for density values
+    const unsigned int numSamplesAngles = trans.size();  // size of array of density values at each (R,z)
+    const int gridRsize = gridR.size(), gridzsize = gridz.size();
+
+    // 1. prepare coordinates of all points where the input density values should be collected
+    std::vector<coord::PosCyl> pos(gridRsize * gridzsize * pow_2(GLORDER_RAD) * numSamplesAngles);
+    for(unsigned int iz=0, ip=0; iz < gridzsize * GLORDER_RAD; iz++) {
+        int indz = iz / GLORDER_RAD, subz = iz % GLORDER_RAD;
+        double
+        offz = glnodesRad[subz],  // fractional offset [0..1] in z within the current grid segment
+        z    = (indz == 0 ? 0. : gridz[indz-1]) * (1-offz) + gridz[indz] * offz;
+        for(unsigned int iR=0; iR < gridRsize * GLORDER_RAD; iR++) {
+            int indR = iR / GLORDER_RAD, subR = iR % GLORDER_RAD;
+            double
+            offR  = glnodesRad[subR],  // fractional offset in R
+            R     = (indR == 0 ? 0. : gridR[indR-1]) * (1-offR) + gridR[indR] * offR;
+            for(unsigned int iphi=0; iphi<numSamplesAngles; iphi++, ip++)
+                pos.at(ip) = coord::PosCyl(R, z, trans.phi(iphi));
+        }
+    }
+
+    // 2. collect density values at all points at once
+    std::vector<double> densValues(pos.size());
+    density.evalmanyDensityCyl(pos.size(), &pos.front(), &densValues.front());
+
+    // 3. convert these values into the array of Fourier coefficients
     std::vector<double> coefs(std::max<int>(trans.size(), mmax+1));  // temp.storage for transformed coefs
     std::vector<double> result(numValues());  // output array
-    const int gridRsize = gridR.size(), gridzsize = gridz.size();
-    for(unsigned int iR=0; iR < gridRsize * GLORDER_RAD; iR++) {
-        int indR = iR / GLORDER_RAD, subR = iR % GLORDER_RAD;
+    for(unsigned int iz=0; iz < gridzsize * GLORDER_RAD; iz++) {
+        int indz = iz / GLORDER_RAD, subz = iz % GLORDER_RAD;
         double
-        R1      = indR == 0 ? 0. : gridR[indR-1],
-        R2      = gridR[indR],
-        offR    = glnodesRad[subR],  // fractional [0..1] offset in R inside the current grid segment
-        R       = R1 * (1-offR) + R2 * offR,
-        weightR = 2 * R * glweightsRad[subR] * (R2 - R1);
+        offz    = glnodesRad[subz],  // fractional offset in z
+        weightz = glweightsRad[subz] * (gridz[indz] - (indz == 0 ? 0. : gridz[indz-1]));
 
-        for(unsigned int iz=0; iz < gridzsize * GLORDER_RAD; iz++) {
-            int indz = iz / GLORDER_RAD, subz = iz % GLORDER_RAD;
+        for(unsigned int iR=0; iR < gridRsize * GLORDER_RAD; iR++) {
+            int indR = iR / GLORDER_RAD, subR = iR % GLORDER_RAD;
             double
-            z1     = indz == 0 ? 0. : gridz[indz-1],
-            z2     = gridz[indz],
-            offz   = glnodesRad[subz],  // fractional offset in z
-            z      = z1 * (1-offz) + z2 * offz,
-            weight = weightR * glweightsRad[subz] * (z2 - z1);
+            R1     = indR == 0 ? 0. : gridR[indR-1],
+            R2     = gridR[indR],
+            offR   = glnodesRad[subR],
+            R      = R1 * (1-offR) + R2 * offR,
+            weight = weightz * 2 * R * glweightsRad[subR] * (R2 - R1);
 
-            // collect the density values and transform them into Fourier coefficients
-            for(unsigned int iphi=0; iphi<numSamplesAngles; iphi++)
-                densValues[iphi] = density.density(coord::PosCyl(R, z, trans.phi(iphi)));
-            trans.transform(&densValues[0], &coefs[0]);
+            // transform the array of density values at each annulus in R,z into Fourier coefficients
+            trans.transform(&densValues.at((iz * gridRsize * GLORDER_RAD + iR) * numSamplesAngles),
+                /*output*/ &coefs[0]);
+            math::eliminateNearZeros(coefs, EPS_COEF);
 
             // add the contribution to each basis function in the azimuthal plane
             for(int m=0; m<=mmax; m+=2) {
@@ -600,6 +647,7 @@ std::vector<double> TargetDensityCylindrical<N>::computeDensityProjection(
             }
         }
     }
+
     return result;
 }
 

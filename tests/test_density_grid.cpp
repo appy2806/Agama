@@ -1,6 +1,6 @@
 /** \name   test_density_grid.cpp
     \author Eugene Vasiliev
-    \date   2017
+    \date   2017-2026
 
     Test the spatial density discretization scheme for Schwarzschild modelling
 */
@@ -81,26 +81,97 @@ bool test(const galaxymodel::BaseTargetDensity& grid)
 int main()
 {
     potential::Ferrers dens(mass, radius, axisYtoX, axisZtoX);
+    // triaxial schemes with the same axis ratio as the density model
     std::vector<double> rad(radii, radii + NR);
-    galaxymodel::TargetDensityClassic<0> grid0(4, rad, axisYtoX, axisZtoX);
-    galaxymodel::TargetDensityClassic<1> grid1(4, rad, axisYtoX, axisZtoX);
+    galaxymodel::TargetDensityClassic<0> cl0t(4, rad, axisYtoX, axisZtoX);
+    galaxymodel::TargetDensityClassic<1> cl1t(4, rad, axisYtoX, axisZtoX);
+    galaxymodel::TargetDensitySphHarm    sh1t(0, 0, rad, axisYtoX, axisZtoX);
+    galaxymodel::TargetDensitySphHarm    sh1T(4, 4, rad, axisYtoX, axisZtoX);
+    // spherical schemes with a somewhat larger radius equal to the major axis of the density model
+    math::blas_dmul(radius/rmult, rad);
+    galaxymodel::TargetDensityClassic<0> cl0s(4, rad);
+    galaxymodel::TargetDensityClassic<1> cl1s(4, rad);
+    galaxymodel::TargetDensitySphHarm    sh1s(0, 0, rad);
+    galaxymodel::TargetDensitySphHarm    sh1S(4, 4, rad);
+    galaxymodel::TargetDensityCylindrical<0> cy0s(0, rad, rad);
+    galaxymodel::TargetDensityCylindrical<0> cy0S(4, rad, rad);
+    galaxymodel::TargetDensityCylindrical<1> cy1s(0, rad, rad);
     bool ok = true;
-    ok &= check(grid1, 0.51, 0.01, 0.50, 15, 16, 44, 49);
-    ok &= check(grid1, 0.01, 0.51, 0.50, 23, 24, 28, 29);
-    ok &= check(grid1, 0.01, 0.50, 0.51, 55, 56, 24, 29);
-    ok &= check(grid1, 0.50, 0.51, 0.01, 35, 36,  4,  9);
-    ok &= check(grid1, 0.50, 0.50, 0.51, 58, 59, 39, 60);
-    ok &= check(grid1, 0.51, 0.50, 0.50, 18, 19, 59, 60);
-    ok &= check(grid1, 0.50, 0.51, 0.50, 38, 39, 19, 60);
-    ok &= check(grid1, 0.10, 0.10, 0.11, 58, 59, 39, 60);
-    ok &= test (grid0);
-    ok &= test (grid1);
-    std::vector<double> masses = grid0.computeDensityProjection(dens);
+    ok &= check(cl1t, 0.51, 0.01, 0.50, 15, 16, 44, 49);
+    ok &= check(cl1t, 0.01, 0.51, 0.50, 23, 24, 28, 29);
+    ok &= check(cl1t, 0.01, 0.50, 0.51, 55, 56, 24, 29);
+    ok &= check(cl1t, 0.50, 0.51, 0.01, 35, 36,  4,  9);
+    ok &= check(cl1t, 0.50, 0.50, 0.51, 58, 59, 39, 60);
+    ok &= check(cl1t, 0.51, 0.50, 0.50, 18, 19, 59, 60);
+    ok &= check(cl1t, 0.50, 0.51, 0.50, 38, 39, 19, 60);
+    ok &= check(cl1t, 0.10, 0.10, 0.11, 58, 59, 39, 60);
+    ok &= test (cl1t);
+    ok &= test (cl0t);
+
+    // when the grid in Classic and SphHarm schemes is aligned with the shape of the ellipsoidal model,
+    // integration in radius becomes exact (by virtue of the input density being polynomial function),
+    // and there is no variation of density in angles when expressed as a function of ellipsoidal radius,
+    // so the result should be very precise
+    std::vector<double>
+    masses = cl0t.computeDensityProjection(dens);
     double sum = std::accumulate(masses.begin(), masses.end(), 0.);
-    ok &= fabs(sum - mass) < 1e-10;
-    masses = grid1.computeDensityProjection(dens);
+    ok &= fabs(sum / mass - 1) < 1e-11;
+    masses = cl1t.computeDensityProjection(dens);
     sum = std::accumulate(masses.begin(), masses.end(), 0.);
-    ok &= fabs(sum - mass) < 1e-10;
+    ok &= fabs(sum / mass - 1) < 1e-11;
+    masses = sh1t.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.end(), 0.);
+    ok &= fabs(sum / mass - 1) < 1e-15;  // expect errors at the level of machine precision
+    masses = sh1T.computeDensityProjection(dens);
+    // for a non-spherical SphHarm, the mass is obtained by summing up only the values of the l=0 term
+    sum = std::accumulate(masses.begin(), masses.begin() + NR + 1, 0.);
+    ok &= fabs(sum / mass - 1) < 1e-15;
+    // and remaining (l>0) terms should all be zero
+    sum = std::accumulate(masses.begin() + NR + 1, masses.end(), 0.);
+    ok &= sum == 0;
+
+    // when the grid is not of the same shape as the density model, the errors are larger,
+    // because the integrand is only piecewise-polynomial and not aligned with the grid boundaries
+    masses = cl0s.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.end(), 0.);
+    ok &= fabs(sum / mass - 1) < 1e-6;
+    masses = cl1s.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.end(), 0.);
+    ok &= fabs(sum / mass - 1) < 1e-6;
+
+    masses = sh1s.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.end(), 0.);
+    ok &= fabs(sum / mass - 1) < 2e-6;
+    masses = sh1S.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.begin() + NR + 1, 0.);
+    ok &= fabs(sum / mass - 1) < 2e-6;
+    // remaining higher-order (l>0) terms should be non-negligible
+    ok &= fabs(std::accumulate(masses.begin() + NR + 1, masses.end(), 0.)) > 1e-4;
+
+    masses = cy0s.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.end(), 0.);
+    ok &= fabs(sum / mass - 1) < 2e-7;
+    masses = cy1s.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.end(), 0.);
+    ok &= fabs(sum / mass - 1) < 2e-7;
+    // same considerations for non-axisymmetric Cylindrical
+    masses = cy0S.computeDensityProjection(dens);
+    sum = std::accumulate(masses.begin(), masses.begin() + pow_2(NR), 0.);
+    ok &= fabs(sum / mass - 1) < 2e-7;
+    ok &= fabs(std::accumulate(masses.begin() + pow_2(NR), masses.end(), 0.)) > 1e-4;
+
+    std::vector<galaxymodel::StorageNumT> output(sh1t.numCoefs());
+    {
+        orbit::OrbitIntegrator<coord::Car> orbint(dens);
+        orbint.init(coord::PosVelCar(0.7, 0, 0, 0, 0.2, 0.3));
+        orbint.addRuntimeFnc(orbit::PtrRuntimeFnc(
+            new galaxymodel::RuntimeFncTarget(orbint, sh1t, &output.front())));
+        orbint.run(3);
+    }
+    sum = std::accumulate(output.begin(), output.end(), 0.);
+    // error should be at the level of floating-point precision of StorageNumT
+    ok &= fabs(sum - 1) < (sizeof(galaxymodel::StorageNumT) == sizeof(double) ? 1e-15 : 1e-7);
+
     if(ok)
         std::cout << "\033[1;32mALL TESTS PASSED\033[0m\n";
     else

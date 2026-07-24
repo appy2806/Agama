@@ -262,14 +262,14 @@ namespace{
     and assign it to the corresponding parameter in the AllParam structure if this makes sense.
 */
 std::string popString(const utils::KeyValueMap& kvmap,
-    std::vector<std::string>& keys, const std::string& key1, const std::string& key2="",
+    std::vector<std::string>& keys, const char* key1, const char* key2=NULL,
     bool isAllowed=true, const char* errorMessage=NULL)
 {
     std::vector<std::string>::iterator found1=keys.end(), found2=keys.end();
     for(std::vector<std::string>::iterator key=keys.begin(); key!=keys.end(); key++) {
         if(utils::stringsEqual(*key, key1))
             found1 = key;
-        if(!key2.empty() && utils::stringsEqual(*key, key2))
+        if(key2 && utils::stringsEqual(*key, key2))
             found2 = key;
     }
     if(found1 == keys.end() && found2 == keys.end())

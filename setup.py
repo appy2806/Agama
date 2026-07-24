@@ -41,13 +41,23 @@ shared library and example programs. If you only need this, you may run python s
 try: import setuptools
 except: pass
 import os, sys, platform, subprocess, ssl, zipfile, distutils, distutils.core, distutils.dir_util, distutils.file_util
-try:        from urllib.request import urlretrieve  # Python 3
-except ImportError: from urllib import urlretrieve  # Python 2
 from distutils import sysconfig
 from distutils.errors import CompileError
 from distutils.command.build_ext import build_ext as CmdBuildExt
 from distutils.cmd import Command
 from distutils.ccompiler import new_compiler
+if sys.version_info.major == 2:  # Python 2
+    import urllib
+    class MyURLopener(urllib.FancyURLopener):
+        version = 'Mozilla/5.0'  # change user-agent to avoid a ban
+    urllib._urlopener = MyURLopener()
+    urlretrieve = urllib.urlretrieve
+else:  # Python 3
+    import urllib.request
+    def urlretrieve(url, filename):
+        with urllib.request.urlopen(urllib.request.Request(url,
+            headers={'User-Agent': 'Mozilla/5.0'})) as u, open(filename, 'wb') as f:
+            f.write(u.read())
 
 ROOT_DIR   = os.getcwd()  # the directory from which the script was called
 EXTRAS_DIR = 'extras'     # this directory will store any third-party libraries installed in the process
@@ -287,13 +297,13 @@ def createMakefile():
                 OMP_LIB_PATHS += ['-L/opt/local/lib/libomp -lomp']
             EXE_NAME = './agamatest.exe'
             for OMP_LIB_PATH in OMP_LIB_PATHS:
-                if runCompiler(code=OMP_CODE, flags=[OMP_LIB_PATH, '-Xpreprocessor'] + OMP_FLAGS, dest=EXE_NAME):
+                if runCompiler(code=OMP_CODE, flags=OMP_LIB_PATH.split(' ') + ['-Xpreprocessor'] + OMP_FLAGS, dest=EXE_NAME):
                     # ensuring that the code compiles and links is not enough, need to check if it can be run!
                     # (the snag is that the OpenMP library may not be in LD_LIBRARY_PATH so not found at runtime)
                     OMP_LIB_FOUND = subprocess.call(EXE_NAME) >= 0
                     if OMP_LIB_FOUND:
                         COMPILE_FLAGS_ALL += ['-Xpreprocessor', OMP_FLAG]
-                        LINK_FLAGS_ALL += [OMP_LIB_PATH]
+                        LINK_FLAGS_ALL += OMP_LIB_PATH.split(' ')
                         break
                     elif not OMP_LIB_PATH.startswith('-L') and runCompiler(code=OMP_CODE,
                             flags=['-Wl,-rpath,' + OMP_LIB_PATH[:OMP_LIB_PATH.rfind('/')],
@@ -603,7 +613,7 @@ PyInit_agamatest(void) {
             dirname  = 'gsl-master'
             filename = dirname + '.zip'
             try:
-                urlretrieve('http://agama.software/files/%s' % filename, filename)
+                urlretrieve('http://eugvas.net/software/agama/%s' % filename, filename)
                 if os.path.isfile(filename):
                     say('Unpacking GSL\n')
                     zipf = zipfile.ZipFile(filename, 'r')  # unpack the archive
@@ -650,7 +660,7 @@ PyInit_agamatest(void) {
             filename = 'Eigen.zip'
             dirname  = 'eigen-3.4.1'
             try:
-                urlretrieve('https://gitlab.com/libeigen/eigen/-/archive/3.3.9/eigen-3.3.9.zip', filename)
+                #urlretrieve('https://gitlab.com/libeigen/eigen/-/archive/3.3.9/eigen-3.3.9.zip', filename)
                 urlretrieve('https://gitlab.com/libeigen/eigen/-/archive/3.4.1/eigen-3.4.1.zip', filename)
                 if os.path.isfile(filename):
                     say('Unpacking Eigen\n')

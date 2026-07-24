@@ -67,24 +67,26 @@ void DensityFromDF::evalmanyDensitySph(const size_t npoints, const coord::PosSph
 const SelectionFunctionTrivial selectionFunctionTrivial;
 
 SelectionFunctionDistance::SelectionFunctionDistance(
-    const coord::PosCar& _point0, double _radius, double _steepness) :
-    point0(_point0), radius(_radius), steepness(_steepness)
+    const coord::PosCar& _point0, double _r_cut, double _xi, double _r_0, double _gamma) :
+    point0(_point0), r_cut_sq(pow_2(_r_cut)), xi(_xi), r_0_sq(pow_2(_r_0)), gamma(_gamma)
 {
-    if(!(radius>0))
-        throw std::invalid_argument("SelectionFunctionDistance: radius must be positive");
-    if(!(steepness>=0))
-        throw std::invalid_argument("SelectionFunctionDistance: steepness must be positive or zero");
+    if(!(_r_cut>0 && _r_0>0))
+        throw std::invalid_argument(
+            "SelectionFunctionDistance: r_0 and r_cut must be positive (possibly infinite)");
+    if(!(xi>=0))
+        throw std::invalid_argument("SelectionFunctionDistance: xi must be positive or zero");
+    // note that there is no restriction on gamma
 }
 
 double SelectionFunctionDistance::value(const coord::PosVelCar& point) const
 {
-    if(radius==INFINITY || steepness==0)
-        return 1;
-    double d2 = (pow_2(point.x-point0.x) + pow_2(point.y-point0.y) + pow_2(point.z-point0.z)) /
-        pow_2(radius);
-    if(steepness==INFINITY)
-        return d2>1 ? 0 : 1;
-    return exp( -math::pow(d2, 0.5*steepness) );
+    double d_sq = (pow_2(point.x-point0.x) + pow_2(point.y-point0.y) + pow_2(point.z-point0.z));
+    double expFactor = (r_cut_sq == INFINITY || xi == 0) ? 1 :
+        (xi == INFINITY ? (d_sq <= r_cut_sq) : exp(-math::pow(d_sq / r_cut_sq, 0.5 * xi)));
+    double powerlawFactor = (r_0_sq == INFINITY && gamma > 0) ? 1 :
+        (gamma == INFINITY ? (d_sq <= r_0_sq) : (gamma == -INFINITY ? (d_sq >= r_0_sq) :
+        (1 / (1 + math::pow(d_sq / r_0_sq, 0.5 * gamma)))));
+    return expFactor * powerlawFactor;
 }
 
 namespace{   // internal definitions
@@ -591,7 +593,7 @@ public:
     /// dimension of the output array
     virtual unsigned int numValues() const { return dflen * (1 + 4*needVel + 6*needVel2); }
 
-    inline void outerProduct(const coord::VelCar& vel, /*add to*/ coord::Vel2Car& vel2) const
+    static void outerProduct(const coord::VelCar& vel, /*add to*/ coord::Vel2Car& vel2)
     {
         vel2.vx2  += vel.vx * vel.vx;
         vel2.vy2  += vel.vy * vel.vy;

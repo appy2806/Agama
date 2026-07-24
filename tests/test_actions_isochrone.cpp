@@ -147,27 +147,32 @@ bool test_isochrone(const coord::PosVelCyl& initial_conditions, const char* titl
     (reversible_iso?"":" \033[1;31mNOT INVERTIBLE\033[0m ")<<std::endl;
 
 #ifdef PERFTEST
-    size_t ncycles=100, npoints=traj.size();
-    clock_t clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actions::actionsIsochrone(M, b,  traj[i/ncycles]);
-    double t_iso_act = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    size_t ncycles=1000, npoints=traj.size();
+    std::vector<coord::PosVelCyl> trajc(npoints);
+    for(size_t i=0; i<npoints; i++)
+        trajc[i] = toPosVelCyl(traj[i].first);
+    utils::Timer timer;
+    double t_iso_begin = 0;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actions::evalIsochrone(M, b, trajc[i], &acI);
+    double t_iso_act = timer.deltaSeconds();
 
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actions::actionAnglesIsochrone(M, b,  traj[i/ncycles]);
-    double t_iso_ang = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actions::evalIsochrone(M, b, trajc[i], &acI, &anI);
+    double t_iso_ang = timer.deltaSeconds();
 
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++) {
-        actions::ActionAngles aa(statI.avg, actions::Angles(i*0.12345,i*0.23456,i*0.34567));
-        actions::mapIsochrone(M, b, aa);
-    }
-    double t_iso_map = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++) {
+            actions::ActionAngles aa(statI.avg, actions::Angles(i*j*0.12345,i*j*0.23456,i*j*0.34567));
+            actions::mapIsochrone(M, b, aa);
+        }
+    double t_iso_map = timer.deltaSeconds();
 
-    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/t_iso_act, 5)<<
-    ",  act+ang="<<utils::pp(npoints*ncycles/t_iso_ang, 5)<<
-    ",  map="<<utils::pp(npoints*ncycles/t_iso_map, 5)<<std::endl;
+    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/(t_iso_act-t_iso_begin), 5)<<
+    ",  act+ang="<<utils::pp(npoints*ncycles/(t_iso_ang-t_iso_act), 5)<<
+    ",  map="<<utils::pp(npoints*ncycles/(t_iso_map-t_iso_ang), 5)<<std::endl;
 #endif
 
     std::cout << "Spherical"
@@ -179,26 +184,28 @@ bool test_isochrone(const coord::PosVelCyl& initial_conditions, const char* titl
     (reversible_sph?"":" \033[1;31mNOT INVERTIBLE\033[0m ")<<std::endl;
 
 #ifdef PERFTEST
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actions::actionsSpherical(pot, traj[i/ncycles]);
-    double t_sph_act = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    ncycles /= 10;  // other methods are much slower than isochrone
+    double t_sph_begin = timer.deltaSeconds();
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actions::evalSpherical(pot, trajc[i], &acS);
+    double t_sph_act = timer.deltaSeconds();
 
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actions::actionAnglesSpherical(pot, traj[i/ncycles]);
-    double t_sph_ang = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actions::evalSpherical(pot, trajc[i], &acS, &anS);
+    double t_sph_ang = timer.deltaSeconds();
 
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++) {
-        actions::ActionAngles aa(statS.avg, actions::Angles(i*0.12345,i*0.23456,i*0.34567));
-        actions::mapSpherical(pot, aa);
-    }
-    double t_sph_map = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++) {
+            actions::ActionAngles aa(statS.avg, actions::Angles(i*j*0.12345,i*j*0.23456,i*j*0.34567));
+            actions::mapSpherical(pot, aa);
+        }
+    double t_sph_map = timer.deltaSeconds();
 
-    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/t_sph_act, 5)<<
-    ",  act+ang="<<utils::pp(npoints*ncycles/t_sph_ang, 5)<<
-    ",  map="<<utils::pp(npoints*ncycles/t_sph_map, 5)<<std::endl;
+    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/(t_sph_act-t_sph_begin), 5)<<
+    ",  act+ang="<<utils::pp(npoints*ncycles/(t_sph_ang-t_sph_act), 5)<<
+    ",  map="<<utils::pp(npoints*ncycles/(t_sph_map-t_sph_ang), 5)<<std::endl;
 #endif
 
     std::cout << "Interpol."
@@ -210,26 +217,27 @@ bool test_isochrone(const coord::PosVelCyl& initial_conditions, const char* titl
     (reversible_grid?"":" \033[1;31mNOT INVERTIBLE\033[0m ")<<std::endl;
 
 #ifdef PERFTEST
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actGrid.actions(traj[i/ncycles]);
-    double t_grid_act = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    double t_grid_begin = timer.deltaSeconds();
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actGrid.eval(trajc[i], &acG);
+    double t_grid_act = timer.deltaSeconds();
 
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actGrid.actionAngles(traj[i/ncycles]);
-    double t_grid_ang = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actGrid.eval(trajc[i], &acG, &anG);
+    double t_grid_ang = timer.deltaSeconds();
 
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++) {
-        actions::ActionAngles aa(statS.avg, actions::Angles(i*0.12345,i*0.23456,i*0.34567));
-        actGrid.map(aa);
-    }
-    double t_grid_map = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++) {
+            actions::ActionAngles aa(statG.avg, actions::Angles(i*j*0.12345,i*j*0.23456,i*j*0.34567));
+            actGrid.map(aa);
+        }
+    double t_grid_map = timer.deltaSeconds();
 
-    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/t_grid_act, 5)<<
-    ",  act+ang="<<utils::pp(npoints*ncycles/t_grid_ang, 5)<<
-    ",  map="<<utils::pp(npoints*ncycles/t_grid_map, 5)<<std::endl;
+    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/(t_grid_act-t_grid_begin), 5)<<
+    ",  act+ang="<<utils::pp(npoints*ncycles/(t_grid_ang-t_grid_act), 5)<<
+    ",  map="<<utils::pp(npoints*ncycles/(t_grid_map-t_grid_ang), 5)<<std::endl;
 #endif
 
     std::cout << "Axi.Fudge"
@@ -239,18 +247,19 @@ bool test_isochrone(const coord::PosVelCyl& initial_conditions, const char* titl
     (dispF_ok?"":" \033[1;31m**\033[0m")<<std::endl;
 
 #ifdef PERFTEST
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actions::actionsAxisymFudge(pot, traj[i/ncycles], ifd);
-    double t_fudge_act = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    double t_fudge_begin = timer.deltaSeconds();
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actions::evalAxisymFudge(pot, trajc[i], &acF, NULL, NULL, ifd);
+    double t_fudge_act = timer.deltaSeconds();
 
-    clock = std::clock();
-    for(size_t i=0; i<npoints*ncycles; i++)
-        actions::actionAnglesAxisymFudge(pot, traj[i/ncycles], ifd);
-    double t_fudge_ang = (std::clock()-clock)*1.0/CLOCKS_PER_SEC;
+    for(size_t j=0; j<ncycles; j++)
+        for(size_t i=0; i<npoints; i++)
+            actions::evalAxisymFudge(pot, trajc[i], &acF, &anF, NULL, ifd);
+    double t_fudge_ang = timer.deltaSeconds();
 
-    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/t_fudge_act, 5)<<
-    ",  act+ang="<<utils::pp(npoints*ncycles/t_fudge_ang, 5)<<std::endl;
+    std::cout << "eval/s:  actions="<<utils::pp(npoints*ncycles/(t_fudge_act-t_fudge_begin), 5)<<
+    ",  act+ang="<<utils::pp(npoints*ncycles/(t_fudge_ang-t_fudge_act), 5)<<std::endl;
 #endif
 
     std::cout <<

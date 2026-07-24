@@ -11,6 +11,9 @@ namespace math {
 /** Error function */
 double erf(const double x);
 
+/** Complementary error function 1-erf(x), computed with greater precision for x>>1 */
+double erfc(const double x);
+
 /** Inverse error function (defined for -1<x<1) */
 double erfinv(const double x);
 

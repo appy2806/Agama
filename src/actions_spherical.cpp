@@ -27,6 +27,13 @@ static const unsigned int GRID_SIZE_L = 25;
 /// minimum order of Gauss-Legendre quadrature for actions, frequencies and angles
 static const unsigned int INTEGR_ORDER = 8;
 
+/// a very crude spline approximation to log2(x), exact at integer powers of 2, otherwise accurate to 1%
+double log2approx(double x) {
+    int l2;  // base-2 logarithm of x, rounded down towards -inf
+    double fr = frexp(x, &l2);  // 0.5 <= fr < 1
+    return l2 - 4./3 * (fr-1) * (fr-2);
+}
+
 /** order of Gauss-Legendre quadrature for actions, frequencies and angles:
     use a higher order for more eccentric orbits, as indicated by the ratio
     of pericenter to apocenter radii (R1/R2).
@@ -34,9 +41,8 @@ static const unsigned int INTEGR_ORDER = 8;
 inline unsigned int integrOrder(double R1overR2) {
     if(R1overR2==0)
         return math::MAX_GL_ORDER;
-    return std::min<int>(math::MAX_GL_ORDER, INTEGR_ORDER - 4/M_LN2 * log(R1overR2));
+    return std::min<int>(math::MAX_GL_ORDER, INTEGR_ORDER - 4 * log2approx(R1overR2));
 }
-
 
 /// return scaledE and optionally dE/d(scaledE) as functions of E and invPhi0 = 1/Phi(0)
 inline double scaleE(const double E, const double invPhi0, /*output*/ double* dEdscaledE=NULL)
@@ -596,7 +602,7 @@ void evalSpherical(const potential::BasePotential& pot, const coord::PosVelCyl& 
         act->Jz = L==0 ? 0 : Lx2plusLy2 / (L + fabs(Lz));  // a roundoff-safe way of computing L - |Lz|
         act->Jphi = Lz;
     }
-    if(E>=0) {
+    if(!(E<0)) {
         if(ang)
             ang->thetar = ang->thetaz = ang->thetaphi = NAN;
         if(freqout)
@@ -678,7 +684,7 @@ void ActionFinderSpherical::eval(const coord::PosVelCyl& point,
 
 double ActionFinderSpherical::E(const Actions& acts) const
 {
-    if(acts.Jr<0 || acts.Jz<0)
+    if(!(acts.Jr>=0 && acts.Jz>=0))
         return NAN;
     double L = acts.Jz + fabs(acts.Jphi);  // total angular momentum
 #ifdef INTERPOLATE_ENERGY
@@ -717,7 +723,7 @@ double ActionFinderSpherical::E(const Actions& acts) const
 
 coord::PosVelCyl ActionFinderSpherical::map(const ActionAngles& aa, Frequencies* freq) const
 {
-    if(aa.Jr<0 || aa.Jz<0) {
+    if(!(aa.Jr>=0 && aa.Jz>=0)) {
         if(freq)
             freq->Omegar = freq->Omegaz = freq->Omegaphi = NAN;
         return coord::PosVelCyl(NAN, NAN, NAN, NAN, NAN, NAN);

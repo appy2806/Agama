@@ -47,13 +47,13 @@ def printoutInfo(model, iteration):
     # report only the potential of stars+halo, excluding the potential of the central BH (0th component)
     pot0 = model.potential.potential(0,0,0) - model.potential[0].potential(0,0,0)
     print("Potential at origin=-(%g)^2, total mass=%g" % ((-pot0)**0.5, model.potential.totalMass()))
-    densDisk. export("dens_disk_" +iteration)
-    densBulge.export("dens_bulge_"+iteration)
-    densHalo. export("dens_halo_" +iteration)
-    model.potential.export("potential_"+iteration)
+    densDisk. export("density_disk_%s.ini"  % iteration)
+    densBulge.export("density_bulge_%s.ini" % iteration)
+    densHalo. export("density_halo_%s.ini"  % iteration)
+    model.potential.export("potential_%s.ini" % iteration)
     # separate the contributions of bulge and halo, which are normally combined
     # into the Multipole potential of all spheroidal components
-    writeRotationCurve("rotcurve_"+iteration, (
+    writeRotationCurve("rotcurve_%s.txt" % iteration, (
         model.potential[0], # potential of the BH
         model.potential[2], # potential of the disk
         agama.Potential(type='Multipole', lmax=6, density=densBulge),  # -"- bulge
@@ -123,23 +123,23 @@ if __name__ == "__main__":
     # first create a representation of density profiles without velocities
     # (just for demonstration), by drawing samples from the density distribution
     print("Sampling disk density")
-    agama.writeSnapshot("dens_disk_final",  model.components[0].density.sample(160000), format)
+    agama.writeSnapshot("density_disk_final.snap",  model.components[0].density.sample(160000), format)
     print("Sampling bulge density")
-    agama.writeSnapshot("dens_bulge_final", model.components[1].density.sample(40000), format)
+    agama.writeSnapshot("density_bulge_final.snap", model.components[1].density.sample(40000), format)
     print("Sampling halo density")
-    agama.writeSnapshot("dens_halo_final",  model.components[2].density.sample(800000), format)
+    agama.writeSnapshot("density_halo_final.snap",  model.components[2].density.sample(800000), format)
 
     # now create genuinely self-consistent models of both components,
     # by drawing positions and velocities from the DF in the given (self-consistent) potential
     print("Sampling disk DF")
-    agama.writeSnapshot("model_disk_final",
+    agama.writeSnapshot("model_disk_final.snap",
         agama.GalaxyModel(potential=model.potential, df=dfDisk,  af=model.af).sample(1600000), format)
     print("Sampling bulge DF")
-    agama.writeSnapshot("model_bulge_final",
+    agama.writeSnapshot("model_bulge_final.snap",
         agama.GalaxyModel(potential=model.potential, df=dfBulge, af=model.af).sample(400000), format)
     print("Sampling halo DF")
     # note: use a 10x larger particle mass for halo than for bulge/disk
-    agama.writeSnapshot("model_halo_final",
+    agama.writeSnapshot("model_halo_final.snap",
         agama.GalaxyModel(potential=model.potential, df=dfHalo,  af=model.af).sample(3000000), format)
 
     # the remaining part computes and plots various diagnostics
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     acc,der = model.potential.eval(xyz, acc=True, der=True)
     kappa = numpy.sqrt(-der[:,0] - 3*acc[:,0]/R)
     ToomreQ = sigma[:,0]**0.5 * kappa / 3.36 / Sigma / agama.G
-    numpy.savetxt("disk_plane",
+    numpy.savetxt("disk_plane.txt",
         numpy.column_stack((R, Sigma, rho, sigma[:,0]**0.5, (sigma[:,1]-vel[:,1]**2)**0.5,
         sigma[:,2]**0.5, vel[:,1], ToomreQ)),
         header="R Sigma rho(R,z=0) sigma_R sigma_phi sigma_z v_phi ToomreQ", fmt="%.6g")
@@ -179,7 +179,7 @@ if __name__ == "__main__":
     R = numpy.array([0.05, 0.5, 1.0, 3.0]) * Rdisk
     xyz = numpy.column_stack((numpy.tile(R, len(z)), numpy.zeros(len(R)*len(z)), numpy.repeat(z, len(R))))
     rho = modelDisk.moments(xyz, vel2=False).reshape(len(z), len(R))
-    numpy.savetxt("vertical_density", numpy.column_stack((z, rho)), fmt="%.6g",
+    numpy.savetxt("vertical_density.txt", numpy.column_stack((z, rho)), fmt="%.6g",
         header="z\\R:\t" + "\t".join(["%.4g" % r for r in R]))
     colors=['r','g','b','m']
     for i,r in enumerate(R):
@@ -203,7 +203,7 @@ if __name__ == "__main__":
     # output f(v) at a different grid of velocity values
     gridv = numpy.linspace(-v_max, v_max, 251)
     for i,p in enumerate(xyz):
-        numpy.savetxt("veldist_R="+str(p[0])+"_z="+str(p[2]),
+        numpy.savetxt("veldist_R=%s_z=%s.txt" % (p[0], p[2]),
             numpy.column_stack((gridv, splvR[i](gridv), splvphi[i](gridv), splvz[i](gridv))),
             fmt="%.6g", delimiter="\t", header="V\tf(V_R)\tf(V_phi)\tf(V_z) [1/(km/s)]")
         if i<len(ax)-2:

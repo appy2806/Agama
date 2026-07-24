@@ -88,7 +88,8 @@ def runRestrictedNbody():
         t_pot = agama.Potential(g_pot,
                 agama.Potential(potential=cpot, center=numpy.column_stack((time_center, orbit_center))))
         # compute the trajectories of all particles moving in the combined potential of the host galaxy and the moving satellite
-        snap = numpy.vstack(agama.orbit(ic=snap, potential=t_pot, time=interval, timestart=time, trajsize=1, accuracy=1e-5, verbose=False)[:,1])
+        snap = agama.orbit(ic=snap, potential=t_pot, time=interval, timestart=time, trajsize=1, accuracy=1e-5,
+            verbose=False, separateTime=True)[1].reshape(-1,6)
         # update the potential of the satellite (using a spherical monopole approximation)
         cpot = agama.Potential(type='multipole', particles=(snap[:,0:3] - orbit_center[(i+1)*num_subint, 0:3], m), symmetry='s')
     filename = 'example_nbody_simulation_last.nemo'
@@ -129,9 +130,17 @@ def runGyrfalcon():
 def runArepoOrGadget(code):
     import os, platform, subprocess, zipfile, shutil, multiprocessing
     if sys.version_info.major == 2:
-        from urllib import urlretrieve
+        import urllib
+        class MyURLopener(urllib.FancyURLopener):
+            version = 'Mozilla/5.0'  # change user-agent to avoid a ban
+        urllib._urlopener = MyURLopener()
+        urlretrieve = urllib.urlretrieve
     else:
-        from urllib.request import urlretrieve
+        import urllib.request
+        def urlretrieve(url, filename):
+            with urllib.request.urlopen(urllib.request.Request(url,
+                headers={'User-Agent': 'Mozilla/5.0'})) as u, open(filename, 'wb') as f:
+                f.write(u.read())
     path = code
     if os.path.isdir(path):
         print('*** Using the existing installation of %s' % code)
@@ -145,6 +154,9 @@ def runArepoOrGadget(code):
         elif code == 'gadget4':
             url = 'https://gitlab.mpcdf.mpg.de/vrs/gadget4/-/archive/1e171a4a679d30ac1e6accabe8a76a037ccbacac/gadget4-1e171a4a679d30ac1e6accabe8a76a037ccbacac.zip'
         urlretrieve(url, filename)
+        if os.path.getsize(filename) < 1e6:  # too small; download failed - use a backup url
+            url = 'https://eugvas.net/software/agama' + url[url.rfind('/'):]
+            urlretrieve(url, filename)
         if not os.path.isfile(filename):
             raise RuntimeError('Cannot find downloaded file %s' % filename)
         with zipfile.ZipFile(filename, 'r') as f:  # unpack the archive, manually setting the file attributes

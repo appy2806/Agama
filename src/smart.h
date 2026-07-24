@@ -149,3 +149,11 @@ typedef shared_ptr<const BaseDistributionFunction> PtrDistributionFunction;
 typedef shared_ptr<const BaseActionSpaceScaling> PtrActionSpaceScaling;
 
 }  // namespace df
+
+namespace galaxymodel{
+
+class BaseSelectionFunction;
+/// shared pointer to a selection function object
+typedef shared_ptr<const BaseSelectionFunction> PtrSelectionFunction;
+
+}  // namespace galaxymodel

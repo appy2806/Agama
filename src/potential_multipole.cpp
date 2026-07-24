@@ -59,7 +59,7 @@ static const unsigned int GLORDER_RAD = 10;
 static const double GRID_SAFETY_FACTOR = ROOT3_DBL_EPSILON;
 
 /// eliminate multipole terms whose relative amplitude is less than this number
-static const double EPS_COEF = 1e-10;
+static const double EPS_COEF = 1e-12;
 
 /// min/max limits for coordinates; when squared, these underflow/overflow
 static const double SQRT_DBL_MIN = 1.4916681462400413e-154;
@@ -542,7 +542,7 @@ public:
     assuming that 
         Phi(r) = W * (r/r1)^v + U * (r/r1)^s + Q * (r/r1)^2  if s!=v, or
         Phi(r) = W * (r/r1)^v + U * (r/r1)^s * ln(r/r1)      if s==v,
-    and given v and the values of Phi(r1), Phi(r2) and dPhi/dr(r1),
+    and given v and the values of Phi(r1), Phi(r2), dPhi/dr(r1), and optionally dPhi/dr(r2),
     determine the coefficients s, U, W and Q (the latter only for v=0 and s>2).
     Here v = l for the inward and v = -l-1 for the outward extrapolation.
     This corresponds to the density profile extrapolated as rho ~ r^(s-2) + const,
