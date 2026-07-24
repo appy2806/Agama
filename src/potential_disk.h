@@ -148,32 +148,6 @@ math::PtrFunction createVerticalDiskFnc(const DiskParam& params);
 // leaves that replicate DiskAnsatz::evalCyl / DiskAnsatz::densityCyl exactly.
 // =====================================================================
 
-/** Mirrors math::pow(double,double)'s fast-path special cases (see math_core.cpp)
-    so that the device leaf and the CPU virtual method -- which used to call
-    math::pow directly -- produce bit-for-bit identical results. Same mirror as
-    dehnen_powT in potential_dehnen.h (math::pow itself is a plain host function,
-    not device-callable, hence the local reproduction here too). */
-template<typename T>
-AGAMA_DEVICE_INLINE T disk_powT(T x, T n)
-{
-    if(n == T(0))    return T(1);
-    if(n == T(1))    return x;
-    if(n == T(-1))   return T(1) / x;
-    if(n == T(2))    return x*x;
-    if(n == T(-2))   return T(1) / (x*x);
-    if(n == T(0.5))  return std::sqrt(x);
-    if(n == T(-0.5)) return T(1) / std::sqrt(x);
-    if(n == T(3))    return x*x*x;
-    if(n == T(-3))   return T(1) / (x*x*x);
-    return std::pow(x, n);
-}
-
-/** Mirrors math::sign(T) (math_core.h), which is a plain (non-device-tagged)
-    template; DiskDensityVertical{Exp,Isothermal} need it inside a device leaf,
-    so it is reproduced locally rather than calling math::sign directly. */
-template<typename T>
-AGAMA_DEVICE_INLINE T disk_signT(T x) { return x > T(0) ? T(1) : x < T(0) ? T(-1) : T(0); }
-
 /// which closed-form radial functor a DiskAnsatz/DiskDensity instance uses
 enum DiskRadialType   { DISK_RADIAL_EXP, DISK_RADIAL_RICHEXP };
 /// which closed-form vertical functor a DiskAnsatz/DiskDensity instance uses
@@ -223,7 +197,7 @@ AGAMA_DEVICE_INLINE void disk_radial_exp_eval(T surfaceDensity, T invScaleRadius
 
 /** more complex radial density profile - exponential/Sersic with possible inner
     hole and modulation: same expression as DiskDensityRadialRichExp::evalDeriv,
-    including the disk_powT mirror of math::pow used for the Sersic term. */
+    including math::powT (the device-callable math::pow) for the Sersic term. */
 template<typename T>
 AGAMA_DEVICE_INLINE void disk_radial_richexp_eval(T surfaceDensity, T invScaleRadius,
     T innerCutoffRadius, T modulationAmplitude, T invSersicIndex, T R,
@@ -238,7 +212,7 @@ AGAMA_DEVICE_INLINE void disk_radial_richexp_eval(T surfaceDensity, T invScaleRa
     const T
         Rinv = T(1) / R,
         Rrel = R * invScaleRadius,
-        Rrn  = disk_powT(Rrel, invSersicIndex),
+        Rrn  = math::powT(Rrel, invSersicIndex),
         RrnR = R>T(0) ? Rrn * Rinv : invSersicIndex==T(1) ? T(1) : invSersicIndex>T(1) ? T(0) : T(INFINITY),
         Rcut = innerCutoffRadius ? innerCutoffRadius * Rinv : T(0),
         cr   = modulationAmplitude ? modulationAmplitude * std::cos(Rrel) : T(0),
@@ -266,7 +240,7 @@ AGAMA_DEVICE_INLINE void disk_vertical_exp_eval(T invScaleHeight, T z,
     T h = std::exp(-x);
     if(H)       *H       = T(0.5) / invScaleHeight *  // use asymptotic expansion for small x
         (x>T(1e-5) ? h-T(1)+x : x*x * (T(0.5) - T(1./6)*x));   // to avoid roundoff errors
-    if(Hprime)  *Hprime  = T(0.5) * disk_signT(z) * (T(1)-h);
+    if(Hprime)  *Hprime  = T(0.5) * math::sign(z) * (T(1)-h);
     if(Hpprime) *Hpprime = T(0.5) * h * invScaleHeight;
 }
 
@@ -281,7 +255,7 @@ AGAMA_DEVICE_INLINE void disk_vertical_isothermal_eval(T invScaleHeight, T z,
     T sh1 = T(1) + h,  invsh1 = T(1)/sh1;
     if(H)       *H       = T(1)/invScaleHeight *
         (x>T(1e-3) ? T(0.5)*x + std::log(T(0.5)*sh1) : x*x * (T(1./8) - T(1./192)*x*x));
-    if(Hprime)  *Hprime  = T(0.5) * disk_signT(z) * (T(1)-h) * invsh1;
+    if(Hprime)  *Hprime  = T(0.5) * math::sign(z) * (T(1)-h) * invsh1;
     if(Hpprime) *Hpprime = h * invScaleHeight * pow_2(invsh1);
 }
 
@@ -290,7 +264,7 @@ template<typename T>
 AGAMA_DEVICE_INLINE void disk_vertical_thin_eval(T z, T* H, T* Hprime, T* Hpprime)
 {
     if(H)       *H       = T(0.5) * std::fabs(z);
-    if(Hprime)  *Hprime  = T(0.5) * disk_signT(z);
+    if(Hprime)  *Hprime  = T(0.5) * math::sign(z);
     if(Hpprime) *Hpprime = T(0);
 }
 

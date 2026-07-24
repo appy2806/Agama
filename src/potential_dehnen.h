@@ -23,27 +23,6 @@ namespace potential {
 // closed form for arbitrary axis ratios and is fully general.
 // =====================================================================
 
-/** Mirrors math::pow(double,double)'s fast-path special cases (see math_core.cpp)
-    so that the device leaf and the CPU virtual method -- which used to call
-    math::pow directly -- produce bit-for-bit identical results. math::pow itself
-    is a plain host function defined in math_core.cpp (not AGAMA_DEVICE_INLINE,
-    so not device-callable); this local template reproduces its exact dispatch
-    order for the small set of exponents Dehnen actually uses. */
-template<typename T>
-AGAMA_DEVICE_INLINE T dehnen_powT(T x, T n)
-{
-    if(n == T(0))    return T(1);
-    if(n == T(1))    return x;
-    if(n == T(-1))   return T(1) / x;
-    if(n == T(2))    return x*x;
-    if(n == T(-2))   return T(1) / (x*x);
-    if(n == T(0.5))  return std::sqrt(x);
-    if(n == T(-0.5)) return T(1) / std::sqrt(x);
-    if(n == T(3))    return x*x*x;
-    if(n == T(-3))   return T(1) / (x*x*x);
-    return std::pow(x, n);
-}
-
 /** Dehnen (1993) SPHERICAL double power-law potential (axisRatioY=axisRatioZ=1
     only -- see file header comment). Phi(r), dPhi/dr, and the Merritt&Fridman
     (1996) "val2" combination used by the CPU Cartesian-Hessian assembly
@@ -58,14 +37,14 @@ AGAMA_DEVICE_INLINE void dehnen_eval(T mass, T scalerad, T gamma, T r,
     if(potential) {
         *potential = s > T(2e-3) / (T(4) - gamma) ?
             mass/scalerad * (gamma == T(2) ? -std::log(T(1)+s) :
-                (T(1) - dehnen_powT(T(1)+s, gamma-T(2))) / (gamma-T(2))) :
+                (T(1) - math::powT(T(1)+s, gamma-T(2))) / (gamma-T(2))) :
             // asymptotic expansion for r->infinity, or equivalently s->0
             mass/scalerad * -s * (T(1) + s*(gamma-T(3))/T(2) * (T(1) + s*(gamma-T(4))/T(3) *
                 (T(1) + s*(gamma-T(5))/T(4))));
     }
     if(!deriv && !deriv2)
         return;
-    T val = mass * dehnen_powT(r, T(1)-gamma) * dehnen_powT(r+scalerad, gamma-T(3));
+    T val = mass * math::powT(r, T(1)-gamma) * math::powT(r+scalerad, gamma-T(3));
     if(deriv)
         *deriv = val;
     if(deriv2)
@@ -82,7 +61,7 @@ AGAMA_DEVICE_INLINE T dehnen_rho(T mass, T scalerad, T gamma, T axisRatioY, T ax
 {
     T m = std::sqrt(pow_2(x) + pow_2(y/axisRatioY) + pow_2(z/axisRatioZ));
     return mass * scalerad * (T(3)-gamma) / (T(4*M_PI)*axisRatioY*axisRatioZ) *
-        dehnen_powT(m, -gamma) * dehnen_powT(scalerad+m, gamma-T(4));
+        math::powT(m, -gamma) * math::powT(scalerad+m, gamma-T(4));
 }
 
 /** Dehnen(1993) double power-law model **/

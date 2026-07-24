@@ -19,7 +19,7 @@ int fcmp(double x, double y, double eps=1e-15);
 
 /** return sign of a number */
 template<typename T>
-inline T sign(T x) { return x>0 ? 1 : x<0 ? -1 : 0; }
+AGAMA_DEVICE_INLINE T sign(T x) { return x>0 ? 1 : x<0 ? -1 : 0; }
 
 /** return absolute value of a number */
 template<typename T>
@@ -35,6 +35,25 @@ double pow(double x, int n);
 /** return a number raised to the given power,
     taking shortcuts for a few common values of n such as 0.5 or 2 */
 double pow(double x, double n);
+
+/** templated, device-callable version of pow(double,double) with the same
+    fast-path shortcuts -- the single source shared by math::pow(double,double)
+    and the potential leaf functions (Dehnen, DiskAnsatz Sersic term), which
+    need it in precision T inside AGAMA_DEVICE_INLINE kernels */
+template<typename T>
+AGAMA_DEVICE_INLINE T powT(T x, T n)
+{
+    if(n == T(0))    return T(1);
+    if(n == T(1))    return x;
+    if(n == T(-1))   return T(1) / x;
+    if(n == T(2))    return x*x;
+    if(n == T(-2))   return T(1) / (x*x);
+    if(n == T(0.5))  return std::sqrt(x);
+    if(n == T(-0.5)) return T(1) / std::sqrt(x);
+    if(n == T(3))    return x*x*x;
+    if(n == T(-3))   return T(1) / (x*x*x);
+    return std::pow(x, n);
+}
 
 
 /** wraps the input argument into the range [0,2pi),

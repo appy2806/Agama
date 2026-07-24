@@ -134,16 +134,7 @@ double pow(double x, int n)
 
 double pow(double x, double n)
 {
-    if(n == 0.0) return 1;
-    if(n == 1.0) return x;
-    if(n ==-1.0) return 1/x;
-    if(n == 2.0) return x*x;
-    if(n ==-2.0) return 1/(x*x);
-    if(n == 0.5) return sqrt(x);
-    if(n ==-0.5) return 1/sqrt(x);
-    if(n == 3.0) return x*x*x;
-    if(n ==-3.0) return 1/(x*x*x);
-    return std::pow(x, n);
+    return powT(x, n);   // single source: the templated device-callable body in math_core.h
 }
 
 double wrapAngle(double x)
