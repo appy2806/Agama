@@ -195,6 +195,113 @@ int main() {
     }
 
     // =====================================================================
+    // Tier 0 Legendre helpers: legendrePmm / sphHarmArray became
+    // AGAMA_DEVICE_INLINE, and legendrePmm's tabulated normalization
+    // constants were extended from m<=16 to m<=LEGENDRE_MMAX (=32) so that
+    // the device never needs the GSL-backed factorial fallback.
+    //
+    // (a) THE CPU-INVARIANCE GATE. Every m <= LEGENDRE_MMAX must return
+    //     BIT-FOR-BIT what it returned before this change, for two different
+    //     reasons over two ranges:
+    //       m = 0..16  -- upstream's hand-tabulated literals. These are NOT
+    //         equal to the closed form (they were printed to 16 significant
+    //         digits, so they sit within 1 ULP of it), which is exactly why
+    //         they must be checked against the literals themselves, restated
+    //         here independently of the header.
+    //       m = 17..32 -- our extension, generated FROM the closed form, so
+    //         here bit-for-bit equality with the closed form is the gate.
+    //         Before this change these m fell through to the same closed
+    //         form at runtime, so CPU output is unchanged.
+    //     A fat-fingered table digit, or a GSL factorial/dfactorial change,
+    //     fails here loudly instead of silently moving Multipole coefficients.
+    // =====================================================================
+    bool ok_legtab = true;
+    {
+        // upstream's literals, restated so the header is not its own reference
+        const int UPMMAX = 16;
+        const double UP_PREFACT[UPMMAX+1] = { 0.2820947917738782,
+            0.3454941494713355,    0.1287580673410632,    0.02781492157551894,   0.004214597070904597,
+            0.0004911451888263050, 4.647273819914057e-05, 3.700296470718545e-06, 2.542785532478802e-07,
+            1.536743406172476e-08, 8.287860012085477e-10, 4.035298721198747e-11, 1.790656309174350e-12,
+            7.299068453727266e-14, 2.751209457796109e-15, 9.643748535232993e-17, 3.159120301003413e-18 };
+        const double UP_COEF[UPMMAX+1] = { 0.2820947917738782,
+            -0.3454941494713355, 0.3862742020231896, -0.4172238236327841, 0.4425326924449826,
+            -0.4641322034408582, 0.4830841135800662, -0.5000395635705506, 0.5154289843972843,
+            -0.5295529414924496, 0.5426302919442215, -0.5548257538066191, 0.5662666637421912,
+            -0.5770536647012670, 0.5872677968601020, -0.5969753602424046, 0.6062313441538353 };
+
+        for(int m = 0; m <= math::LEGENDRE_MMAX; ++m) {
+            // an off-axis theta so that neither sin nor cos is degenerate
+            const double theta = 0.7, ct = std::cos(theta), st = std::sin(theta);
+            double prefact = 0, value = 0, der = 0, der2 = 0;
+            math::legendrePmm(m, ct, st, prefact, &value, &der, &der2);
+
+            // reference constants: upstream's literals where they exist, else the
+            // closed form that legendrePmm used to fall through to at runtime
+            const double pref_ref = m <= UPMMAX ? UP_PREFACT[m] :
+                0.5/M_SQRTPI * std::sqrt( (2*m+1) / math::factorial(2*m) );
+            const double coef_ref = m <= UPMMAX ? UP_COEF[m] :
+                pref_ref * math::dfactorial(2*m-1) * (m%2 == 1 ? -1 : 1);
+            // rebuild the output with the same operations in the same order,
+            // so equality must be exact
+            const double val_ref = m == 0 ? pref_ref : m == 1 ? -st * pref_ref :
+                coef_ref * math::powT(st, m-2) * pow_2(st);
+
+            if(prefact != pref_ref) {
+                ok_legtab = false;
+                std::printf("[T0]    legendrePmm prefact[%d] MISMATCH: got %.17g  want %.17g\n",
+                    m, prefact, pref_ref);
+            }
+            if(value != val_ref) {
+                ok_legtab = false;
+                std::printf("[T0]    legendrePmm Pmm[%d] MISMATCH: got %.17g  want %.17g\n",
+                    m, value, val_ref);
+            }
+        }
+        std::printf("[T0]    legendrePmm m=0..%d bit-for-bit vs reference constants "
+            "(0..%d upstream literals, %d..%d closed form) -> %s\n",
+            math::LEGENDRE_MMAX, UPMMAX, UPMMAX+1, math::LEGENDRE_MMAX,
+            ok_legtab ? "OK" : "FAIL");
+    }
+
+    // (b) math::pow(double,int) must be bit-for-bit its device-callable
+    //     single source math::powT<double>(double,int) -- the .cpp now just
+    //     forwards, so this guards the forwarding (and the overload pick:
+    //     an int exponent must NOT land in powT(T,T)).
+    bool ok_powint = true;
+    {
+        const double xs[] = { 1.5, 0.25, -3.0, 1e-4, 7.125, -0.5 };
+        for(std::size_t i = 0; i < sizeof(xs)/sizeof(xs[0]); ++i)
+            for(int n = -20; n <= 20; ++n)
+                if(math::pow(xs[i], n) != math::powT(xs[i], n))
+                    ok_powint = false;
+        std::printf("[T0]    math::pow(double,int) == math::powT<double>(x,int) "
+            "(6 bases x n=-20..20, bit-for-bit) -> %s\n", ok_powint ? "OK" : "FAIL");
+    }
+
+    // (c) Serial reference for sphHarmArray, compared against Cuda further down.
+    //     Sweep tau over the whole range including the |tau|->1 asymptotic
+    //     branches (theta -> 0 / pi) where the derivative formulas switch.
+    const int    LEG_LMAX = 12;
+    const int    LEG_NM   = 5;           // orders m = 0,1,2,3,LEG_LMAX
+    const int    LEG_NTAU = 48;
+    const int    LEG_MS[LEG_NM] = { 0, 1, 2, 3, LEG_LMAX };
+    const std::size_t LEG_STRIDE = LEG_LMAX + 1;  // room for l = m..lmax
+    // layout: [itau][im][3 quantities][LEG_STRIDE]
+    const std::size_t LEG_N = (std::size_t)LEG_NTAU * LEG_NM * 3 * LEG_STRIDE;
+    std::vector<double> leg_s(LEG_N, 0.0);
+    for(int it = 0; it < LEG_NTAU; ++it) {
+        // tau in (-1, 1); the endpoints are approached to 1e-12 to exercise
+        // the small-sin(theta) asymptotic branches
+        const double tau = -1.0 + 1e-12 + (2.0 - 2e-12) * (it + 0.5) / LEG_NTAU;
+        for(int im = 0; im < LEG_NM; ++im) {
+            double* base = &leg_s[(((std::size_t)it * LEG_NM + im) * 3) * LEG_STRIDE];
+            math::sphHarmArray(LEG_LMAX, LEG_MS[im], tau,
+                base, base + LEG_STRIDE, base + 2 * LEG_STRIDE);
+        }
+    }
+
+    // =====================================================================
     // Tier 3: GPU force descriptor + batch orbit integration.
     // (a) gpu_desc_phi_acc vs the virtual Composite::eval at scattered points
     //     (locks the tagged-union glue against the class path);
@@ -764,6 +871,53 @@ int main() {
     std::vector<double> trig_c(NP * 2 * MM);
     d_trig.to_host(trig_c.data(), NP * 2 * MM);
 
+    // ----- math::sphHarmArray on Cuda (Tier 0 Legendre helpers) -----
+    // One thread per (tau, m) pair; each writes W_l^m and its first two
+    // theta-derivatives for l = m..LEG_LMAX into its own slice, exactly as a
+    // Multipole eval kernel will. Compared against the Serial reference above.
+    device_array<double> d_leg(LEG_N);
+    double* dleg = d_leg.data();
+    const int    dLMAX = LEG_LMAX, dNM = LEG_NM, dNTAU = LEG_NTAU;
+    const std::size_t dSTRIDE = LEG_STRIDE;
+    device_array<int> d_ms(LEG_NM);
+    d_ms.from_host(LEG_MS, LEG_NM);
+    const int* dms = d_ms.data();
+    forall(Cuda{}, (std::size_t)LEG_NTAU * LEG_NM, [=] AGAMA_DEVICE (std::size_t k) {
+        const int it = (int)(k / dNM), im = (int)(k % dNM);
+        const double tau = -1.0 + 1e-12 + (2.0 - 2e-12) * (it + 0.5) / dNTAU;
+        double* base = dleg + (((std::size_t)it * dNM + im) * 3) * dSTRIDE;
+        math::sphHarmArray(dLMAX, dms[im], tau,
+            base, base + dSTRIDE, base + 2 * dSTRIDE);
+    });
+    std::vector<double> leg_c(LEG_N);
+    d_leg.to_host(leg_c.data(), LEG_N);
+    // Relative comparison: the second derivatives reach O(1e4) at lmax=12 while the
+    // values stay O(1), so an absolute tolerance would be meaningless. Host glibc
+    // sqrt/sin/cos vs CUDA plus nvcc's FMA contraction gives a few ULPs per recurrence
+    // step; 1e-11 relative is ~1e5 ULPs, loose enough for a 12-step recurrence yet
+    // tight enough to catch a wrong table entry or an untaken branch.
+    // Only the first (lmax - m + 1) entries of each quantity are written (l = m..lmax);
+    // the rest of the stride is padding that sphHarmArray never touches, so it is
+    // zero on the host and uninitialized device memory on the GPU -- skip it.
+    double max_leg_relerr = 0.0;
+    for(int it = 0; it < LEG_NTAU; ++it)
+        for(int im = 0; im < LEG_NM; ++im) {
+            const std::size_t base = (((std::size_t)it * LEG_NM + im) * 3) * LEG_STRIDE;
+            const int nvalid = LEG_LMAX - LEG_MS[im] + 1;
+            for(int q = 0; q < 3; ++q)
+                for(int j = 0; j < nvalid; ++j) {
+                    const std::size_t i = base + (std::size_t)q * LEG_STRIDE + j;
+                    const double a = leg_s[i], b = leg_c[i];
+                    // |a| can legitimately underflow near |tau|->1; fall back to an
+                    // absolute comparison there rather than dividing by ~0
+                    const double scale = std::fabs(a) > 1e-300 ? std::fabs(a) : 1.0;
+                    const double e = std::fabs(a - b) / scale;
+                    if(e > max_leg_relerr) max_leg_relerr = e;
+                }
+        }
+    const double LEG_TOL = 1e-11;
+    const bool ok_leg = (max_leg_relerr <= LEG_TOL);
+
     bool ok_gpu  = (out_s == out_c) && (rsum_s == rsum_c);
     // trigMultiAngle: tolerance check, not bit-exact. Host glibc sin/cos and device
     // CUDA sin/cos differ by ~1-3 ULPs, plus nvcc's default FMA contraction shifts
@@ -784,12 +938,16 @@ int main() {
         NP, MM, max_trig_err, TRIG_TOL, ok_trig ? "OK" : "FAIL");
     std::printf("[CUDA]  toPos<Car,Cyl>/<Car,Sph> Serial vs Cuda (N=%zu): max |err| = %.3e, tol = %.1e -> %s\n",
         NPT, max_coord_err, COORD_TOL, ok_coord ? "OK" : "FAIL");
+    std::printf("[CUDA]  sphHarmArray Serial vs Cuda (lmax=%d, m=0/1/2/3/%d, %d tau incl. |tau|->1, "
+        "W+dW+d2W): max rel err = %.3e, tol = %.1e -> %s\n",
+        LEG_LMAX, LEG_LMAX, LEG_NTAU, max_leg_relerr, LEG_TOL, ok_leg ? "OK" : "FAIL");
 
-    if (!(ok_cpu && ok_gpu && ok_trig && ok_coord)) {
+    if (!(ok_cpu && ok_gpu && ok_trig && ok_coord && ok_leg && ok_legtab && ok_powint)) {
         std::fprintf(stderr, "FAIL\n");
         return 1;
     }
-    std::printf("PASS (Serial/OpenMP/Cuda agree on forall, reduce, trigMultiAngle, and toPos to %.0e)\n", TRIG_TOL);
+    std::printf("PASS (Serial/OpenMP/Cuda agree on forall, reduce, trigMultiAngle, toPos, "
+        "and sphHarmArray to %.0e)\n", TRIG_TOL);
 
     // ============================================================
     // Timing: Serial vs OpenMP vs Cuda. Two sizes (1M, 16M) × two precisions (fp64, fp32).
@@ -870,11 +1028,13 @@ int main() {
 
     return 0;
 #else
-    if (!ok_cpu) {
+    if (!(ok_cpu && ok_legtab && ok_powint)) {
         std::fprintf(stderr, "FAIL (CPU only)\n");
         return 1;
     }
     std::printf("[CPU]   trigMultiAngle ran for %zu samples, mmax=%u (no GPU to compare against)\n", NP, MM);
+    std::printf("[CPU]   sphHarmArray ran for %d tau x %d orders (no GPU to compare against)\n",
+        LEG_NTAU, LEG_NM);
     std::printf("PASS (CPU only — HAVE_CUDA not defined)\n");
     return 0;
 #endif

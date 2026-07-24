@@ -118,17 +118,7 @@ int fcmp(double x, double y, double eps)
 
 double pow(double x, int n)
 {
-    if(n<0) {
-        n = -n;
-        x = 1/x;
-    }
-    double result = 1;
-    do {
-        if(n%2) result *= x;
-        n >>= 1;
-        x *= x;
-    } while(n);
-    return result;
+    return powT(x, n);   // single source: the templated device-callable body in math_core.h
 }
 
 double pow(double x, double n)

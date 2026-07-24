@@ -55,6 +55,27 @@ AGAMA_DEVICE_INLINE T powT(T x, T n)
     return std::pow(x, n);
 }
 
+/** templated, device-callable version of pow(double,int): exponentiation by
+    squaring, the single source shared by math::pow(double,int) and the
+    device-side Legendre recurrence (legendrePmm in math_sphharm.h).
+    Note this is a distinct overload from powT(T,T) above -- an integer exponent
+    selects it exactly, and the algorithm (and hence the rounding) differs. */
+template<typename T>
+AGAMA_DEVICE_INLINE T powT(T x, int n)
+{
+    if(n<0) {
+        n = -n;
+        x = T(1)/x;
+    }
+    T result = T(1);
+    do {
+        if(n%2) result *= x;
+        n >>= 1;
+        x *= x;
+    } while(n);
+    return result;
+}
+
 
 /** wraps the input argument into the range [0,2pi),
     taking the remainder of the division of x by the floating-point constant 2*M_PI
