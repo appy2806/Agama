@@ -119,11 +119,18 @@ struct GpuDescForce2 {
     thousands of steps). The trajectory sample placement mirrors
     orbit::RuntimeTrajectory::processTimestep with t0 = 0: sample j lies at
     time sign * interval * j, interval = |totalTime| / (trajsize-1); samples
-    that the integration never reaches (stepper error / step limit) stay NAN. */
-template<typename T>
+    that the integration never reaches (stepper error / step limit) stay NAN.
+
+    TOut (defaults to T) is the STORAGE precision of `traj`: every value that
+    would otherwise be written as T is narrowed to TOut at the point of store
+    (dense-output sample, NAN prefill, and the trajsize==1 final-state copy
+    alike), so an fp64 integration can write directly into an fp32 destination
+    with no separate host-side narrowing pass. See orbit_gpu.h for why this is
+    only safe when no unit scaling is pending. */
+template<typename T, typename TOut = T>
 AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
     const T ic6[6], double timeStart, double totalTime, T accuracy,
-    unsigned long long maxNumSteps, std::size_t trajsize, T* traj)
+    unsigned long long maxNumSteps, std::size_t trajsize, TOut* traj)
 {
     // `force` is taken BY VALUE (it is a pointer plus a scalar) so this thread can
     // advance its timeBegin without disturbing any other thread.
@@ -131,7 +138,7 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
     const int NDIM = 6;
     // pre-fill with NAN: anything not overwritten below signals "not reached"
     for(std::size_t j = 0; j < trajsize * 6; j++)
-        traj[j] = T(NAN);
+        traj[j] = TOut(NAN);
 
     T state[60],  // persistent DOP853 storage: x, dx/dt, 8 dense-output blocks
       xt[60];     // per-step scratch (also covers the 4*NDIM init scratch)
@@ -174,7 +181,7 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
                     sign * hd) * sign;
                 for(int k = 0; k < NDIM; k++)
                     traj[iout*6 + k] =
-                        math::dop853_dense(state, NDIM, h, T(offsetout), k);
+                        TOut(math::dop853_dense(state, NDIM, h, T(offsetout), k));
             }
         }
         tcur = tend;
@@ -186,7 +193,7 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
     if(trajsize == 1 && ok) {
         // single-sample mode: only the final state (samplingInterval=INFINITY on CPU)
         for(int k = 0; k < NDIM; k++)
-            traj[k] = state[k];
+            traj[k] = TOut(state[k]);
     }
 }
 
@@ -196,17 +203,18 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
     OdeStepperDPRKN8 wraps. `accuracy` is the ALREADY-RESCALED tolerance
     (10 * userAccuracy^0.9, matching the CPU stepper's constructor), so this body
     is method-agnostic about that rescaling. force1 is used only for the initial
-    timestep estimate (as in dprkn8_init); force2 supplies the acceleration. */
-template<typename T>
+    timestep estimate (as in dprkn8_init); force2 supplies the acceleration.
+    TOut (defaults to T) is the storage precision of `traj` -- see integrate_one_orbit above. */
+template<typename T, typename TOut = T>
 AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
     GpuDescForce2<T> force2, const T ic6[6], double timeStart, double totalTime,
-    T accuracy, unsigned long long maxNumSteps, std::size_t trajsize, T* traj)
+    T accuracy, unsigned long long maxNumSteps, std::size_t trajsize, TOut* traj)
 {
     force1.timeBegin = timeStart;
     force2.timeBegin = timeStart;
     const int NDIM = 6;         // full 2nd-order system size (numVar = 3)
     for(std::size_t j = 0; j < trajsize * 6; j++)
-        traj[j] = T(NAN);
+        traj[j] = TOut(NAN);
 
     T state[18],   // persistent DPRKN8 storage: 3*NDIM (x, v, and the a/jerk/... blocks)
       scratch[39]; // 13*numVar step scratch (also covers the 4*NDIM=24 init scratch)
@@ -244,7 +252,7 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
                     sign * hd) * sign;
                 for(int k = 0; k < NDIM; k++)
                     traj[iout*6 + k] =
-                        math::dprkn8_dense(state, NDIM, h, T(offsetout), k);
+                        TOut(math::dprkn8_dense(state, NDIM, h, T(offsetout), k));
             }
         }
         tcur = tend;
@@ -256,7 +264,7 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
     if(trajsize == 1 && ok) {
         // single-sample mode: final state is state[0..5] = {x(3), v(3)}
         for(int k = 0; k < NDIM; k++)
-            traj[k] = state[k];
+            traj[k] = TOut(state[k]);
     }
 }
 
@@ -276,11 +284,14 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
     (this one and run_batch_dprkn8 below), selected ONCE on the host in
     run_batch()'s dispatch wrapper (further down), makes each a SEPARATE kernel
     that only ever inlines the integrator it actually calls -- ptxas then only
-    has to allocate for one integrator's state, not both. */
-template<typename T, class Policy>
+    has to allocate for one integrator's state, not both.
+
+    TOut (defaults to T) is the storage precision of `traj`, threaded straight through
+    to integrate_one_orbit -- see its doc comment for the narrow-on-store rationale. */
+template<typename T, typename TOut, class Policy>
 void run_batch_dop853(Policy pol, const potential::GpuPotDesc<T>& desc,
     std::size_t Norb, const T* ic, const double* times, const double* timeStart,
-    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, T* traj)
+    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, TOut* traj)
 {
     // The functor is built INSIDE the kernel so that each thread gets its own
     // (tiny) copy pointing at the single descriptor captured by value here. Built
@@ -293,7 +304,7 @@ void run_batch_dop853(Policy pol, const potential::GpuPotDesc<T>& desc,
             ic6[k] = ic[i*6 + k];
         const double t0 = timeStart ? timeStart[i] : 0.0;
         GpuDescForce<T> force = { &desc, t0 };
-        integrate_one_orbit(force, ic6, t0, times[i], accuracy, maxNumSteps,
+        integrate_one_orbit<T, TOut>(force, ic6, t0, times[i], accuracy, maxNumSteps,
             trajsize, traj + i * trajsize * 6);
     });
 }
@@ -301,11 +312,12 @@ void run_batch_dop853(Policy pol, const potential::GpuPotDesc<T>& desc,
 /** DPRKN8 counterpart of run_batch_dop853: same launch shape, but the kernel
     body only ever inlines integrate_one_orbit_dprkn8, so it never carries
     DOP853's state[60]+xt[60] register/spill cost. See run_batch_dop853 above
-    for why this is a separate function rather than a runtime branch. */
-template<typename T, class Policy>
+    for why this is a separate function rather than a runtime branch, and for
+    the TOut storage-precision parameter. */
+template<typename T, typename TOut, class Policy>
 void run_batch_dprkn8(Policy pol, const potential::GpuPotDesc<T>& desc,
     std::size_t Norb, const T* ic, const double* times, const double* timeStart,
-    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, T* traj)
+    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, TOut* traj)
 {
     agama::forall(pol, Norb, [=] AGAMA_DEVICE (std::size_t i) {
         T ic6[6];
@@ -314,7 +326,7 @@ void run_batch_dprkn8(Policy pol, const potential::GpuPotDesc<T>& desc,
         const double t0 = timeStart ? timeStart[i] : 0.0;
         GpuDescForce<T>  force  = { &desc, t0 };  // 1st-order r.h.s. (DPRKN8 init)
         GpuDescForce2<T> force2 = { &desc, t0 };  // 2nd-order r.h.s. (DPRKN8 stages)
-        integrate_one_orbit_dprkn8(force, force2, ic6, t0, times[i], accuracy,
+        integrate_one_orbit_dprkn8<T, TOut>(force, force2, ic6, t0, times[i], accuracy,
             maxNumSteps, trajsize, traj + i * trajsize * 6);
     });
 }
@@ -323,17 +335,17 @@ void run_batch_dprkn8(Policy pol, const potential::GpuPotDesc<T>& desc,
     agama::forall / the kernel launch, so each launch instantiates only the
     kernel it needs (see run_batch_dop853 above for the register-pressure
     rationale). Signature and behaviour are unchanged from the old single
-    run_batch(): callers below are untouched. */
-template<typename T, class Policy>
+    run_batch() for TOut=T callers; TOut is threaded through unchanged. */
+template<typename T, typename TOut, class Policy>
 void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc, int method,
     std::size_t Norb, const T* ic, const double* times, const double* timeStart,
-    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, T* traj)
+    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, TOut* traj)
 {
     if(method == orbit::ORBIT_GPU_DPRKN8)
-        run_batch_dprkn8<T>(pol, desc, Norb, ic, times, timeStart,
+        run_batch_dprkn8<T, TOut>(pol, desc, Norb, ic, times, timeStart,
             trajsize, accuracy, maxNumSteps, traj);
     else
-        run_batch_dop853<T>(pol, desc, Norb, ic, times, timeStart,
+        run_batch_dop853<T, TOut>(pol, desc, Norb, ic, times, timeStart,
             trajsize, accuracy, maxNumSteps, traj);
 }
 
@@ -482,12 +494,18 @@ void syncProducerStream(unsigned long long producer_stream)
 
     `ic`, `times` and `timeStart` are host pointers in both cases -- they are O(Norb)
     and uploaded here. `desc` is taken by value-modifying reference because
-    desc.splineData must be repointed at the device spline buffer allocated below. */
-template<typename T>
+    desc.splineData must be repointed at the device spline buffer allocated below.
+
+    TOut (defaults to T) is the storage precision of `d_trajCaller`/`h_traj`, threaded
+    through to run_batch/integrate_one_orbit -- see integrateOrbitsGPU's doc comment
+    in orbit_gpu.h for the narrow-on-store rationale. The device-side trajectory
+    buffer (`d_traj`, whether caller-supplied or owned here) is always TOut-wide;
+    only the working buffers (`d_ic`, the descriptor's spline data) stay T-wide. */
+template<typename T, typename TOut>
 int cudaOrbitBatch(potential::GpuPotDesc<T>& desc, const std::vector<T>& splineT,
     std::size_t Norb, const double* ic, const double* times, std::size_t trajsize,
     T accT, std::size_t maxNumSteps, int method, const double* timeStart,
-    T* d_trajCaller, T* h_traj, unsigned long long producer_stream)
+    TOut* d_trajCaller, TOut* h_traj, unsigned long long producer_stream)
 {
     if(Norb == 0)
         return ORBIT_GPU_OK;
@@ -505,8 +523,8 @@ int cudaOrbitBatch(potential::GpuPotDesc<T>& desc, const std::vector<T>& splineT
     StreamBuffer<double> d_times(Norb,     stream.s);
     // Allocate a trajectory buffer only when the caller did not supply one. Length 0
     // is a legal cudaMallocAsync/cudaMalloc request and yields a NULL/unused pointer.
-    StreamBuffer<T>      d_trajOwned(d_trajCaller ? 0 : Norb * trajsize * 6, stream.s);
-    T* d_traj = d_trajCaller ? d_trajCaller : d_trajOwned.data();
+    StreamBuffer<TOut>   d_trajOwned(d_trajCaller ? 0 : Norb * trajsize * 6, stream.s);
+    TOut* d_traj = d_trajCaller ? d_trajCaller : d_trajOwned.data();
     // modifier spline coefficients must be device-resident for the kernel to
     // re-evaluate the chain per step; empty for a time-independent potential
     StreamBuffer<T>      d_spline(splineT.size(),        stream.s);
@@ -524,7 +542,7 @@ int cudaOrbitBatch(potential::GpuPotDesc<T>& desc, const std::vector<T>& splineT
     syncProducerStream(producer_stream);
     agama::Cuda pol;
     pol.stream = stream.s;
-    run_batch<T>(pol, desc, method, Norb, d_ic.data(), d_times.data(),
+    run_batch<T, TOut>(pol, desc, method, Norb, d_ic.data(), d_times.data(),
         timeStart ? d_tstart.data() : NULL,
         trajsize, accT, maxNumSteps, d_traj);
     if(h_traj)
@@ -538,7 +556,7 @@ int cudaOrbitBatch(potential::GpuPotDesc<T>& desc, const std::vector<T>& splineT
 
 }  // anonymous namespace
 
-template<typename T>
+template<typename T, typename TOut>
 int integrateOrbitsGPU(const potential::BasePotential& pot,
                        std::size_t Norb,
                        const double* ic,
@@ -546,7 +564,7 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                        std::size_t trajsize,
                        double accuracy,
                        std::size_t maxNumSteps,
-                       T* traj,
+                       TOut* traj,
                        const char* device,
                        int method,
                        const double* timeStart)
@@ -569,16 +587,16 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
             icT[j] = static_cast<T>(ic[j]);
         desc.splineData = splineT.empty() ? NULL : splineT.data();
         if(std::strcmp(device, "serial") == 0)
-            run_batch<T>(agama::Serial{}, desc, method, Norb, icT.data(), times,
+            run_batch<T, TOut>(agama::Serial{}, desc, method, Norb, icT.data(), times,
                 timeStart, trajsize, accT, maxNumSteps, traj);
         else
-            run_batch<T>(agama::OpenMP{}, desc, method, Norb, icT.data(), times,
+            run_batch<T, TOut>(agama::OpenMP{}, desc, method, Norb, icT.data(), times,
                 timeStart, trajsize, accT, maxNumSteps, traj);
         return ORBIT_GPU_OK;
     }
     if(std::strcmp(device, "cuda") == 0) {
 #ifdef HAVE_CUDA
-        return cudaOrbitBatch<T>(desc, splineT, Norb, ic, times, trajsize,
+        return cudaOrbitBatch<T, TOut>(desc, splineT, Norb, ic, times, trajsize,
             accT, maxNumSteps, method, timeStart,
             /*d_trajCaller*/ NULL, /*h_traj*/ traj, /*producer_stream*/ 0);
 #else
@@ -588,7 +606,7 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
     return ORBIT_GPU_EBADDEV;
 }
 
-template<typename T>
+template<typename T, typename TOut>
 int integrateOrbitsGPUDevice(const potential::BasePotential& pot,
                              std::size_t Norb,
                              const double* ic,
@@ -596,7 +614,7 @@ int integrateOrbitsGPUDevice(const potential::BasePotential& pot,
                              std::size_t trajsize,
                              double accuracy,
                              std::size_t maxNumSteps,
-                             T* d_traj,
+                             TOut* d_traj,
                              unsigned long long output_stream,
                              int method,
                              const double* timeStart)
@@ -615,7 +633,7 @@ int integrateOrbitsGPUDevice(const potential::BasePotential& pot,
         return ORBIT_GPU_OK;
     if(d_traj == NULL)
         return ORBIT_GPU_EUNSUPP;
-    return cudaOrbitBatch<T>(desc, splineT, Norb, ic, times, trajsize,
+    return cudaOrbitBatch<T, TOut>(desc, splineT, Norb, ic, times, trajsize,
         accT, maxNumSteps, method, timeStart,
         /*d_trajCaller*/ d_traj, /*h_traj*/ NULL, output_stream);
 #else
@@ -662,11 +680,17 @@ int scaleTrajectoryGPUDevice(std::size_t n, T* d_traj,
 #endif
 }
 
-// Explicit instantiations for the two precisions the Python boundary exposes.
+// Explicit instantiations for the two precisions the Python boundary exposes (TOut
+// defaulted to T, i.e. the storage-narrowing path is opt-in only), PLUS the
+// double-integration/float-storage narrow-on-store combination (interface_python.cpp's
+// `narrowStoreDefault`): fp64 integration writing directly into a float32 destination,
+// used only under a trivial unit system -- see orbit_gpu.h's doc comment.
 template int integrateOrbitsGPU<float >(const potential::BasePotential&, std::size_t,
     const double*, const double*, std::size_t, double, std::size_t, float*,  const char*, int, const double*);
 template int integrateOrbitsGPU<double>(const potential::BasePotential&, std::size_t,
     const double*, const double*, std::size_t, double, std::size_t, double*, const char*, int, const double*);
+template int integrateOrbitsGPU<double, float>(const potential::BasePotential&, std::size_t,
+    const double*, const double*, std::size_t, double, std::size_t, float*,  const char*, int, const double*);
 template int integrateOrbitsGPUDevice<float >(const potential::BasePotential&, std::size_t,
     const double*, const double*, std::size_t, double, std::size_t, float*,  unsigned long long, int, const double*);
 template int integrateOrbitsGPUDevice<double>(const potential::BasePotential&, std::size_t,

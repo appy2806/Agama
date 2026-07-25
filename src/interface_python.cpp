@@ -9073,6 +9073,25 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
     // even the unit conversion needs one).
     const bool directToDest = separateTime != 0 &&
         ((deviceFp32 && dtype == NPY_FLOAT) || (!deviceFp32 && dtype == NPY_DOUBLE));
+    // Narrow-on-store fast path for the OTHER common combination this flag deliberately
+    // excludes: the plain dtype DEFAULT (float32 storage) with the plain integration
+    // DEFAULT (fp64, since deviceFp32 is only set by an explicit float32/complex64
+    // dtype_obj) -- previously the least efficient of the four dtype x precision
+    // combinations, since it neither matched directToDest's fast path nor avoided the
+    // full-width intermediate host buffer. The batch kernel can now narrow each dense-
+    // output sample to float AT THE STORE (integrateOrbitsGPU<double,float>), so the
+    // D2H copy lands straight in the float32 destination same as directToDest does.
+    // Gated on a TRIVIAL unit system: narrowing happens BEFORE any unit scaling, so
+    // "narrow, then scale-by-1" and the host fallback's "scale-by-1, then narrow" are
+    // bit-identical only because there is no scaling to reorder against the narrowing --
+    // under a real unit system this must keep taking the storeTrajectoryGPUImpl fallback,
+    // which computes float(double_value / unit) in one rounding. NOT folded into
+    // directToDest itself: that flag also gates deviceOutput=True's validation below,
+    // and the CuPy destination there is allocated purely from deviceFp32 (not from the
+    // narrowed storage dtype), so relaxing directToDest would let deviceOutput=True
+    // silently hand back a float64 array for a caller's implied-float32 default.
+    const bool narrowStoreDefault = separateTime != 0 && !deviceFp32 && dtype == NPY_FLOAT &&
+        conv->lengthUnit == 1.0 && conv->velocityUnit == 1.0;
     if(deviceOutput && !directToDest) {
         PyErr_Format(PyExc_TypeError,
             "orbit(deviceOutput=True): storage dtype must equal the integration precision "
@@ -9474,24 +9493,37 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
             // exceptions (e.g. CUDA errors) must not escape through the
             // GIL-released region -- captured and re-raised after it
             try{
-                if(directToDest) {
+                if(directToDest || narrowStoreDefault) {
                     // the kernel's D2H copy writes straight into the final NumPy
                     // trajectory buffer -- no intermediate host allocation at all.
+                    // narrowStoreDefault additionally narrows fp64 integration output
+                    // to float32 AT THE STORE (integrateOrbitsGPU<double,float>), which
+                    // is why the storage-type test below is `deviceFp32 ||
+                    // narrowStoreDefault` rather than `deviceFp32` alone.
                     void* dst = PyArray_DATA(result_arrays[indexTraj]);
                     if(deviceFp32)
                         rc = orbit::integrateOrbitsGPU<float>(*pot, numOrbits, icFlat.data(),
                             timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
                             static_cast<float*>(dst), deviceStr.c_str(), gpuMethod,
                             timestart.data());
+                    else if(narrowStoreDefault)
+                        rc = orbit::integrateOrbitsGPU<double, float>(*pot, numOrbits,
+                            icFlat.data(), timetotal.data(), trajsize, params.accuracy,
+                            params.maxNumSteps, static_cast<float*>(dst), deviceStr.c_str(),
+                            gpuMethod, timestart.data());
                     else
                         rc = orbit::integrateOrbitsGPU<double>(*pot, numOrbits, icFlat.data(),
                             timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
                             static_cast<double*>(dst), deviceStr.c_str(), gpuMethod,
                             timestart.data());
                     if(rc == orbit::ORBIT_GPU_OK) {
-                        // convert units in place (single pass, still under released GIL)
+                        // convert units in place (single pass, still under released GIL).
+                        // Under narrowStoreDefault both unit factors are exactly 1 (that is
+                        // the whole precondition for taking this path bit-identically), so
+                        // this loop is a mathematical no-op there -- run uniformly anyway
+                        // rather than special-casing it away.
                         const size_t N = (size_t)numOrbits * (size_t)trajsize;
-                        if(deviceFp32) {
+                        if(deviceFp32 || narrowStoreDefault) {
                             float* buf = static_cast<float*>(dst);
                             for(size_t n=0; n<N; n++) {
                                 float* w = buf + n*6;
@@ -9547,7 +9579,7 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
             Orbit_gpu_set_error(rc, deviceStr, *pot);
             fail = true;   // the cleanup below respects an already-set Python error
         }
-        if(!fail && directToDest) {
+        if(!fail && (directToDest || narrowStoreDefault)) {
             // everything (units + timestamps) was already written above, in bulk
             numCompleted = numOrbits;
         } else if(!fail) {

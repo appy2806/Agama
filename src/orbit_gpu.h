@@ -68,6 +68,21 @@ enum OrbitGPUMethod {
                        double; explicitly instantiated for both). Time
                        bookkeeping is always double; coefficient storage in
                        the force descriptor is double, cast once on entry.
+    \tparam TOut       storage precision of the trajectory output; defaults to
+                       T so every pre-existing call site is unaffected. The
+                       one case this exists for is T=double, TOut=float: fp64
+                       integration with the per-sample dense-output value
+                       narrowed to float AT THE STORE, so a caller whose
+                       destination is float32 (the NumPy default) but whose
+                       requested integration precision is the fp64 default
+                       gets the kernel's D2H copy landing directly in that
+                       destination, instead of a full double-precision
+                       Norb*trajsize*6 intermediate host buffer. Narrowing
+                       here happens BEFORE any unit conversion, so a caller
+                       under a non-trivial unit system must not use TOut!=T:
+                       see interface_python.cpp's `narrowStoreDefault` for the
+                       argument (it is gated on lengthUnit==velocityUnit==1
+                       for exactly this reason).
     \param  pot        the potential (must be representable: analytic
                        GPU-capable types or Composite thereof)
     \param  Norb       number of orbits
@@ -82,15 +97,16 @@ enum OrbitGPUMethod {
                        (10 * accuracy^0.9) is applied internally, so the value
                        passed here has the identical meaning across methods.
     \param  maxNumSteps upper limit on the number of ODE steps per orbit
-    \param  traj       output, packed Norb*trajsize*6:
+    \param  traj       output, packed Norb*trajsize*6, in precision TOut:
                        traj[(i*trajsize + j)*6 + k] = component k of sample j
                        of orbit i. Samples not reached before an integrator
-                       error or the step limit are filled with NAN.
+                       error or the step limit are filled with NAN (TOut(NAN),
+                       which is still a NaN for TOut=float).
     \param  device     "cpu"/"openmp" (OpenMP), "serial", or "cuda"
     \param  method     an OrbitGPUMethod value (DOP853 or DPRKN8)
     \return an OrbitGPUResult code; ORBIT_GPU_OK on success.
 */
-template<typename T>
+template<typename T, typename TOut = T>
 int integrateOrbitsGPU(const potential::BasePotential& pot,
                        std::size_t Norb,
                        const double* ic,
@@ -98,7 +114,7 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                        std::size_t trajsize,
                        double accuracy,
                        std::size_t maxNumSteps,
-                       T* traj,
+                       TOut* traj,
                        const char* device,
                        int method = ORBIT_GPU_DOP853,
                        /** per-orbit absolute start time, length Norb, in internal units;
@@ -148,8 +164,16 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
     for a NULL `d_traj`.
 
     \param  d_traj  output DEVICE buffer, length Norb*trajsize*6, same packing and
-                    same NAN-fill-on-unreached-sample guarantee as `traj` above. */
-template<typename T>
+                    same NAN-fill-on-unreached-sample guarantee as `traj` above.
+
+    \tparam TOut  storage precision of `d_traj`; defaults to T like the host-output
+                 overload above. No caller currently requests TOut != T here (the
+                 device-resident path requires the CuPy buffer's dtype to already
+                 match the integration precision -- see interface_python.cpp), but
+                 the parameter is threaded through for symmetry with
+                 integrateOrbitsGPU and so the shared cudaOrbitBatch() helper does
+                 not need two divergent signatures. */
+template<typename T, typename TOut = T>
 int integrateOrbitsGPUDevice(const potential::BasePotential& pot,
                              std::size_t Norb,
                              const double* ic,
@@ -157,7 +181,7 @@ int integrateOrbitsGPUDevice(const potential::BasePotential& pot,
                              std::size_t trajsize,
                              double accuracy,
                              std::size_t maxNumSteps,
-                             T* d_traj,
+                             TOut* d_traj,
                              unsigned long long output_stream,
                              int method = ORBIT_GPU_DOP853,
                              const double* timeStart = NULL);
