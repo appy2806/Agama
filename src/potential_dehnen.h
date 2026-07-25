@@ -83,10 +83,11 @@ public:
         checks isSpherical(symmetry()) before ever reaching this method, so a
         triaxial Dehnen is reported as unsupported (POT_GPU_EUNSUPP) rather
         than throwing in practice; the guard here is a second, defensive line
-        in case this method is ever called directly. add=true accumulates. */
+        in case this method is ever called directly. add=true accumulates.
+        time parameter accepted for signature uniformity with time-dependent potentials but ignored. */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         if(axisRatioY != 1. || axisRatioZ != 1.)
             throw std::runtime_error("Dehnen: GPU batch evaluation only supports the "
@@ -106,7 +107,8 @@ public:
         kernel. SPHERICAL CASE ONLY -- see evalmanyCarT. add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         if(axisRatioY != 1. || axisRatioZ != 1.)
             throw std::runtime_error("Dehnen: GPU batch evaluation only supports the "
@@ -136,7 +138,7 @@ public:
         accumulates. */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scalerad), g = static_cast<T>(gamma);
         const T ay = static_cast<T>(axisRatioY), az = static_cast<T>(axisRatioZ);

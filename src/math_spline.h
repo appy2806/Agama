@@ -453,6 +453,44 @@ public:
     */
     virtual void evalDeriv(double x, double* val, double* der, double* der2, double* der3) const;
 
+    /** return the array of node values -- the second argument of evalCubicSplineRaw().
+        Exposed (alongside the inherited xvalues() and fderivs() below) so that the
+        spline's coefficients can be handed to a device-resident evaluator: the GPU
+        path needs the three raw arrays, not the object. */
+    const std::vector<double>& fvalues() const { return fval; }
+
+    /** return the array of node first derivatives -- the third argument of
+        evalCubicSplineRaw(); see fvalues() above. */
+    const std::vector<double>& fderivs() const { return fder; }
+
+    /** true if this spline evaluates to one and the same value at every input point,
+        i.e. it carries no actual dependence on its argument.
+
+        This is not a cosmetic query: the four potential modifiers (Shifted, Rotating,
+        Scaled in potential_composite.h) store their center/angle/amplitude/scale as
+        CubicSplines in time even when the user supplied a single constant, and the GPU
+        paths need to distinguish "constant, so it can be folded into a by-value
+        descriptor once" from "genuinely time-dependent, so the spline coefficients must
+        be uploaded and re-evaluated per integration step".
+
+        Both representations a constant can take are recognized:
+        - a single-node spline (what readTimeDependentArray() builds from a bare value:
+          one knot, fder = {0}, so both extrapolation branches return fval[0]);
+        - a multi-node spline whose node values are all equal and whose node derivatives
+          are all zero (what a user file with several identical rows produces).
+        An empty spline is NOT constant -- it evaluates to NaN, which is a value the
+        caller must not silently bake in.
+    */
+    bool isConstant() const
+    {
+        if(fval.empty() || fder.size() != fval.size())
+            return false;                // empty spline evaluates to NaN, not a constant
+        for(size_t i=0; i<fval.size(); i++)
+            if(fval[i] != fval[0] || fder[i] != 0)
+                return false;
+        return true;
+    }
+
     virtual double integrate(double x1, double x2, int n=0) const;
 
     virtual double integrate(double x1, double x2, const IFunctionIntegral& f) const;

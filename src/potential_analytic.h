@@ -345,10 +345,11 @@ public:
         xyz: packed input length 3*N (x0,y0,z0, x1,y1,z1, ...); phi: output length N.
         Templated on precision T (float or double) and execution policy.
         add=true accumulates into phi[] instead of overwriting (composite support);
-        the math is unchanged, only the final store differs (uniform branch). */
+        the math is unchanged, only the final store differs (uniform branch).
+        time parameter accepted for signature uniformity with time-dependent potentials but ignored. */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -365,7 +366,8 @@ public:
         add=true accumulates into the outputs (composite support). */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -385,7 +387,7 @@ public:
         add=true accumulates into rho[] (composite support: composite density = sum). */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -427,7 +429,7 @@ public:
         add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -442,7 +444,8 @@ public:
         one kernel. acc packed length 3*N; add=true accumulates (composite support). */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -461,7 +464,7 @@ public:
     /** Batch density evaluator via the isochrone_rho leaf; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), b = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -504,7 +507,7 @@ public:
         add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), rs = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -520,7 +523,8 @@ public:
         leaf per step). acc packed length 3*N; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), rs = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -539,7 +543,7 @@ public:
     /** Batch density evaluator via the nfw_rho leaf; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), rs = static_cast<T>(scaleRadius);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -582,7 +586,7 @@ public:
         add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), a = static_cast<T>(scaleRadius), b = static_cast<T>(scaleHeight);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -598,7 +602,8 @@ public:
         via cyl_acc_car. acc packed length 3*N; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), ar = static_cast<T>(scaleRadius), b = static_cast<T>(scaleHeight);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -618,7 +623,7 @@ public:
     /** Batch density evaluator via the miyamoto_nagai_rho leaf; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         const T m = static_cast<T>(mass), ar = static_cast<T>(scaleRadius), b = static_cast<T>(scaleHeight);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -691,7 +696,7 @@ public:
         add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         const T v2 = static_cast<T>(v0squared), c2 = static_cast<T>(coreRadius2);
         const T pp = static_cast<T>(p2), qq = static_cast<T>(q2), L2 = static_cast<T>(lengthUnit2);
@@ -707,7 +712,8 @@ public:
         acc packed length 3*N; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         const T v2 = static_cast<T>(v0squared), c2 = static_cast<T>(coreRadius2);
         const T pp = static_cast<T>(p2), qq = static_cast<T>(q2), L2 = static_cast<T>(lengthUnit2);
@@ -725,7 +731,7 @@ public:
         matching the CPU path); add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         const T v2 = static_cast<T>(v0squared), c2 = static_cast<T>(coreRadius2);
         const T pp = static_cast<T>(p2), qq = static_cast<T>(q2), L2 = static_cast<T>(lengthUnit2);
@@ -767,7 +773,7 @@ public:
         add=true accumulates into phi[] instead of overwriting (composite support). */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         const T w2 = static_cast<T>(Omega2), pp = static_cast<T>(p2), qq = static_cast<T>(q2);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -782,7 +788,8 @@ public:
         acc packed length 3*N; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         const T w2 = static_cast<T>(Omega2), pp = static_cast<T>(p2), qq = static_cast<T>(q2);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
@@ -799,7 +806,7 @@ public:
         matching the CPU path); add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         const T w2 = static_cast<T>(Omega2), pp = static_cast<T>(p2), qq = static_cast<T>(q2);
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {

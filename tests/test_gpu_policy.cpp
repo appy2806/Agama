@@ -466,6 +466,179 @@ int main() {
         }
     }
 
+    // =====================================================================
+    // Tier 1 modifiers: Shifted / Tilted / Rotating / Scaled on the descriptor.
+    //
+    // A chain of these collapses to one GpuPotXform (a similarity transform of
+    // the position plus scalar rescalings of Phi, acc and rho -- see
+    // GpuPotXform in potential_composite.h). This block pins that collapse
+    // against the CPU virtual eval, which composes the modifiers by nesting
+    // actual eval calls, for EVERY subset of the four modifiers, including all
+    // the nested combinations. Two things make it worth testing exhaustively
+    // rather than one-per-modifier:
+    //   - the acceleration transforms with M^TRANSPOSE, and a wrong transpose is
+    //     invisible for any chain without a rotation (M is then symmetric);
+    //   - the stages must compose outermost-to-innermost, and the wrong order is
+    //     invisible unless a translation and a rotation/scale are BOTH present
+    //     (translations commute with everything else on their own).
+    // The base potential is therefore a triaxial Logarithmic (no symmetry to
+    // hide a bad rotation) and every subset with >= 2 modifiers is exercised.
+    //
+    // Modifiers are constructed directly rather than through the factory so this
+    // test needs no INI files; the nesting order matches applyModifiers() in
+    // potential_factory.cpp, i.e. Shifted(Tilted(Rotating(Scaled(base)))).
+    // =====================================================================
+    {
+        // constant splines: a single node with zero derivative, exactly what
+        // readTimeDependentArray() builds from a bare "x,y,z" parameter string
+        const std::vector<double> t0(1, 0.0);
+        #define AGAMA_CONST_SPLINE(v) math::CubicSpline(t0, std::vector<double>(1, (v)))
+        const double CX = 0.31, CY = -0.22, CZ = 0.47;   // Shifted center
+        const double ALPHA = 0.4, BETA = 0.9, GAMMA = -0.3;  // Tilted Euler angles
+        const double ANGLE = 0.7;                        // Rotating angle
+        const double AMPL = 1.3, LSCALE = 0.8;           // Scaled amplitude, length scale
+
+        double max_rel_all = 0;
+        bool ok_all = true;
+        int nsubsets = 0;
+        for(int mask = 0; mask < 16; mask++) {
+            potential::PtrPotential p(new potential::Logarithmic(
+                /*v0*/ 1.0, /*coreRadius*/ 0.5, /*axisRatioY*/ 0.7, /*axisRatioZ*/ 0.5));
+            // innermost first, so the outermost wrapper ends up outermost --
+            // same order as applyModifiers()
+            if(mask & 1)
+                p.reset(new potential::Scaled<potential::BasePotential>(p,
+                    AGAMA_CONST_SPLINE(AMPL), AGAMA_CONST_SPLINE(LSCALE)));
+            if(mask & 2)
+                p.reset(new potential::Rotating<potential::BasePotential>(p,
+                    AGAMA_CONST_SPLINE(ANGLE)));
+            if(mask & 4)
+                p.reset(new potential::Tilted<potential::BasePotential>(p,
+                    ALPHA, BETA, GAMMA));
+            if(mask & 8)
+                p.reset(new potential::Shifted<potential::BasePotential>(p,
+                    AGAMA_CONST_SPLINE(CX), AGAMA_CONST_SPLINE(CY), AGAMA_CONST_SPLINE(CZ)));
+
+            potential::GpuPotDesc<double> desc;
+            // every stage is constant here, so requireTimeIndependent must NOT
+            // reject any of these -- ask for it, so a regression that breaks
+            // CubicSpline::isConstant() shows up as a build-once failure
+            if(!potential::buildGpuPotDesc(*p, desc, /*time*/ 0,
+                /*requireTimeIndependent*/ true) || desc.nterms != 1)
+            {
+                std::fprintf(stderr,
+                    "FAIL (modifier descriptor did not build, mask=%d)\n", mask);
+                return 1;
+            }
+            nsubsets++;
+            // Scale-normalized, not pointwise-relative: a triaxial Logarithmic's
+            // Phi crosses zero on the sampled shell, and dividing by ~0 there
+            // reports a huge error for a perfectly good result (the same trap
+            // documented in local_notes/crosscheck_gpu_vs_production.py).
+            double max_ad = 0, max_aa = 0, max_dd = 0, ref_p = 0, ref_a = 0, ref_d = 0;
+            for(int i = 0; i < 200; i++) {
+                const double x = 0.11 + 0.037 * (i % 53) - 0.9,
+                             y = -0.43 + 0.029 * (i % 41),
+                             z = 0.17 + 0.023 * (i % 31) - 0.4;
+                double phi_d, acc_d[3];
+                potential::gpu_desc_phi_acc(desc, x, y, z, &phi_d, acc_d);
+                const double rho_d = potential::gpu_desc_dens(desc, x, y, z);
+                double phi_v;
+                coord::GradCar grad;
+                p->eval(coord::PosCar(x, y, z), &phi_v, &grad, NULL);
+                const double rho_v = p->density(coord::PosCar(x, y, z));
+                const double acc_v[3] = { -grad.dx, -grad.dy, -grad.dz };
+                max_ad = std::max(max_ad, std::fabs(phi_d - phi_v));
+                ref_p  = std::max(ref_p,  std::fabs(phi_v));
+                for(int k = 0; k < 3; k++) {
+                    max_aa = std::max(max_aa, std::fabs(acc_d[k] - acc_v[k]));
+                    ref_a  = std::max(ref_a,  std::fabs(acc_v[k]));
+                }
+                max_dd = std::max(max_dd, std::fabs(rho_d - rho_v));
+                ref_d  = std::max(ref_d,  std::fabs(rho_v));
+            }
+            const double rel_p = max_ad / std::max(1e-300, ref_p),
+                         rel_a = max_aa / std::max(1e-300, ref_a),
+                         rel_d = max_dd / std::max(1e-300, ref_d);
+            const double rel = std::max(rel_p, std::max(rel_a, rel_d));
+            max_rel_all = std::max(max_rel_all, rel);
+            // 1e-13: the transform is 13 multiply-adds on top of the leaf, so a
+            // correct implementation lands at a few ULP (measured ~4e-16); this
+            // leaves three decades of headroom while still catching any real
+            // algebra error, which shows up at O(0.1) or larger.
+            if(rel > 1e-13) {
+                std::fprintf(stderr, "FAIL (modifier descriptor parity, mask=%d: "
+                    "phi %.3e, acc %.3e, rho %.3e)\n", mask, rel_p, rel_a, rel_d);
+                ok_all = false;
+            }
+        }
+        std::printf("[T1]    modifier descriptor vs virtual eval "
+            "(%d Shifted/Tilted/Rotating/Scaled subsets x 200 pts, triaxial Logarithmic, "
+            "Phi+acc+rho): max rel err = %.3e, tol = %.1e -> %s\n",
+            nsubsets, max_rel_all, 1e-13, ok_all ? "OK" : "FAIL");
+        if(!ok_all)
+            return 1;
+
+        // ----- a time-VARYING chain must be refused, not frozen -----
+        // This is the guard that keeps the orbit kernel from integrating a
+        // snapshot of a moving potential. Build a genuinely time-dependent
+        // Shifted (a 2-node center spline) and check that (a) the descriptor
+        // refuses it when the caller demands time-independence, (b) it still
+        // builds when the caller can supply a time, and (c) the descriptor built
+        // at t=T actually matches the CPU eval AT THAT SAME T -- i.e. `time` is
+        // really threaded, not accepted and dropped.
+        {
+            std::vector<double> tt(2), vx(2), vy(2), vz(2);
+            tt[0] = 0;    tt[1] = 10;
+            vx[0] = 0;    vx[1] = 2.0;
+            vy[0] = 0;    vy[1] = -1.0;
+            vz[0] = 0.5;  vz[1] = 0.5;   // z constant, x and y moving
+            potential::PtrPotential base(new potential::Logarithmic(1.0, 0.5, 0.7, 0.5));
+            potential::PtrPotential moving(new potential::Shifted<potential::BasePotential>(
+                base, math::CubicSpline(tt, vx), math::CubicSpline(tt, vy),
+                math::CubicSpline(tt, vz)));
+
+            potential::GpuPotDesc<double> d_strict, d_at_t;
+            const bool refused = !potential::buildGpuPotDesc(*moving, d_strict,
+                /*time*/ 0, /*requireTimeIndependent*/ true);
+            const double TQ = 6.25;
+            const bool built  = potential::buildGpuPotDesc(*moving, d_at_t, TQ,
+                /*requireTimeIndependent*/ false);
+            double rel_t = 1e300;
+            if(built) {
+                double worst = 0, ref = 0;
+                for(int i = 0; i < 64; i++) {
+                    const double x = 0.3 + 0.05 * i, y = -0.7 + 0.031 * (i % 17),
+                                 z = 0.2 + 0.017 * (i % 13);
+                    double phi_d, acc_d[3];
+                    potential::gpu_desc_phi_acc(d_at_t, x, y, z, &phi_d, acc_d);
+                    double phi_v;
+                    coord::GradCar grad;
+                    moving->eval(coord::PosCar(x, y, z), &phi_v, &grad, NULL, TQ);
+                    worst = std::max(worst, std::fabs(phi_d - phi_v));
+                    ref   = std::max(ref,   std::fabs(phi_v));
+                    const double av[3] = { -grad.dx, -grad.dy, -grad.dz };
+                    for(int k = 0; k < 3; k++) {
+                        worst = std::max(worst, std::fabs(acc_d[k] - av[k]));
+                        ref   = std::max(ref,   std::fabs(av[k]));
+                    }
+                }
+                rel_t = worst / std::max(1e-300, ref);
+            }
+            const bool ok_td = refused && built && rel_t <= 1e-13;
+            std::printf("[T1]    time-varying Shifted: refused when time-independence "
+                "required: %s; builds at t=%.2f: %s; matches CPU eval at that t: "
+                "max rel err = %.3e -> %s\n",
+                refused ? "yes" : "NO", TQ, built ? "yes" : "NO", rel_t,
+                ok_td ? "OK" : "FAIL");
+            if(!ok_td) {
+                std::fprintf(stderr, "FAIL (time-dependent modifier gating)\n");
+                return 1;
+            }
+        }
+        #undef AGAMA_CONST_SPLINE
+    }
+
 #ifdef HAVE_CUDA
     // ----- forall<Cuda> -----
     device_array<double> d_out(N);

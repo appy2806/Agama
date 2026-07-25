@@ -33,6 +33,14 @@ enum PotentialGPUResult {
     \param  device   one of "cpu" (OpenMP -- the legacy-equivalent parallel CPU
                      path), "openmp" (alias of "cpu"), "serial" (single-thread
                      debugging/baseline), or "cuda"
+    \param  time     the moment at which to evaluate, in internal units, shared
+                     by the whole batch (same single-scalar-time convention as
+                     BaseDensity::evalmanyDensityCar). Time-independent
+                     potentials ignore it; for a time-dependent one -- a
+                     modifier with a non-constant center/angle/amplitude/scale,
+                     or UniformAcceleration -- it selects the configuration the
+                     batch is evaluated in, exactly, since one host-side spline
+                     lookup serves every point.
     \returns         a PotentialGPUResult code; POT_GPU_OK on success.
 
     On POT_GPU_EUNSUPP, the caller should query `pot.name()` (or, better,
@@ -42,7 +50,7 @@ enum PotentialGPUResult {
 template<typename T>
 int evalPotentialGPU(const BasePotential& pot,
                      std::size_t N, const T* xyz, T* phi,
-                     const char* device);
+                     const char* device, double time = 0);
 
 /** Compute the Cartesian acceleration a = -grad Phi at N positions through the
     fused Phi+acc batch path (evalmanyPhiAccCarT with the Phi output disabled).
@@ -52,7 +60,7 @@ int evalPotentialGPU(const BasePotential& pot,
 template<typename T>
 int evalForceGPU(const BasePotential& pot,
                  std::size_t N, const T* xyz, T* acc,
-                 const char* device);
+                 const char* device, double time = 0);
 
 /** Compute the density rho at N Cartesian positions through the batch path
     (evalmanyDensCarT). Same contract as evalPotentialGPU: host pointers,
@@ -61,7 +69,7 @@ int evalForceGPU(const BasePotential& pot,
 template<typename T>
 int evalDensityGPU(const BasePotential& pot,
                    std::size_t N, const T* xyz, T* rho,
-                   const char* device);
+                   const char* device, double time = 0);
 
 /** For a POT_GPU_EUNSUPP result: the name of the potential type that blocked
     the dispatch. For a plain potential this is just pot.name(); for a
@@ -102,7 +110,7 @@ std::string unsupportedGPUPotentialName(const BasePotential& pot);
 template<typename T>
 int evalPotentialGPUDevice(const BasePotential& pot,
                            std::size_t N, const T* d_xyz, T* d_phi,
-                           unsigned long long input_stream);
+                           unsigned long long input_stream, double time = 0);
 
 /** Device-pointer variant of evalForceGPU: d_xyz and d_acc (packed 3*N) are
     GPU-resident buffers. Same synchronization contract, unit-system limitation
@@ -110,7 +118,7 @@ int evalPotentialGPUDevice(const BasePotential& pot,
 template<typename T>
 int evalForceGPUDevice(const BasePotential& pot,
                        std::size_t N, const T* d_xyz, T* d_acc,
-                       unsigned long long input_stream);
+                       unsigned long long input_stream, double time = 0);
 
 /** Device-pointer variant of evalDensityGPU: d_xyz (3*N) and d_rho (N) are
     GPU-resident buffers. Same synchronization contract, unit-system limitation
@@ -118,6 +126,6 @@ int evalForceGPUDevice(const BasePotential& pot,
 template<typename T>
 int evalDensityGPUDevice(const BasePotential& pot,
                          std::size_t N, const T* d_xyz, T* d_rho,
-                         unsigned long long input_stream);
+                         unsigned long long input_stream, double time = 0);
 
 }  // namespace potential

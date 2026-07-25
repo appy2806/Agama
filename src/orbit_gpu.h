@@ -37,7 +37,17 @@ enum OrbitGPUResult {
     ORBIT_GPU_OK        = 0,  ///< success
     ORBIT_GPU_EBADDEV   = 1,  ///< unknown device string (not cpu/openmp/serial/cuda)
     ORBIT_GPU_ENOTBUILT = 2,  ///< device='cuda' but library built with HAVE_CUDA=0
-    ORBIT_GPU_EUNSUPP   = 3   ///< potential not representable as a GPU force descriptor
+    ORBIT_GPU_EUNSUPP   = 3,  ///< potential not representable as a GPU force descriptor
+    /** the potential IS representable, but only at a single instant: it contains a
+        time-varying modifier (a Shifted/Rotating/Scaled whose center/angle/
+        amplitude/scale actually changes with time). The orbit kernel builds the
+        descriptor once and then integrates across many times, so baking in one
+        instant would silently integrate the wrong potential -- this is reported
+        instead. A CONSTANT modifier chain, and Tilted in any case, are fine.
+        Distinguished from EUNSUPP so the Python layer can say which of the two
+        it is: "this potential type has no GPU path" and "this potential's time
+        dependence has no GPU path yet" call for different user actions. */
+    ORBIT_GPU_ETIMEDEP  = 4
 };
 
 /** ODE integrator selectable on the batch path. Kept as a plain int on this

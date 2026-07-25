@@ -501,10 +501,11 @@ public:
         constructor has no device path). The GPU dispatch layer
         (potential_gpu.cpp / potential_descriptor.h) checks recognizability via
         gpuDesc() before ever reaching this method, so this is a second,
-        defensive check. add=true accumulates. */
+        defensive check. add=true accumulates.
+        time parameter accepted for signature uniformity with time-dependent potentials but ignored. */
     template<typename T, class Policy>
     inline void evalmanyCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* phi, bool add = false) const
+        const T* xyz, /*out*/ T* phi, double /*time*/ = 0, bool add = false) const
     {
         DiskAnsatzDesc<T> d = gpuDescT<T>();
         const int radialType = d.radialType, verticalType = d.verticalType;
@@ -526,7 +527,8 @@ public:
         packed length 3*N; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyPhiAccCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc, bool add = false) const
+        const T* xyz, /*out, nullable*/ T* phi, /*out length 3N*/ T* acc,
+        double /*time*/ = 0, bool add = false) const
     {
         DiskAnsatzDesc<T> d = gpuDescT<T>();
         const int radialType = d.radialType, verticalType = d.verticalType;
@@ -549,7 +551,7 @@ public:
     /** Batch density evaluator via the disk_ansatz_rho leaf; add=true accumulates. */
     template<typename T, class Policy>
     inline void evalmanyDensCarT(Policy pol, std::size_t N,
-        const T* xyz, /*out*/ T* rho, bool add = false) const
+        const T* xyz, /*out*/ T* rho, double /*time*/ = 0, bool add = false) const
     {
         DiskAnsatzDesc<T> d = gpuDescT<T>();
         const int radialType = d.radialType, verticalType = d.verticalType;

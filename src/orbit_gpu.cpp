@@ -355,8 +355,19 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
     if(method != ORBIT_GPU_DOP853 && method != ORBIT_GPU_DPRKN8)
         return ORBIT_GPU_EUNSUPP;
     potential::GpuPotDesc<double> desc0;
-    if(!potential::buildGpuPotDesc(pot, desc0))
-        return ORBIT_GPU_EUNSUPP;
+    // requireTimeIndependent=true is load-bearing, not defensive: the descriptor is
+    // built ONCE here and then evaluated at every RK stage of every orbit, at times
+    // this function never sees. Building it at some nominal time would integrate a
+    // frozen snapshot of a moving potential and return a plausible wrong answer, so
+    // a time-varying modifier is refused outright.
+    if(!potential::buildGpuPotDesc(pot, desc0, /*time*/ 0, /*requireTimeIndependent*/ true)) {
+        // Separate the two failure reasons for the user's benefit: retrying without
+        // the time-independence requirement tells us whether the descriptor was
+        // blocked by an unrepresentable potential type or purely by time dependence.
+        potential::GpuPotDesc<double> probe;
+        return potential::buildGpuPotDesc(pot, probe, /*time*/ 0, /*requireTimeIndependent*/ false)
+            ? ORBIT_GPU_ETIMEDEP : ORBIT_GPU_EUNSUPP;
+    }
     const potential::GpuPotDesc<T> desc = potential::castGpuPotDesc<T>(desc0);
     // Per-method base tolerance (in double): DPRKN8 applies the SAME empirical
     // rescaling as the CPU OdeStepperDPRKN8 constructor (10 * accuracy^0.9) so
