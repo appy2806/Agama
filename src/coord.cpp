@@ -578,59 +578,11 @@ void PosVelAxi::momenta(double& prho, double& pnu, double& pphi) const
 
 //-------- implementations of functions that convert gradients --------//
 
-template<>
-GradCar toGrad(const GradCyl& src, const PosDerivT<Car, Cyl>& deriv) {
-    GradCar dest;
-    dest.dx = src.dR*deriv.dRdx + src.dphi*deriv.dphidx;
-    dest.dy = src.dR*deriv.dRdy + src.dphi*deriv.dphidy;
-    dest.dz = src.dz;
-    return dest;
-}
-
-template<>
-GradCar toGrad(const GradSph& src, const PosDerivT<Car, Sph>& deriv) {
-    GradCar dest;
-    dest.dx = src.dr*deriv.drdx + src.dtheta*deriv.dthetadx + src.dphi*deriv.dphidx;
-    dest.dy = src.dr*deriv.drdy + src.dtheta*deriv.dthetady + src.dphi*deriv.dphidy;
-    dest.dz = src.dr*deriv.drdz + src.dtheta*deriv.dthetadz;
-    return dest;
-}
-
-template<>
-GradCyl toGrad(const GradCar& src, const PosDerivT<Cyl, Car>& deriv) {
-    GradCyl dest;
-    dest.dR = src.dx*deriv.dxdR + src.dy*deriv.dydR;
-    dest.dz = src.dz;
-    dest.dphi = src.dx*deriv.dxdphi + src.dy*deriv.dydphi;
-    return dest;
-}
-
-template<>
-GradCyl toGrad(const GradSph& src, const PosDerivT<Cyl, Sph>& deriv) {
-    GradCyl dest;
-    dest.dR = src.dr*deriv.drdR + src.dtheta*deriv.dthetadR;
-    dest.dz = src.dr*deriv.drdz + src.dtheta*deriv.dthetadz;
-    dest.dphi = src.dphi;
-    return dest;
-}
-
-template<>
-GradSph toGrad(const GradCar& src, const PosDerivT<Sph, Car>& deriv) {
-    GradSph dest;
-    dest.dr     = src.dx*deriv.dxdr     + src.dy*deriv.dydr     + src.dz*deriv.dzdr;
-    dest.dtheta = src.dx*deriv.dxdtheta + src.dy*deriv.dydtheta + src.dz*deriv.dzdtheta;
-    dest.dphi   = src.dx*deriv.dxdphi   + src.dy*deriv.dydphi;
-    return dest;
-}
-
-template<>
-GradSph toGrad(const GradCyl& src, const PosDerivT<Sph, Cyl>& deriv) {
-    GradSph dest;
-    dest.dr     = src.dR*deriv.dRdr     + src.dz*deriv.dzdr;
-    dest.dtheta = src.dR*deriv.dRdtheta + src.dz*deriv.dzdtheta;
-    dest.dphi   = src.dphi;
-    return dest;
-}
+// The 6 Car/Cyl/Sph toGrad specializations (Car<-Cyl, Car<-Sph, Cyl<-Car, Cyl<-Sph,
+// Sph<-Car, Sph<-Cyl) were promoted to coord.h as AGAMA_DEVICE_INLINE so they are
+// callable from CUDA kernels (Multipole::evalCyl routes through toGrad<Sph,Cyl>).
+// The ProlSph/Axi ones below stay host-only: they serve the Stackel action finder
+// and focal-distance finder, both of which stay CPU forever.
 
 template<>
 GradCyl toGrad(const GradProlSph& src, const PosDerivT<Cyl, ProlSph>& deriv) {
@@ -670,162 +622,11 @@ GradAxi toGrad(const GradCyl& src, const PosDerivT<Axi, Cyl>& deriv) {
 
 //-------- implementations of functions that convert hessians --------//
 
-template<>
-HessCar toHess(const GradCyl& srcGrad, const HessCyl& srcHess,
-    const PosDerivT<Car, Cyl>& deriv, const PosDeriv2T<Car, Cyl>& deriv2) {
-    HessCar dest;
-    dest.dx2 =
-        (srcHess.dR2   *deriv.dRdx + srcHess.dRdphi*deriv.dphidx) * deriv.dRdx +
-        (srcHess.dRdphi*deriv.dRdx + srcHess.dphi2 *deriv.dphidx) * deriv.dphidx +
-        srcGrad.dR*deriv2.d2Rdx2   + srcGrad.dphi*deriv2.d2phidx2;
-    dest.dxdy =
-        (srcHess.dR2   *deriv.dRdy + srcHess.dRdphi*deriv.dphidy) * deriv.dRdx +
-        (srcHess.dRdphi*deriv.dRdy + srcHess.dphi2 *deriv.dphidy) * deriv.dphidx +
-        srcGrad.dR*deriv2.d2Rdxdy  + srcGrad.dphi*deriv2.d2phidxdy;
-    dest.dy2 =
-        (srcHess.dR2   *deriv.dRdy + srcHess.dRdphi*deriv.dphidy) * deriv.dRdy +
-        (srcHess.dRdphi*deriv.dRdy + srcHess.dphi2 *deriv.dphidy) * deriv.dphidy +
-        srcGrad.dR*deriv2.d2Rdy2   + srcGrad.dphi*deriv2.d2phidy2;
-    dest.dxdz = srcHess.dRdz*deriv.dRdx + srcHess.dzdphi*deriv.dphidx;
-    dest.dydz = srcHess.dRdz*deriv.dRdy + srcHess.dzdphi*deriv.dphidy;
-    dest.dz2  = srcHess.dz2;
-    return dest;
-}
-
-template<>
-HessCar toHess(const GradSph& srcGrad, const HessSph& srcHess,
-    const PosDerivT<Car, Sph>& deriv, const PosDeriv2T<Car, Sph>& deriv2) {
-    HessCar dest;
-    dest.dx2 =
-        (srcHess.dr2     *deriv.drdx + srcHess.drdtheta  *deriv.dthetadx + srcHess.drdphi    *deriv.dphidx) * deriv.drdx +
-        (srcHess.drdtheta*deriv.drdx + srcHess.dtheta2   *deriv.dthetadx + srcHess.dthetadphi*deriv.dphidx) * deriv.dthetadx +
-        (srcHess.drdphi  *deriv.drdx + srcHess.dthetadphi*deriv.dthetadx + srcHess.dphi2     *deriv.dphidx) * deriv.dphidx +
-        srcGrad.dr*deriv2.d2rdx2     + srcGrad.dtheta*deriv2.d2thetadx2  + srcGrad.dphi*deriv2.d2phidx2;
-    dest.dxdy =
-        (srcHess.dr2     *deriv.drdy + srcHess.drdtheta  *deriv.dthetady + srcHess.drdphi    *deriv.dphidy) * deriv.drdx +
-        (srcHess.drdtheta*deriv.drdy + srcHess.dtheta2   *deriv.dthetady + srcHess.dthetadphi*deriv.dphidy) * deriv.dthetadx +
-        (srcHess.drdphi  *deriv.drdy + srcHess.dthetadphi*deriv.dthetady + srcHess.dphi2     *deriv.dphidy) * deriv.dphidx +
-        srcGrad.dr*deriv2.d2rdxdy    + srcGrad.dtheta*deriv2.d2thetadxdy + srcGrad.dphi*deriv2.d2phidxdy;
-    dest.dxdz =
-        (srcHess.dr2     *deriv.drdz + srcHess.drdtheta  *deriv.dthetadz) * deriv.drdx +
-        (srcHess.drdtheta*deriv.drdz + srcHess.dtheta2   *deriv.dthetadz) * deriv.dthetadx +
-        (srcHess.drdphi  *deriv.drdz + srcHess.dthetadphi*deriv.dthetadz) * deriv.dphidx +
-        srcGrad.dr*deriv2.d2rdxdz    + srcGrad.dtheta*deriv2.d2thetadxdz;
-    dest.dy2 =
-        (srcHess.dr2     *deriv.drdy + srcHess.drdtheta  *deriv.dthetady + srcHess.drdphi    *deriv.dphidy) * deriv.drdy +
-        (srcHess.drdtheta*deriv.drdy + srcHess.dtheta2   *deriv.dthetady + srcHess.dthetadphi*deriv.dphidy) * deriv.dthetady +
-        (srcHess.drdphi  *deriv.drdy + srcHess.dthetadphi*deriv.dthetady + srcHess.dphi2     *deriv.dphidy) * deriv.dphidy +
-        srcGrad.dr*deriv2.d2rdy2     + srcGrad.dtheta*deriv2.d2thetady2  + srcGrad.dphi*deriv2.d2phidy2;
-    dest.dydz =
-        (srcHess.dr2     *deriv.drdz + srcHess.drdtheta  *deriv.dthetadz) * deriv.drdy +
-        (srcHess.drdtheta*deriv.drdz + srcHess.dtheta2   *deriv.dthetadz) * deriv.dthetady +
-        (srcHess.drdphi  *deriv.drdz + srcHess.dthetadphi*deriv.dthetadz) * deriv.dphidy +
-        srcGrad.dr*deriv2.d2rdydz    + srcGrad.dtheta*deriv2.d2thetadydz;
-    dest.dz2 =
-        (srcHess.dr2     *deriv.drdz + srcHess.drdtheta  *deriv.dthetadz) * deriv.drdz +
-        (srcHess.drdtheta*deriv.drdz + srcHess.dtheta2   *deriv.dthetadz) * deriv.dthetadz +
-        srcGrad.dr*deriv2.d2rdz2     + srcGrad.dtheta*deriv2.d2thetadz2;
-    return dest;
-}
-
-template<>
-HessCyl toHess(const GradCar& srcGrad, const HessCar& srcHess,
-    const PosDerivT<Cyl, Car>& deriv, const PosDeriv2T<Cyl, Car>& deriv2) {
-    HessCyl dest;
-    dest.dR2 =
-        (srcHess.dx2 *deriv.dxdR + srcHess.dxdy*deriv.dydR) * deriv.dxdR +
-        (srcHess.dxdy*deriv.dxdR + srcHess.dy2 *deriv.dydR) * deriv.dydR;
-    dest.dRdz = srcHess.dxdz*deriv.dxdR + srcHess.dydz*deriv.dydR;
-    dest.dRdphi =
-        (srcHess.dx2 *deriv.dxdphi + srcHess.dxdy*deriv.dydphi) * deriv.dxdR +
-        (srcHess.dxdy*deriv.dxdphi + srcHess.dy2 *deriv.dydphi) * deriv.dydR +
-        srcGrad.dx*deriv2.d2xdRdphi + srcGrad.dy*deriv2.d2ydRdphi;
-    dest.dz2 = srcHess.dz2;
-    dest.dzdphi = (srcHess.dxdz*deriv.dxdphi + srcHess.dydz*deriv.dydphi);
-    dest.dphi2 =
-        (srcHess.dx2 *deriv.dxdphi + srcHess.dxdy*deriv.dydphi) * deriv.dxdphi +
-        (srcHess.dxdy*deriv.dxdphi + srcHess.dy2 *deriv.dydphi) * deriv.dydphi +
-        srcGrad.dx*deriv2.d2xdphi2 + srcGrad.dy*deriv2.d2ydphi2;
-    return dest;
-}
-
-template<>
-HessCyl toHess(const GradSph& srcGrad, const HessSph& srcHess,
-    const PosDerivT<Cyl, Sph>& deriv, const PosDeriv2T<Cyl, Sph>& deriv2) {
-    HessCyl dest;
-    dest.dR2 =
-        (srcHess.dr2     *deriv.drdR + srcHess.drdtheta*deriv.dthetadR) * deriv.drdR +
-        (srcHess.drdtheta*deriv.drdR + srcHess.dtheta2 *deriv.dthetadR) * deriv.dthetadR +
-        srcGrad.dr*deriv2.d2rdR2 + srcGrad.dtheta*deriv2.d2thetadR2;
-    dest.dRdz =
-        (srcHess.dr2     *deriv.drdz + srcHess.drdtheta*deriv.dthetadz) * deriv.drdR +
-        (srcHess.drdtheta*deriv.drdz + srcHess.dtheta2 *deriv.dthetadz) * deriv.dthetadR +
-        srcGrad.dr*deriv2.d2rdRdz + srcGrad.dtheta*deriv2.d2thetadRdz;
-    dest.dz2 =
-        (srcHess.dr2     *deriv.drdz + srcHess.drdtheta*deriv.dthetadz) * deriv.drdz +
-        (srcHess.drdtheta*deriv.drdz + srcHess.dtheta2 *deriv.dthetadz) * deriv.dthetadz +
-        srcGrad.dr*deriv2.d2rdz2 + srcGrad.dtheta*deriv2.d2thetadz2;
-    dest.dRdphi = srcHess.drdphi*deriv.drdR + srcHess.dthetadphi*deriv.dthetadR;
-    dest.dzdphi = srcHess.drdphi*deriv.drdz + srcHess.dthetadphi*deriv.dthetadz;
-    dest.dphi2  = srcHess.dphi2;
-    return dest;
-}
-
-template<>
-HessSph toHess(const GradCar& srcGrad, const HessCar& srcHess,
-    const PosDerivT<Sph, Car>& deriv, const PosDeriv2T<Sph, Car>& deriv2) {
-    HessSph dest;
-    dest.dr2 =
-        (srcHess.dx2 *deriv.dxdr + srcHess.dxdy*deriv.dydr + srcHess.dxdz*deriv.dzdr) * deriv.dxdr +
-        (srcHess.dxdy*deriv.dxdr + srcHess.dy2 *deriv.dydr + srcHess.dydz*deriv.dzdr) * deriv.dydr +
-        (srcHess.dxdz*deriv.dxdr + srcHess.dydz*deriv.dydr + srcHess.dz2 *deriv.dzdr) * deriv.dzdr;
-    dest.drdtheta =
-        (srcHess.dx2 *deriv.dxdtheta + srcHess.dxdy*deriv.dydtheta + srcHess.dxdz*deriv.dzdtheta) * deriv.dxdr +
-        (srcHess.dxdy*deriv.dxdtheta + srcHess.dy2 *deriv.dydtheta + srcHess.dydz*deriv.dzdtheta) * deriv.dydr +
-        (srcHess.dxdz*deriv.dxdtheta + srcHess.dydz*deriv.dydtheta + srcHess.dz2 *deriv.dzdtheta) * deriv.dzdr +
-        srcGrad.dx*deriv2.d2xdrdtheta + srcGrad.dy*deriv2.d2ydrdtheta + srcGrad.dz*deriv2.d2zdrdtheta;
-    dest.drdphi =
-        (srcHess.dx2 *deriv.dxdphi + srcHess.dxdy*deriv.dydphi)*deriv.dxdr +
-        (srcHess.dxdy*deriv.dxdphi + srcHess.dy2 *deriv.dydphi)*deriv.dydr +
-        (srcHess.dxdz*deriv.dxdphi + srcHess.dydz*deriv.dydphi)*deriv.dzdr +
-        srcGrad.dx*deriv2.d2xdrdphi + srcGrad.dy*deriv2.d2ydrdphi;
-    dest.dtheta2 =
-        (srcHess.dx2 *deriv.dxdtheta + srcHess.dxdy*deriv.dydtheta + srcHess.dxdz*deriv.dzdtheta) * deriv.dxdtheta +
-        (srcHess.dxdy*deriv.dxdtheta + srcHess.dy2 *deriv.dydtheta + srcHess.dydz*deriv.dzdtheta) * deriv.dydtheta +
-        (srcHess.dxdz*deriv.dxdtheta + srcHess.dydz*deriv.dydtheta + srcHess.dz2 *deriv.dzdtheta) * deriv.dzdtheta +
-        srcGrad.dx*deriv2.d2xdtheta2 + srcGrad.dy*deriv2.d2ydtheta2 + srcGrad.dz*deriv2.d2zdtheta2;
-    dest.dthetadphi =
-        (srcHess.dx2 *deriv.dxdphi + srcHess.dxdy*deriv.dydphi) * deriv.dxdtheta +
-        (srcHess.dxdy*deriv.dxdphi + srcHess.dy2 *deriv.dydphi) * deriv.dydtheta +
-        (srcHess.dxdz*deriv.dxdphi + srcHess.dydz*deriv.dydphi) * deriv.dzdtheta +
-        srcGrad.dx*deriv2.d2xdthetadphi + srcGrad.dy*deriv2.d2ydthetadphi;
-    dest.dphi2 =
-        (srcHess.dx2 *deriv.dxdphi + srcHess.dxdy*deriv.dydphi) * deriv.dxdphi +
-        (srcHess.dxdy*deriv.dxdphi + srcHess.dy2 *deriv.dydphi) * deriv.dydphi +
-        srcGrad.dx*deriv2.d2xdphi2 + srcGrad.dy*deriv2.d2ydphi2;
-    return dest;
-}
-
-template<>
-HessSph toHess(const GradCyl& srcGrad, const HessCyl& srcHess,
-    const PosDerivT<Sph, Cyl>& deriv, const PosDeriv2T<Sph, Cyl>& deriv2) {
-    HessSph dest;
-    dest.dr2 =
-        (srcHess.dR2 *deriv.dRdr + srcHess.dRdz*deriv.dzdr) * deriv.dRdr +
-        (srcHess.dRdz*deriv.dRdr + srcHess.dz2 *deriv.dzdr) * deriv.dzdr;
-    dest.drdtheta =
-        (srcHess.dR2 *deriv.dRdtheta + srcHess.dRdz*deriv.dzdtheta) * deriv.dRdr +
-        (srcHess.dRdz*deriv.dRdtheta + srcHess.dz2 *deriv.dzdtheta) * deriv.dzdr +
-        srcGrad.dR*deriv2.d2Rdrdtheta + srcGrad.dz*deriv2.d2zdrdtheta;
-    dest.dtheta2 =
-        (srcHess.dR2 *deriv.dRdtheta + srcHess.dRdz*deriv.dzdtheta) * deriv.dRdtheta +
-        (srcHess.dRdz*deriv.dRdtheta + srcHess.dz2 *deriv.dzdtheta) * deriv.dzdtheta +
-        srcGrad.dR*deriv2.d2Rdtheta2 + srcGrad.dz*deriv2.d2zdtheta2;
-    dest.drdphi     = srcHess.dRdphi*deriv.dRdr     + srcHess.dzdphi*deriv.dzdr;
-    dest.dthetadphi = srcHess.dRdphi*deriv.dRdtheta + srcHess.dzdphi*deriv.dzdtheta;
-    dest.dphi2      = srcHess.dphi2;
-    return dest;
-}
+// The 6 Car/Cyl/Sph toHess specializations (Car<-Cyl, Car<-Sph, Cyl<-Car, Cyl<-Sph,
+// Sph<-Car, Sph<-Cyl) were promoted to coord.h as AGAMA_DEVICE_INLINE so they are
+// callable from CUDA kernels (Multipole::evalCyl routes through toHess<Sph,Cyl>).
+// The ProlSph/Axi ones below stay host-only: they serve the Stackel action finder
+// and focal-distance finder, both of which stay CPU forever.
 
 //TODO// remove
 template<>
