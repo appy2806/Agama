@@ -28,11 +28,27 @@ LINK_FLAGS_ALL    += -L$(CUDA_LIBDIR) -lcudart
 # nvcc flags for any .cpp routed through nvcc. -x cu treats input as CUDA.
 # --expt-extended-lambda enables `[=] AGAMA_DEVICE` lambdas.
 # --expt-relaxed-constexpr lets constexpr host functions be called from device.
-# Host-side flags (fPIC, OpenMP, -O2) are forwarded via -Xcompiler.
+# Host-side flags are forwarded via -Xcompiler.
+#
+# NVCC_HOST_ARCH must match the -march/-mtune flags the g++ TUs get from
+# Makefile.local's COMPILE_FLAGS_ALL. This is NOT cosmetic. Header leaves tagged
+# AGAMA_DEVICE_INLINE (and every other inline/template in the headers) have vague
+# linkage: nvcc's TUs and g++'s TUs each emit their own weak definition, and the
+# linker keeps ONE for the whole library. If the two were compiled with different
+# arch flags, the surviving copy may be the one WITHOUT FMA contraction, silently
+# changing CPU arithmetic across the entire library. Measured on 2026-07-24: with
+# -march=native missing here, a HAVE_CUDA=1 build differed from the CPU-only build
+# of the same commit on 30 of 57 BFE quantities (CylSpline at ~1e-8 relative in
+# force, triaxial Multipole density up to 1.9e-4) -- and therefore differed from
+# upstream, breaking the bit-for-bit CPU guarantee (hard constraint #3). The
+# CPU-only build was correct; the GPU build was not.
+#
+# Override NVCC_HOST_ARCH if Makefile.local uses something other than -march=native.
+NVCC_HOST_ARCH ?= -march=native
 NVCC_FLAGS_ALL = -arch=$(CUDA_ARCH) --std=c++14 \
                  --expt-extended-lambda --expt-relaxed-constexpr \
                  -DHAVE_CUDA -I$(SRCDIR) \
-                 -Xcompiler "-fPIC -fopenmp -O2 -Wall"
+                 -Xcompiler "-fPIC -fopenmp -O2 -Wall $(NVCC_HOST_ARCH)"
 # -x cu must be placed IMMEDIATELY before a .cpp source to force CUDA compilation.
 # It applies to all subsequent inputs until another -x directive, so we wrap each
 # CUDA source with `-x cu source.cpp -x none`. Naming files .cu would avoid this

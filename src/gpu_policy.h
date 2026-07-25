@@ -26,7 +26,9 @@
 #include <vector>
 #include <algorithm>
 
-#ifdef HAVE_CUDA
+// CUDA headers are pulled in ONLY under nvcc, never into a host (g++) translation
+// unit -- see the AGAMA_CUDA_HOST_VISIBLE note below for why this matters.
+#if defined(HAVE_CUDA) && defined(__CUDACC__)
   #include <cuda_runtime.h>
   #include <stdexcept>
   #include <string>
@@ -44,7 +46,7 @@ namespace agama {
 struct Serial {};
 struct OpenMP {};
 
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) && defined(__CUDACC__)
 struct Cuda {
     int block_size = 256;
     cudaStream_t stream = 0;  // 0 = default stream
@@ -55,7 +57,7 @@ struct Cuda {
 // CUDA error check. Throws std::runtime_error on failure with the CUDA
 // error string attached. AGAMA's existing error path is exception-based.
 // ---------------------------------------------------------------------------
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) && defined(__CUDACC__)
 inline void agama_cuda_check(cudaError_t e, const char* expr, const char* file, int line) {
     if (e != cudaSuccess) {
         std::string msg = "CUDA error at ";
@@ -205,7 +207,29 @@ inline T parallel_reduce_sum(Cuda p, std::size_t N, T init, Op op) {
 // Move-only on CUDA; copyable on CPU (since it's a std::vector underneath).
 // ===========================================================================
 
-#ifdef HAVE_CUDA
+// AGAMA_CUDA_HOST_VISIBLE -- why device_array and the Cuda policy are gated on
+// __CUDACC__ and not merely on HAVE_CUDA:
+//
+// gpu_policy.h is included by potential_analytic.h / potential_composite.h /
+// potential_dehnen.h / potential_disk.h, which are in turn included by ordinary
+// host translation units -- among them potential_factory.cpp, the entry point that
+// builds every Multipole/CylSpline/BasisSet expansion. When the CUDA branches were
+// gated on HAVE_CUDA alone, a HAVE_CUDA=1 build therefore pulled <cuda_runtime.h>
+// into those host TUs, and that MEASURABLY CHANGED CPU RESULTS: on 2026-07-24 a GPU
+// build differed from the CPU-only build of the same commit on 30 of 57 BFE
+// quantities (CylSpline ~1e-8 relative in force; triaxial Multipole density up to
+// 1.9e-4), i.e. it no longer matched upstream, breaking the bit-for-bit CPU
+// guarantee (hard constraint #3). Bisected by building the same commit with
+// -DHAVE_CUDA removed from the g++ TUs only, keeping nvcc and libcudart: that build
+// is bit-identical to the CPU-only one. The CPU-only build was always correct; the
+// GPU build was not.
+//
+// No host TU needs the Cuda policy or device_array (verified: nothing outside
+// potential_gpu.cpp / orbit_gpu.cpp references them), so keeping them nvcc-only
+// costs nothing. In a host TU of a GPU build device_array is DECLARED but not
+// DEFINED, so accidental host use is a compile error rather than an ODR clash with
+// nvcc's definition.
+#if defined(HAVE_CUDA) && defined(__CUDACC__)
 
 template<class T>
 class device_array {
@@ -268,6 +292,10 @@ public:
     std::size_t size() const { return n_; }
     bool   empty() const { return n_ == 0; }
 };
+
+#elif defined(HAVE_CUDA)  // GPU build, host compiler: declare only (see note above)
+
+template<class T> class device_array;
 
 #else  // !HAVE_CUDA — CPU fallback with matching surface.
 
