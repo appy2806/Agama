@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <complex>
 #include <algorithm>
+#include <memory>    // std::unique_ptr (non-zero-initializing device-output landing buffers)
 #include <cstring>   // std::strcmp (CAI passthrough path)
 #include <cstdint>   // uintptr_t  (CAI device-pointer round-trip)
 #ifdef _OPENMP
@@ -8401,6 +8402,117 @@ static const char* docstringOrbit =
     ">>> time, endpoint, (v0,v1,v2,v3,v4,v5), (lyap,Tchaos) = agama.orbit(potential=mypot, "
     "ic=[x,y,z,vx,vy,vz], time=100, trajsize=1, der=True, lyapunov=True, separateTime=True)";
 
+/// Store one orbit's worth of samples from the Tier 3 (device=...) batch-integration
+/// flat output buffer directly into the final NumPy destination(s), without ever
+/// materializing an intermediate orbit::Trajectory object.
+/// \tparam T  precision of the flat source buffer: float (fp32 integration) or
+///            double (fp64 integration) -- a plain function template compiles fine
+///            under -std=c++11 (unlike a generic/polymorphic lambda, which needs C++14).
+/// \param[in] orb          index of this orbit within the batch
+/// \param[in] flatSrc      pointer to this orbit's first sample (trajsize*6 values, T),
+///                          already the raw integrator output in *internal* units
+/// \param[in] trajsize     number of samples per orbit (uniform across the batch)
+/// \param[in] dtype        requested NumPy storage type (NPY_DOUBLE/FLOAT/CDOUBLE/CFLOAT;
+///                          NPY_OBJECT is rejected earlier for the device path)
+/// \param[in] dimPhaseSpace 6 for real dtypes, 3 for complex dtypes
+/// \param[in] sizeofPhaseSpace  byte size of one stored sample (used for the
+///                          preallocated-array offset arithmetic)
+/// \param[in] separateTime whether the preallocated single-array format is in use
+/// \param[in] timestart_ / timetotal_  this orbit's integration start time / duration
+///                          (internal units), used to reproduce the sample placement
+/// \param[in] result_arrays / indexTime / indexTraj  destination(s), same convention
+///                          as the legacy storeTrajectory()/storeOrbitArrays()
+/// \return false on failure (a Python error is then set by the callee), true otherwise
+template<typename T>
+bool storeTrajectoryGPUImpl(npy_intp orb, const T* flatSrc, npy_intp trajsize,
+    int dtype, int dimPhaseSpace, int sizeofPhaseSpace, bool separateTime_,
+    double timestart_, double timetotal_,
+    const std::vector<PyArrayObject*>& result_arrays, npy_intp indexTime, npy_intp indexTraj)
+{
+    const double sgn = timetotal_ >= 0 ? +1 : -1;
+    const double interval = trajsize > 1 ? fabs(timetotal_) / (trajsize - 1) : 0;
+    auto sampleTime = [&](npy_intp j) {
+        return (trajsize == 1 ? timestart_ + timetotal_ : timestart_ + sgn * interval * j) /
+            conv->timeUnit;
+    };
+    auto storePoint = [&](const double point[6], void* dest, npy_intp index) {
+        switch(dtype) {
+            case NPY_DOUBLE:
+                for(int c=0; c<6; c++)
+                    static_cast<double*>(dest)[index*6+c] = point[c];
+                break;
+            case NPY_FLOAT:
+                for(int c=0; c<6; c++)
+                    static_cast<float*>(dest)[index*6+c] = float(point[c]);
+                break;
+            case NPY_CDOUBLE:
+                for(int c=0; c<3; c++)
+                    static_cast<std::complex<double>*>(dest)[index*3+c] =
+                        std::complex<double>(point[c], point[c+3]);
+                break;
+            case NPY_CFLOAT:
+                for(int c=0; c<3; c++)
+                    static_cast<std::complex<float>*>(dest)[index*3+c] =
+                        std::complex<float>(float(point[c]), float(point[c+3]));
+                break;
+            default:
+                assert(!"incorrect dtype");
+        }
+    };
+    if(separateTime_) {
+        // preallocated single arrays, dtype/precision mismatched with the integration
+        // precision (otherwise the directToDest fast path in orbit() would have
+        // handled this orbit already without ever reaching this function)
+        double* outTime = static_cast<double*>(PyArray_DATA(result_arrays[indexTime])) +
+            orb * trajsize;
+        char* outTraj = static_cast<char*>(PyArray_DATA(result_arrays[indexTraj])) +
+            (size_t)orb * trajsize * sizeofPhaseSpace;
+        for(npy_intp j=0; j<trajsize; j++) {
+            outTime[j] = sampleTime(j);
+            const T* w = flatSrc + (size_t)j*6;
+            double point[6] = {
+                double(w[0]) / conv->lengthUnit,  double(w[1]) / conv->lengthUnit,
+                double(w[2]) / conv->lengthUnit,  double(w[3]) / conv->velocityUnit,
+                double(w[4]) / conv->velocityUnit, double(w[5]) / conv->velocityUnit };
+            storePoint(point, outTraj, j);
+        }
+        return true;
+    }
+    // separateTime==False: deprecated 2-column object array, one freshly allocated
+    // pair of NumPy arrays per orbit (dtype != object is guaranteed for the device
+    // path, checked by the caller before trajsize/format validation)
+    PyObject** outputTimeArray =
+        static_cast<PyObject**>(PyArray_DATA(result_arrays[indexTraj])) + orb * 2;
+    PyObject** outputTrajArray = outputTimeArray + 1;
+    npy_intp dims[] = {trajsize, dimPhaseSpace};
+    PyObject *timeArr, *trajArr;
+    {
+        PyAcquireGIL lock;
+        trajArr = PyArray_SimpleNew(2, dims, dtype);
+        if(!trajArr)
+            return false;
+        timeArr = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        if(!timeArr) {
+            Py_DECREF((PyObject*)trajArr);
+            return false;
+        }
+    }
+    *outputTimeArray = timeArr;
+    *outputTrajArray = trajArr;
+    double* outTime = static_cast<double*>(PyArray_DATA((PyArrayObject*)timeArr));
+    void* outTraj = PyArray_DATA((PyArrayObject*)trajArr);
+    for(npy_intp j=0; j<trajsize; j++) {
+        outTime[j] = sampleTime(j);
+        const T* w = flatSrc + (size_t)j*6;
+        double point[6] = {
+            double(w[0]) / conv->lengthUnit,  double(w[1]) / conv->lengthUnit,
+            double(w[2]) / conv->lengthUnit,  double(w[3]) / conv->velocityUnit,
+            double(w[4]) / conv->velocityUnit, double(w[5]) / conv->velocityUnit };
+        storePoint(point, outTraj, j);
+    }
+    return true;
+}
+
 /// run a single orbit or the entire orbit library for a Schwarzschild model
 PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
 {
@@ -8911,16 +9023,50 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
     if(!fail && useDevice) {
         // ---- Tier 3 batch path: all orbits in one integrateOrbitsGPU call
         // (one thread per orbit under the Serial / OpenMP / Cuda backend).
-        // The flat sample buffer is converted back into orbit::Trajectory objects
-        // and handed to the same storeTrajectory() as the legacy path, so the
-        // output format and unit conversion are identical by construction.
+        //
+        // Output-path optimization (host side only; the kernel itself is untouched):
+        // the naive implementation used to (1) value-initialize (zero-fill) a full
+        // Norb*trajsize*6 double buffer, (2) for dtype=float32 additionally integrate
+        // into a float buffer and widen every element to double with a scalar loop,
+        // (3) rebuild an orbit::Trajectory object per orbit from the flat buffer, and
+        // (4) hand that to storeTrajectory(), which copies again into the final NumPy
+        // array(s). That is 3-4 full passes over the trajectory data for what is
+        // fundamentally one conversion (internal units -> user units, double -> storage
+        // dtype). We now:
+        //   - never widen fp32 device output to fp64 (the storage dtype in that case is
+        //     always float32, since deviceFp32 only opts in for a caller-requested
+        //     float32/complex64 dtype) -- read the float buffer directly;
+        //   - allocate the flat device-output landing buffer without zero-fill (the
+        //     kernel is documented to write every sample, real or NAN);
+        //   - when the requested output format is the single-preallocated-array kind
+        //     (separateTime=True; guaranteed uniform trajsize>0 on this path) AND the
+        //     storage dtype matches the integration precision exactly (fp64 dtype with
+        //     fp64 integration, or fp32 dtype with fp32 integration), skip the
+        //     intermediate host buffer entirely and have the kernel's D2H copy land
+        //     straight in the destination NumPy array, then convert units in place;
+        //   - otherwise (dtype/precision mismatch, or the deprecated per-orbit object
+        //     array format with separateTime=False), convert straight from the flat
+        //     device buffer into the final destination without ever materializing an
+        //     orbit::Trajectory object.
         const npy_intp trajsize = trajSize;   // validated above: uniform and >= 1
-        std::vector<double> icFlat((size_t)numOrbits * 6), trajFlat;
+        std::vector<double> icFlat((size_t)numOrbits * 6);
         for(npy_intp i=0; i<numOrbits; i++) {
             const coord::PosVelCar ic = convertPosVel(ic_arr, i);
             ic.unpack_to(&icFlat[i*6]);
         }
+        // Fast path applies only to the two real (non-complex) storage dtypes, only
+        // when the single preallocated 3d/2d array format is in use, and only when
+        // the storage width equals the integration precision -- see comment above.
+        const bool directToDest = separateTime != 0 &&
+            ((deviceFp32 && dtype == NPY_FLOAT) || (!deviceFp32 && dtype == NPY_DOUBLE));
+
         int rc = orbit::ORBIT_GPU_OK;
+        // Intermediate flat landing buffers for the non-direct case, in the native
+        // integration precision; deliberately NOT value-initialized (`new T[n]`
+        // performs no initialization for a scalar type), since every element is
+        // guaranteed to be overwritten by the kernel (real sample or NAN).
+        std::unique_ptr<double[]> trajFlatD;
+        std::unique_ptr<float[]>  trajFlatF;
         {
             PyReleaseGIL unlock;
             // map the validated integrator choice onto the batch method enum
@@ -8930,18 +9076,69 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
             // exceptions (e.g. CUDA errors) must not escape through the
             // GIL-released region -- captured and re-raised after it
             try{
-                trajFlat.resize((size_t)numOrbits * trajsize * 6);
-                if(deviceFp32) {
-                    std::vector<float> trajF((size_t)numOrbits * trajsize * 6);
+                if(directToDest) {
+                    // the kernel's D2H copy writes straight into the final NumPy
+                    // trajectory buffer -- no intermediate host allocation at all.
+                    void* dst = PyArray_DATA(result_arrays[indexTraj]);
+                    if(deviceFp32)
+                        rc = orbit::integrateOrbitsGPU<float>(*pot, numOrbits, icFlat.data(),
+                            timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
+                            static_cast<float*>(dst), deviceStr.c_str(), gpuMethod,
+                            timestart.data());
+                    else
+                        rc = orbit::integrateOrbitsGPU<double>(*pot, numOrbits, icFlat.data(),
+                            timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
+                            static_cast<double*>(dst), deviceStr.c_str(), gpuMethod,
+                            timestart.data());
+                    if(rc == orbit::ORBIT_GPU_OK) {
+                        // convert units in place (single pass, still under released GIL)
+                        const size_t N = (size_t)numOrbits * (size_t)trajsize;
+                        if(deviceFp32) {
+                            float* buf = static_cast<float*>(dst);
+                            for(size_t n=0; n<N; n++) {
+                                float* w = buf + n*6;
+                                w[0] = float(w[0] / conv->lengthUnit);
+                                w[1] = float(w[1] / conv->lengthUnit);
+                                w[2] = float(w[2] / conv->lengthUnit);
+                                w[3] = float(w[3] / conv->velocityUnit);
+                                w[4] = float(w[4] / conv->velocityUnit);
+                                w[5] = float(w[5] / conv->velocityUnit);
+                            }
+                        } else {
+                            double* buf = static_cast<double*>(dst);
+                            for(size_t n=0; n<N; n++) {
+                                double* w = buf + n*6;
+                                w[0] /= conv->lengthUnit;
+                                w[1] /= conv->lengthUnit;
+                                w[2] /= conv->lengthUnit;
+                                w[3] /= conv->velocityUnit;
+                                w[4] /= conv->velocityUnit;
+                                w[5] /= conv->velocityUnit;
+                            }
+                        }
+                        // fill the (also preallocated) timestamps array
+                        double* outTime = static_cast<double*>(PyArray_DATA(result_arrays[indexTime]));
+                        for(npy_intp orb=0; orb<numOrbits; orb++) {
+                            const double sgn = timetotal[orb] >= 0 ? +1 : -1;
+                            const double interval = trajsize > 1 ?
+                                fabs(timetotal[orb]) / (trajsize - 1) : 0;
+                            for(npy_intp j=0; j<trajsize; j++)
+                                outTime[(size_t)orb*trajsize+j] = (trajsize == 1 ?
+                                    timestart[orb] + timetotal[orb] :
+                                    timestart[orb] + sgn * interval * j) / conv->timeUnit;
+                        }
+                    }
+                } else if(deviceFp32) {
+                    trajFlatF.reset(new float[(size_t)numOrbits * trajsize * 6]);
                     rc = orbit::integrateOrbitsGPU<float>(*pot, numOrbits, icFlat.data(),
                         timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
-                        trajF.data(), deviceStr.c_str(), gpuMethod, timestart.data());
-                    for(size_t j=0; j<trajF.size(); j++)
-                        trajFlat[j] = trajF[j];
-                } else
+                        trajFlatF.get(), deviceStr.c_str(), gpuMethod, timestart.data());
+                } else {
+                    trajFlatD.reset(new double[(size_t)numOrbits * trajsize * 6]);
                     rc = orbit::integrateOrbitsGPU<double>(*pot, numOrbits, icFlat.data(),
                         timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
-                        trajFlat.data(), deviceStr.c_str(), gpuMethod, timestart.data());
+                        trajFlatD.get(), deviceStr.c_str(), gpuMethod, timestart.data());
+                }
             }
             catch(std::exception& ex) {
                 errorMessage = ex.what();
@@ -8979,22 +9176,29 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
             }
             fail = true;   // the cleanup below respects an already-set Python error
         }
-        for(npy_intp orb = 0; orb < numOrbits && !fail; orb++) {
-            const double sgn = timetotal[orb] >= 0 ? +1 : -1;
-            const double interval = trajsize > 1 ?
-                fabs(timetotal[orb]) / (trajsize - 1) : 0;
-            orbit::Trajectory traj((size_t)trajsize);
-            for(npy_intp j = 0; j < trajsize; j++) {
-                const double* w = &trajFlat[((size_t)orb * trajsize + j) * 6];
-                traj[j].first  = coord::PosVelCar(w[0], w[1], w[2], w[3], w[4], w[5]);
-                // sample times replicate RuntimeTrajectory: t0 + sign*interval*j;
-                // a single sample (trajsize=1) holds the final state
-                traj[j].second = trajsize == 1 ? timestart[orb] + timetotal[orb] :
-                    timestart[orb] + sgn * interval * j;
+        if(!fail && directToDest) {
+            // everything (units + timestamps) was already written above, in bulk
+            numCompleted = numOrbits;
+        } else if(!fail) {
+            // Convert straight from the flat device buffer (native integration
+            // precision) into the final destination -- no orbit::Trajectory
+            // reconstruction step. storeTrajectoryGPUImpl<T>() applies the same
+            // per-component unit conversion and dtype narrowing/packing as
+            // storeOrbitArrays(), with normFactor implicitly 1 ('der' and 'lyapunov'
+            // are rejected for the device path, so no deviation vectors with a
+            // non-unit normFactor ever reach this branch).
+            for(npy_intp orb = 0; orb < numOrbits && !fail; orb++) {
+                bool ok = deviceFp32 ?
+                    storeTrajectoryGPUImpl<float>(orb, trajFlatF.get() + (size_t)orb*trajsize*6,
+                        trajsize, dtype, dimPhaseSpace, sizeofPhaseSpace, separateTime != 0,
+                        timestart[orb], timetotal[orb], result_arrays, indexTime, indexTraj) :
+                    storeTrajectoryGPUImpl<double>(orb, trajFlatD.get() + (size_t)orb*trajsize*6,
+                        trajsize, dtype, dimPhaseSpace, sizeofPhaseSpace, separateTime != 0,
+                        timestart[orb], timetotal[orb], result_arrays, indexTime, indexTraj);
+                if(!ok)
+                    fail = true;
+                ++numCompleted;
             }
-            if(!storeTrajectory(orb, traj))
-                fail = true;
-            ++numCompleted;
         }
     }
     else if(!fail) {
