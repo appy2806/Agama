@@ -94,29 +94,58 @@ AGAMA_DEVICE_INLINE T isochrone_phi(T mass, T scaleRadius, T r) {
     return phi;
 }
 
+/** Crossover r/r_s between the closed-form NFW expressions and their Pade expansions at
+    r->0. This has to depend on the precision: above the crossover, dPhi/dr and d2Phi/dr2
+    subtract two nearly-equal O(1/r_s) terms, so the closed form loses ~eps/rrel^2 relative
+    accuracy to cancellation, while the Pade truncation error grows with rrel. The optimum
+    therefore scales as sqrt(eps) and sits ~20x higher in single precision. Measured
+    worst-case relative error over rrel in [1e-5, 100] against an 80-bit reference:
+
+                       fp64 thresholds     fp32 threshold
+                       used in fp32        0.25
+        Phi              3.7e-6              3.1e-7
+        dPhi/dr          4.7e-4              3.1e-6
+        d2Phi/dr2        4.5e-2              3.3e-5
+
+    The fp64 values are upstream's tuned constants and MUST NOT change -- fp64 is
+    bit-for-bit legacy behaviour (hard constraint #3). In fp32 one crossover is within 40%
+    of the per-quantity optimum for all three quantities, so unlike fp64 there is nothing
+    to gain from three separate constants. */
+template<typename T> struct nfw_pade_guard;   // no default: an unsupported T won't compile
+template<> struct nfw_pade_guard<double> {
+    static AGAMA_DEVICE_INLINE double potential() { return 0.016; }
+    static AGAMA_DEVICE_INLINE double deriv()     { return 0.013; }
+    static AGAMA_DEVICE_INLINE double deriv2()    { return 0.010; }
+};
+template<> struct nfw_pade_guard<float> {
+    static AGAMA_DEVICE_INLINE float potential() { return 0.25f; }
+    static AGAMA_DEVICE_INLINE float deriv()     { return 0.25f; }
+    static AGAMA_DEVICE_INLINE float deriv2()    { return 0.25f; }
+};
+
 /** NFW:  Phi(r) = -M ln(1+r/r_s) / r, plus dPhi/dr and d2Phi/dr2, each with
-    its own accurate Pade expansion at r->0 (thresholds copied from the CPU code). */
+    its own accurate Pade expansion at r->0 (see nfw_pade_guard for the thresholds). */
 template<typename T>
 AGAMA_DEVICE_INLINE void nfw_eval(T mass, T scaleRadius, T r,
     T* potential, T* deriv, T* deriv2)
 {
     T rrel = r / scaleRadius;
     T ln_over_r = r == T(INFINITY) ? T(0) :
-        rrel > T(0.016) ? std::log(T(1) + rrel) / r :
+        rrel > nfw_pade_guard<T>::potential() ? std::log(T(1) + rrel) / r :
         // accurate (14 digits) asymptotic Pade(2,3) expansion at r->0
         (T(1) + rrel * (T(1) + T(11./60) * rrel)) /
         (T(1) + rrel * (T(1.5) + rrel * (T(0.6) + rrel * T(0.05)))) / scaleRadius;
     if(potential)
         *potential = -mass * ln_over_r;
     if(deriv)
-        *deriv = mass * (rrel > T(0.013) ?
+        *deriv = mass * (rrel > nfw_pade_guard<T>::deriv() ?
             (ln_over_r - T(1)/(r+scaleRadius)) / r :
             // accurate (12 digits) asymptotic Pade(1,3) expansion at r->0
             (T(0.5) + T(17./96) * rrel) /
             (T(1) + rrel * (T(27./16) + rrel * (T(0.75) + T(11./160) * rrel))) /
             pow_2(scaleRadius));
     if(deriv2)
-        *deriv2 = -mass * (rrel > T(0.010) ?
+        *deriv2 = -mass * (rrel > nfw_pade_guard<T>::deriv2() ?
             (T(2)*ln_over_r - (T(2)*scaleRadius + T(3)*r) / pow_2(scaleRadius+r) ) / pow_2(r) :
             // accurate (10 digits) asymptotic Pade(2,3) expansion at r->0
             T(1) / (T(1.5) + rrel * (T(27./8) + rrel * (T(351./160) + T(183./640) * rrel))) /
