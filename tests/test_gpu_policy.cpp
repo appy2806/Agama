@@ -21,6 +21,7 @@
 #include "orbit.h"                  // orbit::integrateTraj (CPU reference integrator)
 #include "orbit_gpu.h"              // orbit::integrateOrbitsGPU (Tier 3 batch path)
 #include <cstdio>
+#include <cstring>   // std::memcmp (bitwise trajectory comparison, NAN-safe)
 #include <vector>
 #include <cmath>
 #include <chrono>
@@ -486,6 +487,80 @@ int main() {
             "NaN: %s -> %s\n", max_dE_f, DE_TOL_F, nan_f ? "yes" : "no", ok_orb_f ? "OK" : "FAIL");
 
         ok_t3 = ok_t3 && ok_orb_cuda && ok_orb_f;
+
+        // ----- (d) device-resident output: integrateOrbitsGPUDevice -----
+        // The whole point of the device-output entry point is that it changes WHERE
+        // the trajectory lands and nothing else, so the gate is exact equality with
+        // the host-output result, not a tolerance. Anything less would let a real
+        // divergence (a missed spline upload, a different accuracy clamp, a dropped
+        // NAN prefill) hide inside a "close enough" threshold.
+        {
+            bool ok_dev = true;
+            auto check_device_output = [&](auto tag, const char* tname,
+                const std::vector<decltype(tag)>& traj_host, double accuracy)
+            {
+                typedef decltype(tag) T;
+                const std::size_t n6 = NORB * TRAJ * 6;
+                T* d_traj = NULL;
+                if(cudaMalloc(&d_traj, n6 * sizeof(T)) != cudaSuccess) {
+                    std::printf("[CUDA]  device-resident orbits %s: cudaMalloc FAILED\n", tname);
+                    ok_dev = false;
+                    return;
+                }
+                int rc_d = orbit::integrateOrbitsGPUDevice<T>(pot, NORB, ic.data(),
+                    times.data(), TRAJ, accuracy, 100000000, d_traj, /*output_stream*/ 0);
+                std::vector<T> back(n6);
+                cudaMemcpy(back.data(), d_traj, n6 * sizeof(T), cudaMemcpyDeviceToHost);
+                // bit-for-bit, including NAN slots: compare the raw bit patterns so a
+                // NAN never compares unequal to itself and mask a real mismatch
+                std::size_t ndiff = 0;
+                for(std::size_t j = 0; j < n6; j++) {
+                    T a = back[j], b = traj_host[j];
+                    if(std::memcmp(&a, &b, sizeof(T)) != 0)
+                        ndiff++;
+                }
+                bool ok = rc_d == 0 && ndiff == 0;
+                std::printf("[CUDA]  device-resident orbits %s vs host-resident: "
+                    "%zu/%zu values differ -> %s\n", tname, ndiff, n6, ok ? "OK (bitwise)" : "FAIL");
+                ok_dev = ok_dev && ok;
+
+                // scaleTrajectoryGPUDevice must reproduce the host unit conversion
+                // exactly (promote to double, divide, round once) -- see orbit_gpu.h.
+                const double LU = 1.234567890123, VU = 0.98765432109;
+                int rc_s2 = orbit::scaleTrajectoryGPUDevice<T>(NORB * TRAJ, d_traj, LU, VU);
+                std::vector<T> scaled(n6);
+                cudaMemcpy(scaled.data(), d_traj, n6 * sizeof(T), cudaMemcpyDeviceToHost);
+                std::size_t nsdiff = 0;
+                for(std::size_t i = 0; i < NORB * TRAJ; i++) {
+                    for(int k = 0; k < 6; k++) {
+                        // exactly what the host directToDest loop computes
+                        T want = T(double(traj_host[i*6+k]) / (k < 3 ? LU : VU));
+                        T got  = scaled[i*6+k];
+                        if(std::memcmp(&got, &want, sizeof(T)) != 0)
+                            nsdiff++;
+                    }
+                }
+                bool ok_s = rc_s2 == 0 && nsdiff == 0;
+                std::printf("[CUDA]  scaleTrajectoryGPUDevice %s vs host unit conversion: "
+                    "%zu/%zu values differ -> %s\n", tname, nsdiff, n6,
+                    ok_s ? "OK (bitwise)" : "FAIL");
+                ok_dev = ok_dev && ok_s;
+                cudaFree(d_traj);
+            };
+            check_device_output(double{}, "fp64", traj_c, ACC);
+            check_device_output(float{},  "fp32", traj_f, 1e-5);
+
+            // A NULL destination must be rejected rather than dereferenced. (There is
+            // no "wrong device" case to test: this entry point takes no device string
+            // -- being CUDA-only is expressed in the signature, not validated at
+            // runtime -- so a NULL buffer is the only misuse it can catch.)
+            int rc_null = orbit::integrateOrbitsGPUDevice<double>(pot, NORB, ic.data(),
+                times.data(), TRAJ, ACC, 100000000, (double*)NULL, 0);
+            bool ok_null = rc_null == orbit::ORBIT_GPU_EUNSUPP;
+            std::printf("[CUDA]  device-resident orbits, NULL destination rejected: "
+                "rc=%d -> %s\n", rc_null, ok_null ? "OK" : "FAIL");
+            ok_t3 = ok_t3 && ok_dev && ok_null;
+        }
 #endif
         if(!ok_t3) {
             std::fprintf(stderr, "FAIL (Tier 3 orbit integration)\n");

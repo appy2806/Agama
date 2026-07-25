@@ -109,4 +109,83 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                            OrbitIntegrator's timeBegin. */
                        const double* timeStart = NULL);
 
+/** Device-resident-output variant of integrateOrbitsGPU: the trajectory is left in
+    a caller-supplied GPU buffer and never copied to the host.
+
+    This exists because the output is where the volume is. The initial conditions are
+    6*Norb doubles (2.4 MB at Norb=50k) but the trajectory is Norb*trajsize*6 values
+    (307 MB at Norb=50k, trajsize=256, fp32) — two orders of magnitude more. A
+    workflow that integrates orbits and then evaluates a DF or bins a density on the
+    GPU should never round-trip that through host memory: the host output path was
+    measured at roughly 1 GB/s effective and was 58% of fp32 orbit wall time before
+    commit `ec4f269`, against on-device bandwidth two orders of magnitude higher.
+
+    Everything except the trajectory destination stays a host pointer: `ic`, `times`
+    and `timeStart` are all O(Norb) and are uploaded internally exactly as the
+    host-output entry point does, so there is no benefit to making the caller manage
+    them and no change in their meaning.
+
+    Synchronization contract, matching `potential::evalPotentialGPUDevice`:
+    - if `output_stream` names a real producer stream (nonzero and not the
+      __cuda_array_interface__ v3 sentinels 1 = legacy default stream, 2 =
+      per-thread default stream), it is cudaStreamSynchronize'd BEFORE the kernel
+      launches, so any prior work the producer enqueued on `d_traj` is complete;
+    - this call's own stream is always synchronized before returning, so `d_traj` is
+      fully written on return and the caller may consume it on any stream.
+
+    Same v1 multi-GPU limitation as the potential device entry points: the
+    __cuda_array_interface__ carries no device id, so `d_traj` must live on the same
+    device as AGAMA's CUDA context (the calling process's current device).
+
+    `d_traj` holds values in **internal units**, exactly like the `traj` argument of
+    the host-output overload — this function performs no unit conversion. Use
+    scaleTrajectoryGPUDevice() below when the caller's unit system is non-trivial.
+
+    CUDA-only by construction: there is no such thing as a device-resident buffer
+    under device="cpu"/"openmp"/"serial", so this entry point takes no `device`
+    argument at all rather than accepting one and rejecting most of its values.
+    Returns ORBIT_GPU_ENOTBUILT when built with HAVE_CUDA=0, and ORBIT_GPU_EUNSUPP
+    for a NULL `d_traj`.
+
+    \param  d_traj  output DEVICE buffer, length Norb*trajsize*6, same packing and
+                    same NAN-fill-on-unreached-sample guarantee as `traj` above. */
+template<typename T>
+int integrateOrbitsGPUDevice(const potential::BasePotential& pot,
+                             std::size_t Norb,
+                             const double* ic,
+                             const double* times,
+                             std::size_t trajsize,
+                             double accuracy,
+                             std::size_t maxNumSteps,
+                             T* d_traj,
+                             unsigned long long output_stream,
+                             int method = ORBIT_GPU_DOP853,
+                             const double* timeStart = NULL);
+
+/** Convert a device-resident trajectory buffer from internal units to the caller's
+    unit system, in place: positions are divided by `lengthUnit` and velocities by
+    `velocityUnit`.
+
+    Kept separate from integrateOrbitsGPUDevice rather than folded into the orbit
+    kernel for two reasons: the integrator's documented contract is that it works
+    purely in internal units, and folding a scale into the per-sample store would put
+    it on the hot path of every call including the overwhelmingly common one where
+    both factors are exactly 1 (no unit system configured), where the caller should
+    skip this entirely.
+
+    The division is performed in **double** even when T=float, and by division rather
+    than by multiplication by a precomputed reciprocal. That is deliberate: it
+    reproduces the host path's `float(w[k] / conv->lengthUnit)` — promote to double,
+    divide, round once to float — so a device-resident result is bit-identical to the
+    host-resident one rather than merely close. On a consumer card with a 1:64
+    fp64:fp32 ratio those are slow double divisions, which is accepted because this is
+    one pass over the buffer on a path only taken under a non-trivial unit system.
+
+    \param  n  number of PHASE-SPACE SAMPLES (Norb*trajsize), not the element count;
+               each sample is 6 consecutive values [x,y,z,vx,vy,vz]. */
+template<typename T>
+int scaleTrajectoryGPUDevice(std::size_t n, T* d_traj,
+                             double lengthUnit, double velocityUnit,
+                             unsigned long long output_stream = 0);
+
 }  // namespace orbit

@@ -337,6 +337,57 @@ void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc, int method,
             trajsize, accuracy, maxNumSteps, traj);
 }
 
+/** Shared prologue of the host-output and device-output entry points: validate the
+    request, build the GPU force descriptor, and derive the working-precision accuracy.
+    Extracted so the two public functions cannot drift apart -- in particular so the
+    device-output path cannot miss the spline-buffer argument that makes time-VARYING
+    modifier chains re-evaluable per step rather than silently frozen at t=0.
+    Does NOT set desc.splineData: the caller points it at host or device memory
+    depending on the policy it is about to run. */
+template<typename T>
+int prepareOrbitBatch(const potential::BasePotential& pot, std::size_t trajsize,
+    double accuracy, int method,
+    potential::GpuPotDesc<T>& desc, std::vector<T>& splineT, T& accT)
+{
+    if(trajsize < 1)
+        return ORBIT_GPU_EUNSUPP;
+    if(method != ORBIT_GPU_DOP853 && method != ORBIT_GPU_DPRKN8)
+        return ORBIT_GPU_EUNSUPP;
+    potential::GpuPotDesc<double> desc0;
+    // Pass a spline buffer, which is what tells the builder to emit re-evaluable
+    // GpuModStage entries for time-VARYING modifier chains instead of folding them
+    // at one nominal time. That distinction is load-bearing here: the descriptor is
+    // built ONCE and then evaluated at every RK stage of every orbit, at times this
+    // function never sees, so a folded moving potential would silently integrate a
+    // frozen snapshot. Constant chains are still folded on the host and cost the
+    // kernel nothing.
+    std::vector<double> splineData0;
+    if(!potential::buildGpuPotDesc(pot, desc0, /*time*/ 0, &splineData0))
+        return ORBIT_GPU_EUNSUPP;
+    desc = potential::castGpuPotDesc<T>(desc0);
+    // Spline coefficients in the kernel's working precision; `desc.splineData` is
+    // pointed at whichever memory space the chosen policy will read from, by the caller.
+    splineT = potential::castGpuSplineData<T>(splineData0);
+    // Per-method base tolerance (in double): DPRKN8 applies the SAME empirical
+    // rescaling as the CPU OdeStepperDPRKN8 constructor (10 * accuracy^0.9) so
+    // the user-facing `accuracy` has an identical meaning for both methods and
+    // the batch result matches the CPU stepper bit-for-bit in double.
+    const double accBase = method == ORBIT_GPU_DPRKN8
+        ? 10.0 * std::pow(accuracy, 0.9) : accuracy;
+    // Working-precision floor on the accuracy parameter: an accRel near or below
+    // one ULP of T (e.g. the fp64-oriented default 1e-8 under T=float) is
+    // unattainable -- the error estimate sits at the rounding-noise floor, so the
+    // adaptive controller grinds through micro-steps (measured 30-100x SLOWER than
+    // fp64, with NaNs when the stepper gives up). 10 ULP is the measured knee on
+    // this workload: for T=float the default 1e-8 clamps to ~1.2e-6 (123k orbits/s,
+    // |dE/E| ~ 8e-6 on the crosscheck workload; explicitly passing accuracy~1e-5
+    // reaches ~300k orbits/s). A no-op for T=double at any sane accuracy. The
+    // clamp is applied AFTER the per-method rescaling so DPRKN8 in fp32 is guarded
+    // too.
+    accT = T(std::max(accBase, 10 * double(std::numeric_limits<T>::epsilon())));
+    return ORBIT_GPU_OK;
+}
+
 #ifdef HAVE_CUDA
 /* ---- Path A: per-call CUDA streams --------------------------------------
    Each integrateOrbitsGPU call runs on its OWN non-blocking stream with
@@ -407,6 +458,82 @@ struct StreamBuffer {
         AGAMA_CUDA_CHECK(cudaMemcpyAsync(h, d, n * sizeof(T), cudaMemcpyDeviceToHost, s));
     }
 };
+
+/// Order this call against a producer that wrote a caller-supplied device buffer on
+/// a different stream. Values 1 and 2 are the __cuda_array_interface__ v3 sentinels
+/// for the legacy default stream and the per-thread default stream respectively, and
+/// 0 means the key was absent -- none of them names a stream we can or should
+/// synchronize, so they are skipped. Mirrors the contract of the potential device
+/// entry points so a caller reasons about one rule, not two.
+void syncProducerStream(unsigned long long producer_stream)
+{
+    if(producer_stream > 2)
+        AGAMA_CUDA_CHECK(cudaStreamSynchronize(
+            reinterpret_cast<cudaStream_t>(producer_stream)));
+}
+
+/** Shared CUDA body of the host-output and device-output entry points.
+
+    Exactly one of `d_trajCaller` (a device buffer owned by the caller, left in place)
+    and `h_traj` (a host buffer, filled by a D2H copy) must be non-NULL; that single
+    difference is the entire distinction between the two public functions, so keeping
+    one body means the stream discipline, the spline-data wiring and the NAN-fill
+    guarantee cannot diverge between them.
+
+    `ic`, `times` and `timeStart` are host pointers in both cases -- they are O(Norb)
+    and uploaded here. `desc` is taken by value-modifying reference because
+    desc.splineData must be repointed at the device spline buffer allocated below. */
+template<typename T>
+int cudaOrbitBatch(potential::GpuPotDesc<T>& desc, const std::vector<T>& splineT,
+    std::size_t Norb, const double* ic, const double* times, std::size_t trajsize,
+    T accT, std::size_t maxNumSteps, int method, const double* timeStart,
+    T* d_trajCaller, T* h_traj, unsigned long long producer_stream)
+{
+    if(Norb == 0)
+        return ORBIT_GPU_OK;
+    // ICs in working precision (identity copy for T=double)
+    std::vector<T> icT(Norb * 6);
+    for(std::size_t j = 0; j < Norb * 6; j++)
+        icT[j] = static_cast<T>(ic[j]);
+    // Path A: the whole call (allocation, copies, kernel, teardown) is
+    // ordered on its own non-blocking stream, so concurrent calls from
+    // different host threads overlap on the GPU. Per-call RAII buffers,
+    // no shared scratch, no mutex: orbit batches amortize the allocation
+    // cost over thousands of ODE steps.
+    OrbitCallStream stream;
+    StreamBuffer<T>      d_ic   (Norb * 6, stream.s);
+    StreamBuffer<double> d_times(Norb,     stream.s);
+    // Allocate a trajectory buffer only when the caller did not supply one. Length 0
+    // is a legal cudaMallocAsync/cudaMalloc request and yields a NULL/unused pointer.
+    StreamBuffer<T>      d_trajOwned(d_trajCaller ? 0 : Norb * trajsize * 6, stream.s);
+    T* d_traj = d_trajCaller ? d_trajCaller : d_trajOwned.data();
+    // modifier spline coefficients must be device-resident for the kernel to
+    // re-evaluate the chain per step; empty for a time-independent potential
+    StreamBuffer<T>      d_spline(splineT.size(),        stream.s);
+    StreamBuffer<double> d_tstart(timeStart ? Norb : 0,  stream.s);
+    d_ic.from_host(icT.data(), Norb * 6);
+    d_times.from_host(times, Norb);
+    if(!splineT.empty()) {
+        d_spline.from_host(splineT.data(), splineT.size());
+        desc.splineData = d_spline.data();
+    }
+    if(timeStart)
+        d_tstart.from_host(timeStart, Norb);
+    // If the caller's buffer came from another stream's producer, make that work
+    // visible before we launch. No-op for the host-output path (producer_stream 0).
+    syncProducerStream(producer_stream);
+    agama::Cuda pol;
+    pol.stream = stream.s;
+    run_batch<T>(pol, desc, method, Norb, d_ic.data(), d_times.data(),
+        timeStart ? d_tstart.data() : NULL,
+        trajsize, accT, maxNumSteps, d_traj);
+    if(h_traj)
+        d_trajOwned.to_host(h_traj, Norb * trajsize * 6);
+    // wait only for THIS call's work; other threads' streams keep running. For the
+    // device-output path this is what lets the caller consume d_traj on any stream.
+    AGAMA_CUDA_CHECK(cudaStreamSynchronize(stream.s));
+    return ORBIT_GPU_OK;
+}
 #endif  // HAVE_CUDA
 
 }  // anonymous namespace
@@ -424,42 +551,15 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                        int method,
                        const double* timeStart)
 {
-    if(trajsize < 1)
-        return ORBIT_GPU_EUNSUPP;
-    if(method != ORBIT_GPU_DOP853 && method != ORBIT_GPU_DPRKN8)
-        return ORBIT_GPU_EUNSUPP;
-    potential::GpuPotDesc<double> desc0;
-    // Pass a spline buffer, which is what tells the builder to emit re-evaluable
-    // GpuModStage entries for time-VARYING modifier chains instead of folding them
-    // at one nominal time. That distinction is load-bearing here: the descriptor is
-    // built ONCE and then evaluated at every RK stage of every orbit, at times this
-    // function never sees, so a folded moving potential would silently integrate a
-    // frozen snapshot. Constant chains are still folded on the host and cost the
-    // kernel nothing.
-    std::vector<double> splineData0;
-    if(!potential::buildGpuPotDesc(pot, desc0, /*time*/ 0, &splineData0))
-        return ORBIT_GPU_EUNSUPP;
-    potential::GpuPotDesc<T> desc = potential::castGpuPotDesc<T>(desc0);
-    // Spline coefficients in the kernel's working precision; `desc.splineData` is
-    // pointed at whichever memory space the chosen policy will read from, below.
-    const std::vector<T> splineT = potential::castGpuSplineData<T>(splineData0);
-    // Per-method base tolerance (in double): DPRKN8 applies the SAME empirical
-    // rescaling as the CPU OdeStepperDPRKN8 constructor (10 * accuracy^0.9) so
-    // the user-facing `accuracy` has an identical meaning for both methods and
-    // the batch result matches the CPU stepper bit-for-bit in double.
-    const double accBase = method == ORBIT_GPU_DPRKN8
-        ? 10.0 * std::pow(accuracy, 0.9) : accuracy;
-    // Working-precision floor on the accuracy parameter: an accRel near or below
-    // one ULP of T (e.g. the fp64-oriented default 1e-8 under T=float) is
-    // unattainable -- the error estimate sits at the rounding-noise floor, so the
-    // adaptive controller grinds through micro-steps (measured 30-100x SLOWER than
-    // fp64, with NaNs when the stepper gives up). 10 ULP is the measured knee on
-    // this workload: for T=float the default 1e-8 clamps to ~1.2e-6 (123k orbits/s,
-    // |dE/E| ~ 8e-6 on the crosscheck workload; explicitly passing accuracy~1e-5
-    // reaches ~300k orbits/s). A no-op for T=double at any sane accuracy. The
-    // clamp is applied AFTER the per-method rescaling so DPRKN8 in fp32 is guarded
-    // too.
-    const T accT = T(std::max(accBase, 10 * double(std::numeric_limits<T>::epsilon())));
+    potential::GpuPotDesc<T> desc;
+    std::vector<T> splineT;
+    T accT;
+    {
+        const int rc = prepareOrbitBatch<T>(pot, trajsize, accuracy, method,
+            desc, splineT, accT);
+        if(rc != ORBIT_GPU_OK)
+            return rc;
+    }
 
     if(std::strcmp(device, "cpu") == 0 || std::strcmp(device, "openmp") == 0 ||
        std::strcmp(device, "serial") == 0) {
@@ -478,41 +578,9 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
     }
     if(std::strcmp(device, "cuda") == 0) {
 #ifdef HAVE_CUDA
-        if(Norb == 0)
-            return ORBIT_GPU_OK;
-        std::vector<T> icT(Norb * 6);
-        for(std::size_t j = 0; j < Norb * 6; j++)
-            icT[j] = static_cast<T>(ic[j]);
-        // Path A: the whole call (allocation, copies, kernel, teardown) is
-        // ordered on its own non-blocking stream, so concurrent calls from
-        // different host threads overlap on the GPU. Per-call RAII buffers,
-        // no shared scratch, no mutex: orbit batches amortize the allocation
-        // cost over thousands of ODE steps.
-        OrbitCallStream stream;
-        StreamBuffer<T>      d_ic   (Norb * 6,            stream.s);
-        StreamBuffer<double> d_times(Norb,                stream.s);
-        StreamBuffer<T>      d_traj (Norb * trajsize * 6, stream.s);
-        // modifier spline coefficients must be device-resident for the kernel to
-        // re-evaluate the chain per step; empty for a time-independent potential
-        StreamBuffer<T>      d_spline(splineT.size(),        stream.s);
-        StreamBuffer<double> d_tstart(timeStart ? Norb : 0,  stream.s);
-        d_ic.from_host(icT.data(), Norb * 6);
-        d_times.from_host(times, Norb);
-        if(!splineT.empty()) {
-            d_spline.from_host(splineT.data(), splineT.size());
-            desc.splineData = d_spline.data();
-        }
-        if(timeStart)
-            d_tstart.from_host(timeStart, Norb);
-        agama::Cuda pol;
-        pol.stream = stream.s;
-        run_batch<T>(pol, desc, method, Norb, d_ic.data(), d_times.data(),
-            timeStart ? d_tstart.data() : NULL,
-            trajsize, accT, maxNumSteps, d_traj.data());
-        d_traj.to_host(traj, Norb * trajsize * 6);
-        // wait only for THIS call's work; other threads' streams keep running
-        AGAMA_CUDA_CHECK(cudaStreamSynchronize(stream.s));
-        return ORBIT_GPU_OK;
+        return cudaOrbitBatch<T>(desc, splineT, Norb, ic, times, trajsize,
+            accT, maxNumSteps, method, timeStart,
+            /*d_trajCaller*/ NULL, /*h_traj*/ traj, /*producer_stream*/ 0);
 #else
         return ORBIT_GPU_ENOTBUILT;
 #endif
@@ -520,10 +588,90 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
     return ORBIT_GPU_EBADDEV;
 }
 
+template<typename T>
+int integrateOrbitsGPUDevice(const potential::BasePotential& pot,
+                             std::size_t Norb,
+                             const double* ic,
+                             const double* times,
+                             std::size_t trajsize,
+                             double accuracy,
+                             std::size_t maxNumSteps,
+                             T* d_traj,
+                             unsigned long long output_stream,
+                             int method,
+                             const double* timeStart)
+{
+#ifdef HAVE_CUDA
+    // Validation and descriptor construction are shared with the host-output entry
+    // point via the helper below; only the destination differs.
+    potential::GpuPotDesc<T> desc;
+    std::vector<T> splineT;
+    T accT;
+    const int rc = prepareOrbitBatch<T>(pot, trajsize, accuracy, method,
+        desc, splineT, accT);
+    if(rc != ORBIT_GPU_OK)
+        return rc;
+    if(Norb == 0)
+        return ORBIT_GPU_OK;
+    if(d_traj == NULL)
+        return ORBIT_GPU_EUNSUPP;
+    return cudaOrbitBatch<T>(desc, splineT, Norb, ic, times, trajsize,
+        accT, maxNumSteps, method, timeStart,
+        /*d_trajCaller*/ d_traj, /*h_traj*/ NULL, output_stream);
+#else
+    (void)pot; (void)Norb; (void)ic; (void)times; (void)trajsize; (void)accuracy;
+    (void)maxNumSteps; (void)d_traj; (void)output_stream; (void)method; (void)timeStart;
+    return ORBIT_GPU_ENOTBUILT;
+#endif
+}
+
+template<typename T>
+int scaleTrajectoryGPUDevice(std::size_t n, T* d_traj,
+                             double lengthUnit, double velocityUnit,
+                             unsigned long long output_stream)
+{
+#ifdef HAVE_CUDA
+    if(n == 0)
+        return ORBIT_GPU_OK;
+    if(d_traj == NULL)
+        return ORBIT_GPU_EUNSUPP;
+    OrbitCallStream stream;
+    // order against a producer that wrote d_traj on a different stream
+    syncProducerStream(output_stream);
+    agama::Cuda pol;
+    pol.stream = stream.s;
+    // Divide in double, and by division rather than by a precomputed reciprocal, so
+    // the result is bit-identical to the host path's promote-divide-round -- see the
+    // rationale in the header. `lu`/`vu` are captured by value into the lambda.
+    const double lu = lengthUnit, vu = velocityUnit;
+    T* p = d_traj;
+    agama::forall(pol, n, [=] AGAMA_DEVICE (std::size_t i) {
+        T* w = p + i * 6;
+        w[0] = T(double(w[0]) / lu);
+        w[1] = T(double(w[1]) / lu);
+        w[2] = T(double(w[2]) / lu);
+        w[3] = T(double(w[3]) / vu);
+        w[4] = T(double(w[4]) / vu);
+        w[5] = T(double(w[5]) / vu);
+    });
+    AGAMA_CUDA_CHECK(cudaStreamSynchronize(stream.s));
+    return ORBIT_GPU_OK;
+#else
+    (void)n; (void)d_traj; (void)lengthUnit; (void)velocityUnit; (void)output_stream;
+    return ORBIT_GPU_ENOTBUILT;
+#endif
+}
+
 // Explicit instantiations for the two precisions the Python boundary exposes.
 template int integrateOrbitsGPU<float >(const potential::BasePotential&, std::size_t,
     const double*, const double*, std::size_t, double, std::size_t, float*,  const char*, int, const double*);
 template int integrateOrbitsGPU<double>(const potential::BasePotential&, std::size_t,
     const double*, const double*, std::size_t, double, std::size_t, double*, const char*, int, const double*);
+template int integrateOrbitsGPUDevice<float >(const potential::BasePotential&, std::size_t,
+    const double*, const double*, std::size_t, double, std::size_t, float*,  unsigned long long, int, const double*);
+template int integrateOrbitsGPUDevice<double>(const potential::BasePotential&, std::size_t,
+    const double*, const double*, std::size_t, double, std::size_t, double*, unsigned long long, int, const double*);
+template int scaleTrajectoryGPUDevice<float >(std::size_t, float*,  double, double, unsigned long long);
+template int scaleTrajectoryGPUDevice<double>(std::size_t, double*, double, double, unsigned long long);
 
 }  // namespace orbit
