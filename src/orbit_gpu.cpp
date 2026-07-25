@@ -260,35 +260,81 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
     }
 }
 
-/** Launch the batch under the given execution policy. All pointers must be
-    accessible by that policy's execution space (host pointers for
-    Serial/OpenMP, device pointers for Cuda). */
+/** Launch the batch under the given execution policy, ALWAYS running the
+    DOP853 core. All pointers must be accessible by that policy's execution
+    space (host pointers for Serial/OpenMP, device pointers for Cuda).
+
+    `method` used to be a runtime argument to a single run_batch(), with the
+    lambda branching at runtime between integrate_one_orbit (DOP853) and
+    integrate_one_orbit_dprkn8 (DPRKN8). Because both callees are
+    AGAMA_DEVICE_INLINE, BOTH integrators got inlined into the SAME kernel body
+    even though any one launch only ever executes one branch -- register
+    allocation then had to satisfy the union of both integrators' live state
+    (DOP853's state[60]+xt[60] AND DPRKN8's state[18]+scratch[39] at once),
+    which is most of the ~255-register/thread saturation and 2.6-5.5 KB/thread
+    local-memory spill measured on this kernel. Splitting into two functions
+    (this one and run_batch_dprkn8 below), selected ONCE on the host in
+    run_batch()'s dispatch wrapper (further down), makes each a SEPARATE kernel
+    that only ever inlines the integrator it actually calls -- ptxas then only
+    has to allocate for one integrator's state, not both. */
 template<typename T, class Policy>
-void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc, int method,
+void run_batch_dop853(Policy pol, const potential::GpuPotDesc<T>& desc,
     std::size_t Norb, const T* ic, const double* times, const double* timeStart,
     std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, T* traj)
 {
-    // The functors are built INSIDE the kernel so that each thread gets its own
+    // The functor is built INSIDE the kernel so that each thread gets its own
     // (tiny) copy pointing at the single descriptor captured by value here. Built
     // outside, a host-side &desc would be meaningless on the device, and holding
-    // the descriptor by value in each of the two functors would put two multi-KiB
-    // copies into the kernel argument space.
-    // `method` is a kernel-uniform runtime value: every thread branches the same
-    // way, so there is no warp divergence from this test.
+    // the descriptor by value in the functor would put a multi-KiB copy into
+    // the kernel argument space.
     agama::forall(pol, Norb, [=] AGAMA_DEVICE (std::size_t i) {
         T ic6[6];
         for(int k = 0; k < 6; k++)
             ic6[k] = ic[i*6 + k];
         const double t0 = timeStart ? timeStart[i] : 0.0;
-        GpuDescForce<T>  force  = { &desc, t0 };  // 1st-order r.h.s. (DOP853 + DPRKN8 init)
-        GpuDescForce2<T> force2 = { &desc, t0 };  // 2nd-order r.h.s. (DPRKN8 stages)
-        if(method == orbit::ORBIT_GPU_DPRKN8)
-            integrate_one_orbit_dprkn8(force, force2, ic6, t0, times[i], accuracy,
-                maxNumSteps, trajsize, traj + i * trajsize * 6);
-        else
-            integrate_one_orbit(force, ic6, t0, times[i], accuracy, maxNumSteps,
-                trajsize, traj + i * trajsize * 6);
+        GpuDescForce<T> force = { &desc, t0 };
+        integrate_one_orbit(force, ic6, t0, times[i], accuracy, maxNumSteps,
+            trajsize, traj + i * trajsize * 6);
     });
+}
+
+/** DPRKN8 counterpart of run_batch_dop853: same launch shape, but the kernel
+    body only ever inlines integrate_one_orbit_dprkn8, so it never carries
+    DOP853's state[60]+xt[60] register/spill cost. See run_batch_dop853 above
+    for why this is a separate function rather than a runtime branch. */
+template<typename T, class Policy>
+void run_batch_dprkn8(Policy pol, const potential::GpuPotDesc<T>& desc,
+    std::size_t Norb, const T* ic, const double* times, const double* timeStart,
+    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, T* traj)
+{
+    agama::forall(pol, Norb, [=] AGAMA_DEVICE (std::size_t i) {
+        T ic6[6];
+        for(int k = 0; k < 6; k++)
+            ic6[k] = ic[i*6 + k];
+        const double t0 = timeStart ? timeStart[i] : 0.0;
+        GpuDescForce<T>  force  = { &desc, t0 };  // 1st-order r.h.s. (DPRKN8 init)
+        GpuDescForce2<T> force2 = { &desc, t0 };  // 2nd-order r.h.s. (DPRKN8 stages)
+        integrate_one_orbit_dprkn8(force, force2, ic6, t0, times[i], accuracy,
+            maxNumSteps, trajsize, traj + i * trajsize * 6);
+    });
+}
+
+/** Dispatch wrapper: picks DOP853 vs DPRKN8 ONCE on the host, BEFORE entering
+    agama::forall / the kernel launch, so each launch instantiates only the
+    kernel it needs (see run_batch_dop853 above for the register-pressure
+    rationale). Signature and behaviour are unchanged from the old single
+    run_batch(): callers below are untouched. */
+template<typename T, class Policy>
+void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc, int method,
+    std::size_t Norb, const T* ic, const double* times, const double* timeStart,
+    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, T* traj)
+{
+    if(method == orbit::ORBIT_GPU_DPRKN8)
+        run_batch_dprkn8<T>(pol, desc, Norb, ic, times, timeStart,
+            trajsize, accuracy, maxNumSteps, traj);
+    else
+        run_batch_dop853<T>(pol, desc, Norb, ic, times, timeStart,
+            trajsize, accuracy, maxNumSteps, traj);
 }
 
 #ifdef HAVE_CUDA
