@@ -107,11 +107,37 @@ $(TESTEXEFORTRAN):  $(TESTSDIR)/$(TESTFORTRAN) $(LIBNAME_STATIC)
 endif
 
 
-$(OBJDIR)/%.o:  $(SRCDIR)/%.cpp Makefile.local
+# --- build-configuration stamp -------------------------------------------
+# Object files land in $(OBJDIR) under the same names whichever compiler produced
+# them, and make decides staleness purely from timestamps -- it has no notion of
+# the FLAGS an object was built with. Header dependencies are tracked (-MMD, see
+# DEPENDS below), but the configuration is not, so before this stamp existed:
+#
+#     make                                  # CPU-only build, fills obj/
+#     HAVE_CUDA=1 CUDA_ARCH=sm_86 make      # -> "Nothing to be done for 'all'"
+#
+# every object was newer than its sources, make declared victory, and you were
+# left holding a CPU-only agama.so while believing you had a GPU build. The
+# reverse silently linked nvcc-built objects into a CPU-only build. Neither is
+# detectable by any test in the suite -- it is the same family as the stale-nvcc
+# ABI skew fixed in b3c8a53, one level up.
+#
+# The stamp records the configuration and is rewritten ONLY when its contents
+# actually change, so flipping HAVE_CUDA / CUDA_ARCH / the compilers forces
+# exactly the rebuild it should, while a repeated identical build stays a no-op.
+BUILDCONFIG     := HAVE_CUDA=$(HAVE_CUDA) CUDA_ARCH=$(CUDA_ARCH) CXX=$(CXX) NVCC=$(NVCC)
+BUILDCONFIGFILE := $(OBJDIR)/.buildconfig
+$(shell mkdir -p $(OBJDIR); \
+        printf '%s\n' "$(BUILDCONFIG)" > $(BUILDCONFIGFILE).new; \
+        cmp -s $(BUILDCONFIGFILE).new $(BUILDCONFIGFILE) \
+          || mv -f $(BUILDCONFIGFILE).new $(BUILDCONFIGFILE); \
+        rm -f $(BUILDCONFIGFILE).new)
+
+$(OBJDIR)/%.o:  $(SRCDIR)/%.cpp Makefile.local $(BUILDCONFIGFILE)
 	@mkdir -p $(OBJDIR)
 	$(CXX) -c $(COMPILE_FLAGS_ALL) $(COMPILE_FLAGS_LIB) -o "$@" "$<"
 
-$(OBJDIR)/%.o:  $(TORUSDIR)/%.cc Makefile.local
+$(OBJDIR)/%.o:  $(TORUSDIR)/%.cc Makefile.local $(BUILDCONFIGFILE)
 	$(CXX) -c $(COMPILE_FLAGS_ALL) $(COMPILE_FLAGS_LIB) -o "$@" "$<"
 
 # Per-file nvcc override for any TU listed in CUDA_TUS. The explicit rule
@@ -120,7 +146,7 @@ $(OBJDIR)/%.o:  $(TORUSDIR)/%.cc Makefile.local
 # and the file compiles CPU-only with all Cuda-policy branches gated off).
 ifdef HAVE_CUDA
 define CUDA_TU_RULE
-$(OBJDIR)/$(1).o:  $(SRCDIR)/$(1).cpp Makefile.local
+$(OBJDIR)/$(1).o:  $(SRCDIR)/$(1).cpp Makefile.local $(BUILDCONFIGFILE)
 	@mkdir -p $(OBJDIR)
 	$(NVCC) $(NVCC_FLAGS_ALL) -MMD -MF "$$(@:.o=.d)" -c -x cu "$$<" -o "$$@"
 endef
