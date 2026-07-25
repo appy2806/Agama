@@ -22,6 +22,8 @@ Makefile.local
 CLAUDE.md
 project_report.md
 pending_tasks.md
+findings.md
+agent_brief.md
 
 # Python egg-info / build artifacts from pip install
 agama_migrate.egg-info/
