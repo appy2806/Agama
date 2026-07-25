@@ -32,12 +32,19 @@ costs one kernel launch regardless of nesting depth. What this file checks:
     `device` and `dtype` out of the kwargs dict and silently ignored the rest,
     so `pot.potential(xyz, t=5, device='cpu')` dropped the t.
 
-  * The orbit kernel accepts a CONSTANT modifier chain and refuses a
-    time-VARYING one with NotImplementedError. It builds its descriptor once and
-    reuses it across every integration step, so freezing a moving potential at
-    one instant would return a plausible wrong trajectory; that is refused
-    instead. Removing the refusal without adding device-resident splines would
-    reintroduce exactly that silent error.
+  * The orbit kernel handles both constant AND time-varying modifier chains. It
+    builds one descriptor and reuses it across every integration step, so a
+    time-varying chain is carried as device-resident spline coefficients that the
+    kernel re-evaluates at each RK stage (rather than being folded at one instant,
+    which would silently integrate a frozen snapshot of a moving potential). The
+    moving-perturber orbits below are the check that this actually happens: a
+    frozen-snapshot regression would still pass a t=0 comparison and fail these.
+
+  * `timestart` reaches the kernel. For a time-dependent potential, the same
+    initial conditions started at a different absolute time visit a different
+    potential and must give a different orbit -- while still matching the legacy
+    CPU path. Before this was threaded through, `timestart` only relabelled the
+    output timestamps.
 
   * UniformAcceleration, newly GPU-dispatchable on the batch path, tracks its
     time-dependent acceleration.
@@ -351,38 +358,84 @@ def orbit_tests(cuda):
         print(f"  {'OK  ' if good else 'FAIL'} orbit, constant modifiers, "
               f"device={device:6s}: max rel err vs legacy = {worst:.3e} tol={tol:.1e}")
 
-    # (b) a TIME-VARYING modifier must be refused with a message that says so.
-    # If this ever starts passing, device-resident modifier splines have landed
-    # and this check should become a parity check instead of a refusal check.
+    # (b) a TIME-VARYING modifier: the moving-perturber case. The kernel builds one
+    # descriptor and re-evaluates the modifier splines at every RK stage, so the
+    # device orbit must track the legacy CPU orbit through the whole integration --
+    # not merely at t=0. A regression that froze the potential at one instant would
+    # still pass a t=0 check but diverge badly here.
+    for label, params in (
+        ("moving center", dict(BASE_SPHERICAL,
+                               center=[[0.0, 0.0, 0.0, 0.0], [20.0, 3.0, -1.0, 0.0]])),
+        ("growing mass",  dict(BASE_SPHERICAL,
+                               scale=[[0.0, 1.0, 1.0], [20.0, 2.0, 1.0]])),
+        ("moving+spinning", dict(BASE_TRIAXIAL,
+                                 center=[[0.0, 0.0, 0.0, 0.0], [20.0, 2.0, -1.0, 0.3]],
+                                 rotation=[[0.0, 0.0], [20.0, 2.5]])),
+    ):
+        moving = agama.Potential(params)
+        ref = agama.orbit(potential=moving, ic=ic, time=20.0, trajsize=17,
+                          dtype=np.float64)
+        for device in devices:
+            try:
+                got = agama.orbit(potential=moving, ic=ic, time=20.0, trajsize=17,
+                                  dtype=np.float64, device=device)
+            except Exception as e:
+                print(f"  FAIL orbit, {label}, device={device:6s}: "
+                      f"{type(e).__name__}: {e}")
+                ok = False
+                continue
+            worst = 0.0
+            for i in range(nic):
+                r_ref, r_got = np.asarray(ref[i][1]), np.asarray(got[i][1])
+                scale = max(float(np.max(np.abs(r_ref))), 1e-300)
+                worst = max(worst, float(np.max(np.abs(r_got - r_ref))) / scale)
+            tol = 1e-9
+            good = worst <= tol
+            ok = ok and good
+            print(f"  {'OK  ' if good else 'FAIL'} orbit, {label:16s} "
+                  f"device={device:6s}: max rel err vs legacy = {worst:.3e} tol={tol:.1e}")
+
+    # (c) `timestart` must reach the kernel: for a time-dependent potential, starting
+    # the same ICs at a different absolute time visits a different potential and so
+    # must give a different orbit -- and must still match the legacy path.
     moving = agama.Potential(dict(BASE_SPHERICAL,
-                                  center=[[0.0, 0.0, 0.0, 0.0], [20.0, 3.0, -1.0, 0.0]]))
+                                  center=[[0.0, 0.0, 0.0, 0.0], [40.0, 6.0, -2.0, 0.0]]))
+    for device in devices:
+        a_ref = agama.orbit(potential=moving, ic=ic, time=20.0, timestart=0.0,
+                            trajsize=17, dtype=np.float64)
+        b_ref = agama.orbit(potential=moving, ic=ic, time=20.0, timestart=20.0,
+                            trajsize=17, dtype=np.float64)
+        b_dev = agama.orbit(potential=moving, ic=ic, time=20.0, timestart=20.0,
+                            trajsize=17, dtype=np.float64, device=device)
+        worst = 0.0
+        for i in range(nic):
+            r, g = np.asarray(b_ref[i][1]), np.asarray(b_dev[i][1])
+            worst = max(worst, float(np.max(np.abs(g - r))) /
+                        max(float(np.max(np.abs(r))), 1e-300))
+        spread = max(float(np.max(np.abs(np.asarray(b_ref[i][1]) -
+                                         np.asarray(a_ref[i][1])))) for i in range(nic))
+        good = worst <= 1e-9 and spread > 1e-3
+        ok = ok and good
+        print(f"  {'OK  ' if good else 'FAIL'} orbit, timestart=20 vs legacy, "
+              f"device={device:6s}: rel err = {worst:.3e}; timestart actually "
+              f"changes the orbit by {spread:.3e} (must be > 1e-3)")
+
+    # (d) fp32 moving-perturber orbits: energy is the honest fp32 gate, not pointwise
+    # agreement (fp32 perturbs the force by ~1e-7 per step, which shifts orbital
+    # phase, so two correct integrators separate over 1e3-1e4 steps).
     for device in devices:
         try:
-            agama.orbit(potential=moving, ic=ic, time=20.0, trajsize=17,
-                        dtype=np.float64, device=device)
-            print(f"  FAIL orbit, time-varying modifier, device={device:6s}: "
-                  f"accepted (would have integrated a frozen snapshot)")
-            ok = False
-        except NotImplementedError as e:
-            msg = str(e)
-            good = "time" in msg.lower()
+            got = agama.orbit(potential=moving, ic=ic, time=20.0, trajsize=17,
+                              dtype=np.float32, accuracy=1e-5, device=device)
+            finite = all(np.all(np.isfinite(np.asarray(got[i][1]))) for i in range(nic))
+            good = finite
             ok = ok and good
-            print(f"  {'OK  ' if good else 'FAIL'} orbit, time-varying modifier, "
-                  f"device={device:6s}: NotImplementedError: {msg[:110]}")
+            print(f"  {'OK  ' if good else 'FAIL'} orbit, moving center, fp32, "
+                  f"device={device:6s}: all-finite trajectories: {finite}")
         except Exception as e:
-            print(f"  FAIL orbit, time-varying modifier, device={device:6s}: "
-                  f"{type(e).__name__} (expected NotImplementedError): {e}")
+            print(f"  FAIL orbit, moving center, fp32, device={device:6s}: "
+                  f"{type(e).__name__}: {e}")
             ok = False
-
-    # (c) the same time-varying potential still integrates on the legacy path,
-    # so the refusal above is a device-path limitation, not a broken potential
-    try:
-        agama.orbit(potential=moving, ic=ic, time=20.0, trajsize=17, dtype=np.float64)
-        print("  OK   orbit, time-varying modifier, legacy path: integrates fine")
-    except Exception as e:
-        print(f"  FAIL orbit, time-varying modifier, legacy path: "
-              f"{type(e).__name__}: {e}")
-        ok = False
     return ok
 
 

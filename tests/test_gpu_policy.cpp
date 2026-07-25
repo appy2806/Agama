@@ -138,6 +138,33 @@ void run_perf_T(int trials, std::size_t N, const char* tname) {
 #endif  // HAVE_CUDA (run_perf_T)
 }  // namespace
 
+/** Max scale-normalized error of a descriptor against the virtual eval of the same
+    potential, at one time. Scale-normalized rather than pointwise-relative because a
+    triaxial Logarithmic's Phi crosses zero on the sampled shell, where dividing by
+    ~0 reports a huge error for a perfectly good result. */
+static double desc_vs_virtual(const potential::GpuPotDesc<double>& d,
+    const potential::BasePotential& pot, double time)
+{
+    double worst = 0, ref = 0;
+    for(int i = 0; i < 64; i++) {
+        const double x = 0.3 + 0.05 * i, y = -0.7 + 0.031 * (i % 17),
+                     z = 0.2 + 0.017 * (i % 13);
+        double phi_d, acc_d[3];
+        potential::gpu_desc_phi_acc(d, x, y, z, &phi_d, acc_d, time);
+        double phi_v;
+        coord::GradCar grad;
+        pot.eval(coord::PosCar(x, y, z), &phi_v, &grad, NULL, time);
+        worst = std::max(worst, std::fabs(phi_d - phi_v));
+        ref   = std::max(ref,   std::fabs(phi_v));
+        const double av[3] = { -grad.dx, -grad.dy, -grad.dz };
+        for(int k = 0; k < 3; k++) {
+            worst = std::max(worst, std::fabs(acc_d[k] - av[k]));
+            ref   = std::max(ref,   std::fabs(av[k]));
+        }
+    }
+    return worst / std::max(1e-300, ref);
+}
+
 int main() {
     using namespace agama;
     const std::size_t N = 1024;
@@ -520,11 +547,12 @@ int main() {
                     AGAMA_CONST_SPLINE(CX), AGAMA_CONST_SPLINE(CY), AGAMA_CONST_SPLINE(CZ)));
 
             potential::GpuPotDesc<double> desc;
-            // every stage is constant here, so requireTimeIndependent must NOT
-            // reject any of these -- ask for it, so a regression that breaks
-            // CubicSpline::isConstant() shows up as a build-once failure
-            if(!potential::buildGpuPotDesc(*p, desc, /*time*/ 0,
-                /*requireTimeIndependent*/ true) || desc.nterms != 1)
+            // every stage is constant here, so the builder must fold the whole
+            // chain and emit NO stages -- asserting stageCount == 0 is what makes
+            // a regression in CubicSpline::isConstant() visible (it would start
+            // emitting per-step stages for a chain that cannot vary)
+            if(!potential::buildGpuPotDesc(*p, desc, /*time*/ 0) ||
+                desc.nterms != 1 || desc.terms[0].stageCount != 0)
             {
                 std::fprintf(stderr,
                     "FAIL (modifier descriptor did not build, mask=%d)\n", mask);
@@ -579,14 +607,16 @@ int main() {
         if(!ok_all)
             return 1;
 
-        // ----- a time-VARYING chain must be refused, not frozen -----
-        // This is the guard that keeps the orbit kernel from integrating a
-        // snapshot of a moving potential. Build a genuinely time-dependent
-        // Shifted (a 2-node center spline) and check that (a) the descriptor
-        // refuses it when the caller demands time-independence, (b) it still
-        // builds when the caller can supply a time, and (c) the descriptor built
-        // at t=T actually matches the CPU eval AT THAT SAME T -- i.e. `time` is
-        // really threaded, not accepted and dropped.
+        // ----- a time-VARYING chain: both modes must be right -----
+        // Two callers with different needs:
+        //  (a) batch eval shares one `time`, so folding the chain at that time is
+        //      exact -- build with no spline buffer and check against the CPU eval
+        //      AT THAT SAME time (this also proves `time` is actually threaded and
+        //      not accepted and dropped);
+        //  (b) the orbit kernel sees a different t at every RK stage, so it builds
+        //      with a spline buffer and gets GpuModStages it re-evaluates per step
+        //      -- check the SAME descriptor against the CPU eval at several
+        //      different times, which a folded descriptor could not do.
         {
             std::vector<double> tt(2), vx(2), vy(2), vz(2);
             tt[0] = 0;    tt[1] = 10;
@@ -594,45 +624,62 @@ int main() {
             vy[0] = 0;    vy[1] = -1.0;
             vz[0] = 0.5;  vz[1] = 0.5;   // z constant, x and y moving
             potential::PtrPotential base(new potential::Logarithmic(1.0, 0.5, 0.7, 0.5));
+            // a moving shift wrapped around a constant scaling: exercises the
+            // constant-run flush, i.e. that a folded run keeps its place in the
+            // composition order instead of being applied out of sequence
+            potential::PtrPotential inner(new potential::Scaled<potential::BasePotential>(
+                base, AGAMA_CONST_SPLINE(1.3), AGAMA_CONST_SPLINE(0.8)));
             potential::PtrPotential moving(new potential::Shifted<potential::BasePotential>(
-                base, math::CubicSpline(tt, vx), math::CubicSpline(tt, vy),
+                inner, math::CubicSpline(tt, vx), math::CubicSpline(tt, vy),
                 math::CubicSpline(tt, vz)));
 
-            potential::GpuPotDesc<double> d_strict, d_at_t;
-            const bool refused = !potential::buildGpuPotDesc(*moving, d_strict,
-                /*time*/ 0, /*requireTimeIndependent*/ true);
-            const double TQ = 6.25;
-            const bool built  = potential::buildGpuPotDesc(*moving, d_at_t, TQ,
-                /*requireTimeIndependent*/ false);
-            double rel_t = 1e300;
-            if(built) {
-                double worst = 0, ref = 0;
-                for(int i = 0; i < 64; i++) {
-                    const double x = 0.3 + 0.05 * i, y = -0.7 + 0.031 * (i % 17),
-                                 z = 0.2 + 0.017 * (i % 13);
-                    double phi_d, acc_d[3];
-                    potential::gpu_desc_phi_acc(d_at_t, x, y, z, &phi_d, acc_d);
-                    double phi_v;
-                    coord::GradCar grad;
-                    moving->eval(coord::PosCar(x, y, z), &phi_v, &grad, NULL, TQ);
-                    worst = std::max(worst, std::fabs(phi_d - phi_v));
-                    ref   = std::max(ref,   std::fabs(phi_v));
-                    const double av[3] = { -grad.dx, -grad.dy, -grad.dz };
-                    for(int k = 0; k < 3; k++) {
-                        worst = std::max(worst, std::fabs(acc_d[k] - av[k]));
-                        ref   = std::max(ref,   std::fabs(av[k]));
-                    }
+            const double TIMES[5] = { -2.0, 0.0, 3.75, 6.25, 12.0 };
+
+            // (a) folded-at-one-time mode
+            double worst_fold = 0;
+            for(int q = 0; q < 5; q++) {
+                potential::GpuPotDesc<double> d;
+                if(!potential::buildGpuPotDesc(*moving, d, TIMES[q]) ||
+                    d.nstages != 0 || d.terms[0].stageCount != 0)
+                {
+                    std::fprintf(stderr, "FAIL (folded build at t=%g)\n", TIMES[q]);
+                    return 1;
                 }
-                rel_t = worst / std::max(1e-300, ref);
+                worst_fold = std::max(worst_fold,
+                    desc_vs_virtual(d, *moving, TIMES[q]));
             }
-            const bool ok_td = refused && built && rel_t <= 1e-13;
-            std::printf("[T1]    time-varying Shifted: refused when time-independence "
-                "required: %s; builds at t=%.2f: %s; matches CPU eval at that t: "
-                "max rel err = %.3e -> %s\n",
-                refused ? "yes" : "NO", TQ, built ? "yes" : "NO", rel_t,
+
+            // (b) stage mode: ONE descriptor, many times
+            potential::GpuPotDesc<double> ds;
+            std::vector<double> splineData;
+            if(!potential::buildGpuPotDesc(*moving, ds, /*time*/ 0, &splineData)) {
+                std::fprintf(stderr, "FAIL (stage-mode build)\n");
+                return 1;
+            }
+            ds.splineData = splineData.empty() ? NULL : splineData.data();
+            // the Shifted is genuinely time-varying, so at least one stage must
+            // exist; the constant Scaled must have been flushed as a CONST stage
+            // AFTER it (it is innermost), giving 2 stages in that order
+            const bool shape_ok = ds.nstages == 2 &&
+                ds.terms[0].stageCount == 2 &&
+                ds.stages[0].kind == potential::GPU_MOD_SHIFTED &&
+                ds.stages[1].kind == potential::GPU_MOD_CONST &&
+                ds.terms[0].hasXform == 0 &&
+                !splineData.empty();
+            double worst_stage = 0;
+            for(int q = 0; q < 5; q++)
+                worst_stage = std::max(worst_stage,
+                    desc_vs_virtual(ds, *moving, TIMES[q]));
+
+            const bool ok_td = shape_ok && worst_fold <= 1e-13 && worst_stage <= 1e-13;
+            std::printf("[T1]    time-varying Shifted(Scaled(Log)) at t = -2..12: "
+                "folded-per-time max rel err = %.3e; ONE staged descriptor "
+                "re-evaluated per t = %.3e (%d stages: %s); tol = 1.0e-13 -> %s\n",
+                worst_fold, worst_stage, ds.nstages,
+                shape_ok ? "SHIFTED+CONST as expected" : "UNEXPECTED SHAPE",
                 ok_td ? "OK" : "FAIL");
             if(!ok_td) {
-                std::fprintf(stderr, "FAIL (time-dependent modifier gating)\n");
+                std::fprintf(stderr, "FAIL (time-varying modifier stages)\n");
                 return 1;
             }
         }

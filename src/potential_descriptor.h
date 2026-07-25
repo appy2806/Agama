@@ -24,10 +24,15 @@
     buildGpuPotDesc() descends through the wrapper chain and collapses it into
     the GpuPotXform carried by each term it wraps (see GpuPotXform in
     potential_composite.h for why an arbitrarily deep chain is exactly 13
-    numbers). Since the transform depends on time, a descriptor is in general
-    valid only at the `time` it was built for -- buildGpuPotDesc()'s
-    requireTimeIndependent flag is how a caller that reuses one descriptor
-    across many times (the orbit kernel) declines the ones that would go stale.
+    numbers). Since the transform depends on time, such a collapsed descriptor is
+    valid only at the `time` it was built for -- which is exactly right for batch
+    evaluation, where one `time` is shared by the whole batch.
+
+    A caller that reuses ONE descriptor across many times (the orbit kernel, a
+    different t at every RK stage) instead passes a spline buffer to
+    buildGpuPotDesc(), and gets back GpuModStage entries that the kernel
+    recomposes per step via gpu_term_xform(). Constant parts of the chain are
+    still folded on the host either way.
 */
 #pragma once
 #include "potential_base.h"
@@ -37,6 +42,7 @@
 #include "potential_disk.h"
 #include "gpu_device.h"
 #include <cmath>
+#include <vector>
 
 namespace potential {
 
@@ -62,6 +68,13 @@ enum GpuPotTag {
 /// maximum number of flattened members a descriptor can hold; a composite
 /// with more members fails to build (falls back to the CPU path)
 enum { GPU_POT_DESC_MAX_TERMS = 16 };
+
+/// maximum number of time-varying modifier stages a descriptor can hold, summed
+/// over all its terms. The Python factory applies each of the four modifiers at
+/// most once, so a factory-built chain needs at most 4 (and fewer once constant
+/// runs are merged); the headroom covers modifiers nested through composites.
+/// A potential needing more fails to build and falls back to the CPU path.
+enum { GPU_MOD_MAX_STAGES = 8 };
 
 /** One concrete potential member: type tag + constructor parameters.
     The meaning of p[] per tag is defined by the class's gpuTermParams()
@@ -92,6 +105,12 @@ struct GpuPotTerm {
     T p[6];    ///< constructor parameters, layout per tag (unused slots zero)
     int hasXform;        ///< nonzero if `xf` must be applied (a modifier chain wraps this term)
     GpuPotXform<T> xf;   ///< the collapsed modifier chain; undefined when hasXform == 0
+    /** A TIME-VARYING modifier chain cannot be collapsed once, so instead of `xf`
+        the term names a run of stages in GpuPotDesc::stages that the kernel
+        recomposes at each time it is asked for. stageCount == 0 means "use xf
+        (or nothing)"; the two are mutually exclusive. */
+    int stageBegin;      ///< index of this term's first stage in GpuPotDesc::stages
+    int stageCount;      ///< number of stages; 0 => time-independent, use hasXform/xf
 };
 
 /** Flattened by-value snapshot of a (possibly Composite) potential. */
@@ -99,19 +118,33 @@ template<typename T>
 struct GpuPotDesc {
     int nterms;
     GpuPotTerm<T> terms[GPU_POT_DESC_MAX_TERMS];
+    /** Stages for the terms whose modifier chain varies with time (see
+        GpuPotTerm::stageBegin). Held here rather than inside each term because
+        most descriptors have none, and inlining a worst-case chain into all 16
+        terms would multiply the by-value footprint for nothing. */
+    int nstages;
+    GpuModStage<T> stages[GPU_MOD_MAX_STAGES];
+    /** Flat buffer holding the node arrays of every spline referenced by
+        `stages`, in whichever memory space the kernel that reads it will run in
+        -- host memory for the Serial/OpenMP policies, device memory for Cuda.
+        buildGpuPotDesc() leaves this NULL and hands the host-side buffer back to
+        the caller, because only the caller knows where the kernel will run and
+        therefore where the data has to end up. NULL whenever nstages == 0. */
+    const T* splineData;
 };
 
 /** A descriptor travels into every kernel as a by-value lambda capture, i.e. in
     the CUDA kernel-argument space. That space is 4 KiB on pre-sm_70 hardware and
-    32 KiB from sm_70 on; our floor is sm_75, but staying under the 4 KiB figure
-    costs nothing today (a double descriptor is ~2.8 KiB) and keeps the option of
-    an older target open. Adding fields to GpuPotTerm, or raising
-    GPU_POT_DESC_MAX_TERMS, is what would break this -- so it fails at compile
-    time here rather than as a launch error at runtime. If a future term genuinely
-    needs the room, move the payload behind a device pointer instead of widening
-    the by-value struct. */
-static_assert(sizeof(GpuPotDesc<double>) <= 4096,
-    "GpuPotDesc<double> no longer fits the 4 KiB CUDA kernel-argument budget; "
+    32 KiB from sm_70 on, and our floor is sm_75. The budget asserted below is
+    8 KiB: a quarter of what every supported target provides, which leaves room
+    for the modifier stages (a double descriptor is 4312 bytes with them) while
+    still failing loudly long before a launch error. Adding fields to GpuPotTerm,
+    or raising GPU_POT_DESC_MAX_TERMS / GPU_MOD_MAX_STAGES, is what would break
+    it. If a future term genuinely needs more room -- Multipole's coefficient
+    tables are ~1 MB, for instance -- put the payload behind a device pointer, as
+    `splineData` does, instead of widening the by-value struct. */
+static_assert(sizeof(GpuPotDesc<double>) <= 8192,
+    "GpuPotDesc<double> no longer fits its CUDA kernel-argument budget; "
     "see the comment above before raising this limit");
 
 /** STORE (not accumulate) Phi (optional) and the Cartesian acceleration
@@ -206,22 +239,24 @@ AGAMA_DEVICE_INLINE void gpu_term_leaf_phi_acc(const GpuPotTerm<T>& t,
     them one branch and nothing else, so their results stay bit-for-bit. */
 template<typename T>
 AGAMA_DEVICE_INLINE void gpu_term_phi_acc(const GpuPotTerm<T>& t,
+    /*nullable: NULL means no modifier chain*/ const GpuPotXform<T>* xfp,
     T x, T y, T z, /*accumulated, nullable*/ T* phi, /*accumulated*/ T acc[3])
 {
     T a[3];
-    if(t.hasXform) {
+    if(xfp) {
+        const GpuPotXform<T>& xf = *xfp;
         // Reproduces Scaled::evalCar's "amplitude is zero, skip evaluating the
         // wrapped potential" shortcut: the contribution is identically zero, and
         // short-circuiting also keeps a non-finite leaf value (e.g. a divergent
         // cusp) from turning into 0*inf = NaN.
-        if(t.xf.kphi == 0)
+        if(xf.kphi == 0)
             return;
         T q[3];
-        gpu_xform_pos(t.xf, x, y, z, q);
+        gpu_xform_pos(xf, x, y, z, q);
         T pot = 0, ai[3];
         gpu_term_leaf_phi_acc(t, q[0], q[1], q[2], phi ? &pot : (T*)NULL, ai);
-        gpu_xform_vec(t.xf, ai, a);
-        if(phi) *phi += t.xf.kphi * pot;
+        gpu_xform_vec(xf, ai, a);
+        if(phi) *phi += xf.kphi * pot;
     } else {
         T pot = 0;
         gpu_term_leaf_phi_acc(t, x, y, z, phi ? &pot : (T*)NULL, a);
@@ -271,9 +306,12 @@ AGAMA_DEVICE_INLINE T gpu_term_leaf_rho(const GpuPotTerm<T>& t, T x, T y, T z)
     modifier transform if it has one. A similarity transform multiplies the
     Laplacian by sc^2 on top of the potential's own kphi (see GpuPotXform). */
 template<typename T>
-AGAMA_DEVICE_INLINE void gpu_term_dens(const GpuPotTerm<T>& t, T x, T y, T z, /*accumulated*/ T* rho)
+AGAMA_DEVICE_INLINE void gpu_term_dens(const GpuPotTerm<T>& t,
+    /*nullable: NULL means no modifier chain*/ const GpuPotXform<T>* xfp,
+    T x, T y, T z, /*accumulated*/ T* rho)
 {
-    if(t.hasXform) {
+    if(xfp) {
+        const GpuPotXform<T>& xf = *xfp;
         // Short-circuit at zero amplitude, as the potential path does. Note that
         // Scaled::densityCar on the CPU does NOT short-circuit -- it evaluates
         // the wrapped density and multiplies by zero -- so the two differ only
@@ -281,11 +319,11 @@ AGAMA_DEVICE_INLINE void gpu_term_dens(const GpuPotTerm<T>& t, T x, T y, T z, /*
         // exactly at r=0), giving 0 here versus NaN there. Both are defensible
         // for a component that has been scaled out of existence; this one does
         // not let one degenerate point poison the batch.
-        if(t.xf.kphi == 0)
+        if(xf.kphi == 0)
             return;
         T q[3];
-        gpu_xform_pos(t.xf, x, y, z, q);
-        *rho += t.xf.kphi * t.xf.sc * t.xf.sc * gpu_term_leaf_rho(t, q[0], q[1], q[2]);
+        gpu_xform_pos(xf, x, y, z, q);
+        *rho += xf.kphi * xf.sc * xf.sc * gpu_term_leaf_rho(t, q[0], q[1], q[2]);
     } else
         *rho += gpu_term_leaf_rho(t, x, y, z);
 }
@@ -294,58 +332,143 @@ AGAMA_DEVICE_INLINE void gpu_term_dens(const GpuPotTerm<T>& t, T x, T y, T z, /*
     of the whole descriptor at one point: zero-initializes the outputs, then
     accumulates the terms in member order (matching the summation order of the
     Composite batch dispatch in potential_gpu.cpp). */
+/** Resolve one term's modifier transform at time `t`.
+
+    Three cases, in increasing cost, and the cheap ones stay cheap:
+      - no modifiers            -> returns NULL, and the term takes exactly the
+                                   arithmetic path it took before modifiers existed;
+      - constant chain          -> returns the transform baked at build time;
+      - time-varying chain      -> recomposed here from the term's stages, which
+                                   costs a handful of spline lookups.
+    `scratch` receives the recomposed transform in the last case; the returned
+    pointer aliases it, so it must outlive the use of the return value. */
+template<typename T>
+AGAMA_DEVICE_INLINE const GpuPotXform<T>* gpu_term_xform(const GpuPotDesc<T>& d,
+    const GpuPotTerm<T>& t, T time, /*scratch*/ GpuPotXform<T>& scratch)
+{
+    if(t.stageCount > 0) {
+        gpu_stages_xform(d.stages + t.stageBegin, t.stageCount, d.splineData, time, scratch);
+        return &scratch;
+    }
+    return t.hasXform ? &t.xf : (const GpuPotXform<T>*)NULL;
+}
+
 template<typename T>
 AGAMA_DEVICE_INLINE void gpu_desc_phi_acc(const GpuPotDesc<T>& d,
-    T x, T y, T z, /*nullable*/ T* phi, T acc[3])
+    T x, T y, T z, /*nullable*/ T* phi, T acc[3], T time = 0)
 {
     if(phi) *phi = 0;
     acc[0] = acc[1] = acc[2] = 0;
+    // one scratch reused across terms: this runs inside the orbit kernel next to
+    // DOP853's 120-element state/scratch arrays, where every extra live value
+    // competes for registers and therefore for occupancy
+    GpuPotXform<T> scratch;
     for(int c = 0; c < d.nterms; c++)
-        gpu_term_phi_acc(d.terms[c], x, y, z, phi, acc);
+        gpu_term_phi_acc(d.terms[c], gpu_term_xform(d, d.terms[c], time, scratch),
+            x, y, z, phi, acc);
 }
 
 /** Evaluate the mass density of the whole descriptor at one point: the sum of
     the members' densities, in member order (a composite's density is the sum of
     its components', same as its potential). */
 template<typename T>
-AGAMA_DEVICE_INLINE T gpu_desc_dens(const GpuPotDesc<T>& d, T x, T y, T z)
+AGAMA_DEVICE_INLINE T gpu_desc_dens(const GpuPotDesc<T>& d, T x, T y, T z, T time = 0)
 {
     T rho = 0;
+    GpuPotXform<T> scratch;
     for(int c = 0; c < d.nterms; c++)
-        gpu_term_dens(d.terms[c], x, y, z, &rho);
+        gpu_term_dens(d.terms[c], gpu_term_xform(d, d.terms[c], time, scratch),
+            x, y, z, &rho);
     return rho;
 }
 
 namespace detail {
+
+/** Flush an accumulated constant run into a GPU_MOD_CONST stage, so that a
+    time-varying stage emitted after it composes in the right order.
+
+    Needed because composition does not commute: once any stage of a chain is
+    time-varying, an OUTER constant run can no longer be folded into a single
+    baked transform and applied separately -- it has to keep its position in the
+    sequence. If there is no accumulated run (hasXform false) this is a no-op.
+    \return false if the stage array is full. */
+inline bool gpuDescFlushConstStage(GpuPotDesc<double>& desc,
+    GpuPotXform<double>& xf, bool& hasXform, int& stageBegin, int& stageCount)
+{
+    if(!hasXform)
+        return true;
+    if(desc.nstages >= GPU_MOD_MAX_STAGES)
+        return false;
+    desc.stages[desc.nstages].kind = GPU_MOD_CONST;
+    desc.stages[desc.nstages].xf   = xf;
+    if(stageCount == 0)
+        stageBegin = desc.nstages;
+    desc.nstages++;
+    stageCount++;
+    // the run has been consumed; start accumulating a fresh one
+    gpu_xform_identity(xf);
+    hasXform = false;
+    return true;
+}
 
 /** Recursive worker behind buildGpuPotDesc(): appends one or more terms for
     `pot`, each carrying the modifier transform `xf` accumulated by the wrappers
     already descended through (`hasXform` false means `xf` is still the
     identity and should not be stored). See buildGpuPotDesc() for the contract. */
 inline bool gpuDescAddTerms(const BasePotential& pot, GpuPotDesc<double>& desc,
-    double time, bool requireTimeIndependent, GpuPotXform<double> xf, bool hasXform)
+    double time, std::vector<double>* splineData,
+    GpuPotXform<double> xf, bool hasXform, int stageBegin, int stageCount)
 {
     // --- modifier wrappers: fold this stage into xf and descend into the wrapped
     // object. Because the transform rides on the term rather than on a separate
     // kernel, nesting depth is free: N wrappers still collapse to 13 numbers.
+    // Two ways to absorb a modifier stage, chosen by whether the caller can
+    // re-evaluate the descriptor at other times:
+    //
+    //  splineData == NULL (batch eval, one `time` shared by the whole batch):
+    //      fold every stage into the accumulated `xf` at that time. Exact, not an
+    //      approximation, because the answer is only ever wanted at this one time.
+    //
+    //  splineData != NULL (the orbit kernel, which sees a different t at every RK
+    //      stage): fold CONSTANT stages as above -- they can never go stale -- but
+    //      emit a GpuModStage for a time-varying one so the kernel recomposes it
+    //      per step. A constant run that precedes a varying stage cannot simply be
+    //      folded into `xf` and forgotten, because composition does not commute;
+    //      it is flushed into a GPU_MOD_CONST stage so ordering is preserved.
+    // Tilted is always time-independent (Euler angles fixed at construction), so it
+    // is only ever folded -- it has no gpuEmitStage() and needs none.
+    if(const Tilted<BasePotential>* m = dynamic_cast<const Tilted<BasePotential>*>(&pot)) {
+        double A[9], b[3], k, s;
+        m->gpuXformStage(time, A, b, k, s);
+        gpuXformComposeInner(xf, A, b, k, s);
+        return gpuDescAddTerms(*m->component(0), desc, time, splineData,
+            xf, true, stageBegin, stageCount);
+    }
     #define AGAMA_GPU_MOD_UNWRAP(ModClass) \
         if(const ModClass<BasePotential>* m =                                          \
             dynamic_cast<const ModClass<BasePotential>*>(&pot))                        \
         {                                                                              \
-            /* A caller that re-evaluates the descriptor per time step (batch eval,  */\
-            /* one shared `time`) can take any modifier. A caller that builds the    */\
-            /* descriptor once and then integrates across many times (the orbit      */\
-            /* kernel) must refuse a time-varying stage rather than freeze it.       */\
-            if(requireTimeIndependent && !m->gpuXformConstant())                       \
+            if(!splineData || m->gpuXformConstant()) {                                  \
+                double A[9], b[3], k, s;                                               \
+                m->gpuXformStage(time, A, b, k, s);                                     \
+                gpuXformComposeInner(xf, A, b, k, s);                                   \
+                return gpuDescAddTerms(*m->component(0), desc, time, splineData,        \
+                    xf, true, stageBegin, stageCount);                                  \
+            }                                                                          \
+            if(!gpuDescFlushConstStage(desc, xf, hasXform, stageBegin, stageCount))     \
                 return false;                                                          \
-            double A[9], b[3], k, s;                                                   \
-            m->gpuXformStage(time, A, b, k, s);                                         \
-            gpuXformComposeInner(xf, A, b, k, s);                                       \
-            return gpuDescAddTerms(*m->component(0), desc, time,                        \
-                requireTimeIndependent, xf, true);                                      \
+            if(desc.nstages >= GPU_MOD_MAX_STAGES)                                     \
+                return false;                                                          \
+            if(!m->gpuEmitStage(desc.stages[desc.nstages], *splineData))                \
+                return false;                                                          \
+            if(stageCount == 0)                                                        \
+                stageBegin = desc.nstages;                                             \
+            desc.nstages++;                                                            \
+            stageCount++;                                                              \
+            return gpuDescAddTerms(*m->component(0), desc, time, splineData,            \
+                xf, false, stageBegin, stageCount);                                     \
         }
     AGAMA_GPU_MOD_UNWRAP(Shifted)
-    AGAMA_GPU_MOD_UNWRAP(Tilted)
     AGAMA_GPU_MOD_UNWRAP(Rotating)
     AGAMA_GPU_MOD_UNWRAP(Scaled)
     #undef AGAMA_GPU_MOD_UNWRAP
@@ -355,8 +478,8 @@ inline bool gpuDescAddTerms(const BasePotential& pot, GpuPotDesc<double>& desc,
     // Phi is linear in the members.
     if(const Composite* comp = dynamic_cast<const Composite*>(&pot)) {
         for(unsigned int c = 0; c < comp->size(); c++)
-            if(!gpuDescAddTerms(*comp->component(c), desc, time,
-                requireTimeIndependent, xf, hasXform))
+            if(!gpuDescAddTerms(*comp->component(c), desc, time, splineData,
+                xf, hasXform, stageBegin, stageCount))
                 return false;
         return true;
     }
@@ -366,8 +489,25 @@ inline bool gpuDescAddTerms(const BasePotential& pot, GpuPotDesc<double>& desc,
     term.aux = 0;
     for(int k = 0; k < 6; k++)
         term.p[k] = 0;
-    term.hasXform = hasXform ? 1 : 0;
-    term.xf = xf;
+    term.stageBegin = stageBegin;
+    term.stageCount = stageCount;
+    if(stageCount > 0) {
+        // A trailing constant run after the last varying stage still has to be
+        // applied, and it is INNERMOST, so it must follow them as its own stage.
+        if(hasXform) {
+            if(desc.nstages >= GPU_MOD_MAX_STAGES)
+                return false;
+            desc.stages[desc.nstages].kind = GPU_MOD_CONST;
+            desc.stages[desc.nstages].xf   = xf;
+            desc.nstages++;
+            term.stageCount++;
+        }
+        term.hasXform = 0;
+        gpu_xform_identity(term.xf);
+    } else {
+        term.hasXform = hasXform ? 1 : 0;
+        term.xf = xf;
+    }
     if(hasXform) {
         // Fail closed on a degenerate transform (scale(t) == 0 gives an infinite
         // s; a NaN anywhere in the chain would otherwise silently poison every
@@ -428,27 +568,46 @@ inline bool gpuDescAddTerms(const BasePotential& pot, GpuPotDesc<double>& desc,
     Shifted / Tilted / Rotating / Scaled modifier wrappers) into `desc`.
 
     \param[in]  time  the moment at which time-dependent modifier stages are
-    evaluated and baked into the terms. The resulting descriptor is therefore
-    valid AT THAT TIME ONLY unless requireTimeIndependent was set.
-    \param[in]  requireTimeIndependent  if true, refuse any modifier stage whose
-    transform varies with time, so that the returned descriptor is valid at every
-    time. Callers that build once and evaluate at many times -- the orbit kernel,
-    which sees a different t at each RK stage -- MUST set this; callers with a
-    single shared `time` for the whole batch must not, since for them baking the
-    stage in at `time` is exact.
+    folded into the terms. When `splineData` is NULL the resulting descriptor is
+    valid AT THAT TIME ONLY; when it is given, only the constant parts are folded
+    at `time` (which is immaterial for them) and the rest stays re-evaluable.
+    \param[in,out]  splineData  when NULL (the default, and what batch evaluation
+    wants), every modifier stage is folded at `time`. When non-NULL, time-varying
+    stages are instead emitted into desc.stages and their spline node arrays are
+    appended to this vector; the CALLER must then place that data where the kernel
+    can read it (host memory for Serial/OpenMP, device memory for Cuda) and set
+    desc.splineData to point at it -- see castGpuSplineData() and the orbit path
+    in orbit_gpu.cpp. desc.splineData is deliberately left NULL here, because only
+    the caller knows which memory space the kernel will run in.
     \return true on success; false if any member is not a representable type, a
-    modifier stage was rejected per requireTimeIndependent, a transform came out
-    non-finite, or the flattened member count exceeds GPU_POT_DESC_MAX_TERMS --
-    in which case the caller should fall back to the CPU path (desc is left
-    partially filled and must not be used). Use
-    potential::unsupportedGPUPotentialName() for the user-facing error message. */
+    transform came out non-finite, a modifier spline could not be packed, or the
+    member/stage count exceeds GPU_POT_DESC_MAX_TERMS / GPU_MOD_MAX_STAGES -- in
+    which case the caller should fall back to the CPU path (desc is left partially
+    filled and must not be used). Use potential::unsupportedGPUPotentialName() for
+    the user-facing error message. */
 inline bool buildGpuPotDesc(const BasePotential& pot, GpuPotDesc<double>& desc,
-    double time = 0, bool requireTimeIndependent = false)
+    double time = 0, std::vector<double>* splineData = NULL)
 {
-    desc.nterms = 0;
+    desc.nterms  = 0;
+    desc.nstages = 0;
+    desc.splineData = NULL;
+    if(splineData)
+        splineData->clear();
     GpuPotXform<double> xf;
     gpu_xform_identity(xf);
-    return detail::gpuDescAddTerms(pot, desc, time, requireTimeIndependent, xf, false);
+    return detail::gpuDescAddTerms(pot, desc, time, splineData, xf, false, 0, 0);
+}
+
+/// element-wise cast of one transform; shared by the term and stage loops below
+template<typename T>
+inline void castGpuPotXform(const GpuPotXform<double>& in, /*out*/ GpuPotXform<T>& out)
+{
+    for(int k = 0; k < 9; k++)
+        out.mat[k] = static_cast<T>(in.mat[k]);
+    for(int k = 0; k < 3; k++)
+        out.off[k] = static_cast<T>(in.off[k]);
+    out.kphi = static_cast<T>(in.kphi);
+    out.sc   = static_cast<T>(in.sc);
 }
 
 /** Convert a double-precision descriptor to the kernel's working precision
@@ -463,15 +622,34 @@ inline GpuPotDesc<T> castGpuPotDesc(const GpuPotDesc<double>& d)
         out.terms[c].aux = d.terms[c].aux;
         for(int k = 0; k < 6; k++)
             out.terms[c].p[k] = static_cast<T>(d.terms[c].p[k]);
-        out.terms[c].hasXform = d.terms[c].hasXform;
-        for(int k = 0; k < 9; k++)
-            out.terms[c].xf.mat[k] = static_cast<T>(d.terms[c].xf.mat[k]);
-        for(int k = 0; k < 3; k++)
-            out.terms[c].xf.off[k] = static_cast<T>(d.terms[c].xf.off[k]);
-        out.terms[c].xf.kphi = static_cast<T>(d.terms[c].xf.kphi);
-        out.terms[c].xf.sc   = static_cast<T>(d.terms[c].xf.sc);
+        out.terms[c].hasXform   = d.terms[c].hasXform;
+        out.terms[c].stageBegin = d.terms[c].stageBegin;
+        out.terms[c].stageCount = d.terms[c].stageCount;
+        castGpuPotXform<T>(d.terms[c].xf, out.terms[c].xf);
     }
+    out.nstages = d.nstages;
+    for(int i = 0; i < d.nstages; i++) {
+        out.stages[i].kind = d.stages[i].kind;
+        castGpuPotXform<T>(d.stages[i].xf, out.stages[i].xf);
+        for(int k = 0; k < 3; k++) {
+            out.stages[i].s[k].off  = d.stages[i].s[k].off;
+            out.stages[i].s[k].size = d.stages[i].s[k].size;
+            out.stages[i].s[k].c    = static_cast<T>(d.stages[i].s[k].c);
+        }
+    }
+    // set by the caller once the spline data is in the right memory space
+    out.splineData = NULL;
     return out;
+}
+
+/** Convert the flat spline buffer that buildGpuPotDesc() filled to the kernel's
+    working precision. Identity for T=double; a one-time host-side cast otherwise.
+    Coefficients are stored fp64 and cast on load, as everywhere else in the
+    descriptor (hard constraint #4). */
+template<typename T>
+inline std::vector<T> castGpuSplineData(const std::vector<double>& src)
+{
+    return std::vector<T>(src.begin(), src.end());
 }
 
 }  // namespace potential

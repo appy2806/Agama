@@ -8935,13 +8935,13 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
                     std::vector<float> trajF((size_t)numOrbits * trajsize * 6);
                     rc = orbit::integrateOrbitsGPU<float>(*pot, numOrbits, icFlat.data(),
                         timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
-                        trajF.data(), deviceStr.c_str(), gpuMethod);
+                        trajF.data(), deviceStr.c_str(), gpuMethod, timestart.data());
                     for(size_t j=0; j<trajF.size(); j++)
                         trajFlat[j] = trajF[j];
                 } else
                     rc = orbit::integrateOrbitsGPU<double>(*pot, numOrbits, icFlat.data(),
                         timetotal.data(), trajsize, params.accuracy, params.maxNumSteps,
-                        trajFlat.data(), deviceStr.c_str(), gpuMethod);
+                        trajFlat.data(), deviceStr.c_str(), gpuMethod, timestart.data());
             }
             catch(std::exception& ex) {
                 errorMessage = ex.what();
@@ -8963,14 +8963,14 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
                         potential::unsupportedGPUPotentialName(*pot).c_str());
                     break;
                 case orbit::ORBIT_GPU_ETIMEDEP:
-                    // the potential IS representable on the GPU orbit path; it is
-                    // specifically the time-dependence of a modifier that is unsupported
+                    // No longer produced for a time-varying modifier -- those are
+                    // supported now, via device-resident modifier splines. Retained
+                    // so that any future "representable, but not at arbitrary times"
+                    // case has a distinct code rather than being lumped into EUNSUPP.
                     PyErr_Format(PyExc_NotImplementedError,
-                        "orbit(device='%s'): the potential '%s' contains a time-varying "
-                        "modifier (a Shifted/Rotating/Scaled whose center/angle/amplitude/scale "
-                        "changes with time), which the GPU orbit path does not support yet; "
-                        "a constant modifier is supported, or omit the device argument to use "
-                        "the CPU path", deviceStr.c_str(), pot->name().c_str());
+                        "orbit(device='%s'): the potential '%s' cannot be evaluated at "
+                        "arbitrary times on the GPU orbit path; omit the device argument "
+                        "to use the CPU path", deviceStr.c_str(), pot->name().c_str());
                     break;
                 default:   // EBADDEV is pre-validated above, so this is unreachable
                     PyErr_Format(PyExc_RuntimeError,

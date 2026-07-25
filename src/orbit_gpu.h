@@ -100,6 +100,13 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                        std::size_t maxNumSteps,
                        T* traj,
                        const char* device,
-                       int method = ORBIT_GPU_DOP853);
+                       int method = ORBIT_GPU_DOP853,
+                       /** per-orbit absolute start time, length Norb, in internal units;
+                           NULL means all zeros. Only affects a TIME-DEPENDENT potential:
+                           it is the absolute time at which each orbit's integration
+                           begins, which the kernel adds to the ODE cores' per-step time
+                           offsets before asking the potential for a force. Mirrors
+                           OrbitIntegrator's timeBegin. */
+                       const double* timeStart = NULL);
 
 }  // namespace orbit

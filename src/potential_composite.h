@@ -345,18 +345,24 @@ AGAMA_DEVICE_INLINE void gpu_xform_vec(const GpuPotXform<T>& f, const T v[3], /*
     out[2] = f.kphi * (f.mat[2] * v[0] + f.mat[5] * v[1] + f.mat[8] * v[2]);
 }
 
-/** Host-side composition: fold one more modifier stage, which sits INSIDE
-    everything already accumulated in `f`, into `f`.
+/** Fold one more modifier stage, which sits INSIDE everything already accumulated
+    in `f`, into `f`.
 
     Call order therefore runs from the outermost modifier to the innermost, i.e.
     in the same direction as descending the wrapper chain from the object the
     user holds down to the concrete potential. Given the accumulated map
     x -> M x + off and the new stage's x -> A x + b, the composite is
-    A(M x + off) + b, hence M <- A*M and off <- A*off + b. */
-inline void gpuXformComposeInner(GpuPotXform<double>& f,
-    const double A[9], const double b[3], double k, double s)
+    A(M x + off) + b, hence M <- A*M and off <- A*off + b.
+
+    Device-callable as well as host-callable: the host uses it to bake a constant
+    chain once at descriptor-build time, and the orbit kernel uses the same body
+    to recompose a time-varying chain at each integration step. One source of the
+    composition rule for both. */
+template<typename T>
+AGAMA_DEVICE_INLINE void gpuXformComposeInner(GpuPotXform<T>& f,
+    const T A[9], const T b[3], T k, T s)
 {
-    double M[9], o[3];
+    T M[9], o[3];
     for(int i=0; i<3; i++) {
         for(int j=0; j<3; j++)
             M[3*i+j] = A[3*i+0] * f.mat[0*3+j] + A[3*i+1] * f.mat[1*3+j] + A[3*i+2] * f.mat[2*3+j];
@@ -368,6 +374,138 @@ inline void gpuXformComposeInner(GpuPotXform<double>& f,
         f.off[i] = o[i];
     f.kphi *= k;
     f.sc   *= s;
+}
+
+
+/** Reference to one cubic spline held in a flat buffer that the descriptor owns
+    (GpuPotDesc::splineData). Modifier splines are small -- a handful of nodes --
+    so all of a descriptor's splines are packed into one allocation and addressed
+    by offset, which keeps the by-value descriptor free of per-spline pointers.
+
+    Layout of one spline at `off`:  [ knots(size) | values(size) | derivs(size) ],
+    i.e. exactly the three arrays evalCubicSplineRaw wants.
+
+    `size == 0` encodes a CONSTANT spline whose value is `c`, so the common
+    "this component of the chain does not actually vary" case costs a compare
+    instead of a binary search plus a polynomial evaluation. */
+template<typename T>
+struct GpuSplineRef {
+    int off;   ///< index of this spline's first knot within GpuPotDesc::splineData
+    int size;  ///< number of nodes; 0 means "constant, value is c"
+    T   c;     ///< the constant value, when size == 0
+};
+
+/** Evaluate a referenced spline at `t`. */
+template<typename T>
+AGAMA_DEVICE_INLINE T gpu_spline_at(const GpuSplineRef<T>& s, const T* data, T t)
+{
+    if(s.size == 0)
+        return s.c;
+    T v;
+    math::evalCubicSplineRaw(t, data + s.off, data + s.off + s.size,
+        data + s.off + 2 * s.size, s.size, &v);
+    return v;
+}
+
+/** Host-side: append one spline's three arrays to `data` and return a reference to
+    it. A spline that is constant is stored inline as `c` with size 0 and consumes
+    no buffer space at all.
+    \return false if the spline is empty, i.e. would evaluate to NaN -- the caller
+    must fail closed rather than bake a NaN or, worse, mistake the zero size for
+    the constant encoding. */
+inline bool gpuPackSpline(const math::CubicSpline& spl,
+    /*out*/ GpuSplineRef<double>& ref, /*append to*/ std::vector<double>& data)
+{
+    const std::vector<double>& x = spl.xvalues();
+    if(x.empty())
+        return false;
+    if(spl.isConstant()) {
+        ref.off  = 0;
+        ref.size = 0;
+        ref.c    = spl.fvalues()[0];
+        return true;
+    }
+    const std::vector<double>& f = spl.fvalues();
+    const std::vector<double>& d = spl.fderivs();
+    if(f.size() != x.size() || d.size() != x.size())
+        return false;
+    ref.off  = static_cast<int>(data.size());
+    ref.size = static_cast<int>(x.size());
+    ref.c    = 0;
+    data.insert(data.end(), x.begin(), x.end());
+    data.insert(data.end(), f.begin(), f.end());
+    data.insert(data.end(), d.begin(), d.end());
+    return true;
+}
+
+/** Which kind of stage a GpuModStage holds. GPU_MOD_CONST is not a modifier
+    class: it is a maximal run of time-INDEPENDENT stages that the host already
+    composed into a single transform, so the kernel replays one matrix multiply
+    instead of re-deriving a rotation it knows cannot have changed. Tilted is
+    always folded this way, since its Euler angles are fixed at construction. */
+enum GpuModKind {
+    GPU_MOD_CONST,
+    GPU_MOD_SHIFTED,
+    GPU_MOD_ROTATING,
+    GPU_MOD_SCALED
+};
+
+/** One stage of a modifier chain that the kernel must re-evaluate per time step.
+    Only used for genuinely time-varying chains; a wholly constant chain is baked
+    into the term's GpuPotXform at build time and needs no stages at all. */
+template<typename T>
+struct GpuModStage {
+    int kind;               ///< a GpuModKind value
+    GpuPotXform<T> xf;      ///< GPU_MOD_CONST only: the pre-composed constant run
+    GpuSplineRef<T> s[3];   ///< SHIFTED: cx,cy,cz;  ROTATING: angle;  SCALED: ampl,scale
+};
+
+/** Recompose a modifier chain at time `t` into `out`.
+
+    This is the device-side counterpart of what the host does when it bakes a
+    constant chain: identical composition rule (gpuXformComposeInner), identical
+    per-modifier stage matrices as the four gpuXformStage() methods below, so the
+    two cannot drift. The stages are ordered outermost-first, as the builder
+    emits them. */
+template<typename T>
+AGAMA_DEVICE_INLINE void gpu_stages_xform(const GpuModStage<T>* stages, int n,
+    const T* data, T t, /*out*/ GpuPotXform<T>& out)
+{
+    gpu_xform_identity(out);
+    for(int i = 0; i < n; i++) {
+        const GpuModStage<T>& st = stages[i];
+        if(st.kind == GPU_MOD_CONST) {
+            gpuXformComposeInner(out, st.xf.mat, st.xf.off, st.xf.kphi, st.xf.sc);
+            continue;
+        }
+        T A[9], b[3], k = 1, s = 1;
+        A[0] = 1; A[1] = 0; A[2] = 0;
+        A[3] = 0; A[4] = 1; A[5] = 0;
+        A[6] = 0; A[7] = 0; A[8] = 1;
+        b[0] = b[1] = b[2] = 0;
+        if(st.kind == GPU_MOD_SHIFTED) {
+            b[0] = -gpu_spline_at(st.s[0], data, t);
+            b[1] = -gpu_spline_at(st.s[1], data, t);
+            b[2] = -gpu_spline_at(st.s[2], data, t);
+        } else if(st.kind == GPU_MOD_ROTATING) {
+            // std::sin/std::cos rather than math::sincos, which is declared for
+            // double only and so cannot serve an fp32 kernel; same substitution
+            // Tier 0 made in math::trigMultiAngle for the same reason. nvcc fuses
+            // the pair back into a single sincos on device. The host-side constant
+            // path (Rotating::gpuXformStage) still uses math::sincos, so a constant
+            // rotation stays bit-identical to the CPU; a time-varying one may differ
+            // from it in the last bit, which the descriptor path already tolerates.
+            const T ang = gpu_spline_at(st.s[0], data, t);
+            const T sa = std::sin(ang), ca = std::cos(ang);
+            A[0] =  ca; A[1] = sa;
+            A[3] = -sa; A[4] = ca;
+        } else {   // GPU_MOD_SCALED
+            s = T(1) / gpu_spline_at(st.s[1], data, t);
+            A[0] = A[4] = A[8] = s;
+            k = gpu_spline_at(st.s[0], data, t) * s;
+        }
+        gpuXformComposeInner(out, A, b, k, s);
+    }
 }
 
 
@@ -463,12 +601,23 @@ public:
     }
 
     /** True if gpuXformStage() returns the same stage for every `time`, so the
-        stage can be folded once into a by-value descriptor. A caller that
-        cannot re-evaluate the splines per step (the orbit kernel, which sees a
-        different t at every RK stage) must refuse a chain where this is false
-        rather than silently freeze it at one time. */
+        stage can be folded once into a by-value descriptor. A caller that CAN
+        re-evaluate per step asks for a GpuModStage via gpuEmitStage() instead. */
     bool gpuXformConstant() const
     { return centerx.isConstant() && centery.isConstant() && centerz.isConstant(); }
+
+    /** Emit this modifier as a device-evaluable stage: record the kind and append
+        the three center splines to the descriptor's flat spline buffer. Used only
+        for chains the caller must re-evaluate at many times (the orbit kernel);
+        a constant chain is baked by gpuXformStage() instead and needs no stage.
+        \return false if any spline could not be packed (see gpuPackSpline). */
+    bool gpuEmitStage(/*out*/ GpuModStage<double>& st, std::vector<double>& data) const
+    {
+        st.kind = GPU_MOD_SHIFTED;
+        return gpuPackSpline(centerx, st.s[0], data)
+            && gpuPackSpline(centery, st.s[1], data)
+            && gpuPackSpline(centerz, st.s[2], data);
+    }
 
 private:
     /// the instance of the actual potential
@@ -676,6 +825,13 @@ public:
     /// a constant rotation angle is equivalent to a Tilted modifier and is time-independent
     bool gpuXformConstant() const { return angle.isConstant(); }
 
+    /// Emit as a device-evaluable stage; see Shifted<BasePotential>::gpuEmitStage.
+    bool gpuEmitStage(/*out*/ GpuModStage<double>& st, std::vector<double>& data) const
+    {
+        st.kind = GPU_MOD_ROTATING;
+        return gpuPackSpline(angle, st.s[0], data);
+    }
+
 private:
     /// the instance of the actual potential
     const PtrPotential pot;
@@ -796,6 +952,15 @@ public:
 
     /// both the amplitude and the length scale must be time-independent
     bool gpuXformConstant() const { return ampl.isConstant() && scale.isConstant(); }
+
+    /// Emit as a device-evaluable stage; see Shifted<BasePotential>::gpuEmitStage.
+    /// Slot order (ampl, scale) must match what gpu_stages_xform reads.
+    bool gpuEmitStage(/*out*/ GpuModStage<double>& st, std::vector<double>& data) const
+    {
+        st.kind = GPU_MOD_SCALED;
+        return gpuPackSpline(ampl, st.s[0], data)
+            && gpuPackSpline(scale, st.s[1], data);
+    }
 
 private:
     /// the instance of the actual potential

@@ -113,7 +113,7 @@ bool can_dispatch(const BasePotential& pot, double time = 0)
     // fail there after partially writing the outputs.
     if(is_modifier(pot)) {
         GpuPotDesc<double> desc;
-        return buildGpuPotDesc(pot, desc, time, /*requireTimeIndependent*/ false);
+        return buildGpuPotDesc(pot, desc, time);
     }
     // Dehnen is deliberately NOT in AGAMA_GPU_POT_LIST above: it is only
     // GPU-dispatchable in the spherical case (axisRatioY==axisRatioZ==1) --
@@ -282,7 +282,7 @@ bool try_dispatch(const BasePotential& pot, Policy pol,
     // here, not an approximation, because the whole batch shares one `time`.
     if(is_modifier(pot)) {
         GpuPotDesc<double> desc0;
-        if(!buildGpuPotDesc(pot, desc0, time, /*requireTimeIndependent*/ false))
+        if(!buildGpuPotDesc(pot, desc0, time))
             return false;
         evalmanyDescT<T>(pol, N, xyz_p, mode, out1, out3,
             castGpuPotDesc<T>(desc0), add);

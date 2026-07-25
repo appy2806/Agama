@@ -38,17 +38,29 @@ namespace {
 /** Force callable for the DOP853 core: the equations of motion
     dw/dt = {v, -grad Phi} for w = {x,y,z,vx,vy,vz}, with the same optional
     accuracy factor as OrbitIntegrator<coord::Car>::eval (Omega = 0):
-    accFac = min(1, |Epot+Ekin| / max(|Epot|, Ekin)). The potential is static,
-    so the time argument is unused. */
+    accFac = min(1, |Epot+Ekin| / max(|Epot|, Ekin)).
+
+    The ODE cores hand the force a time OFFSET relative to the start of the
+    current step (see the `time offset` comments in math_ode.h), so the absolute
+    time a time-dependent potential needs is timeBegin + offset -- exactly what
+    OrbitIntegrator<coord::Car>::eval does on the CPU with its own timeBegin.
+    The caller updates timeBegin before each step.
+
+    `desc` is a POINTER, not a copy: the descriptor is a few kilobytes and both
+    this functor and GpuDescForce2 would otherwise duplicate it into the kernel
+    argument space. Each thread instead builds its own tiny functor pointing at
+    the single captured descriptor, which is also what makes timeBegin safe to
+    mutate per thread. */
 template<typename T>
 struct GpuDescForce {
-    potential::GpuPotDesc<T> desc;
+    const potential::GpuPotDesc<T>* desc;
+    double timeBegin;   ///< absolute time at the start of the current step
 
-    AGAMA_DEVICE_INLINE void operator()(T /*t*/, const T w[], T dwdt[], T* accFac) const
+    AGAMA_DEVICE_INLINE void operator()(T t, const T w[], T dwdt[], T* accFac) const
     {
         T Epot, acc[3];
-        potential::gpu_desc_phi_acc(desc, w[0], w[1], w[2],
-            accFac ? &Epot : (T*)NULL, acc);
+        potential::gpu_desc_phi_acc(*desc, w[0], w[1], w[2],
+            accFac ? &Epot : (T*)NULL, acc, T(timeBegin + t));
         // time derivative of position
         dwdt[0] = w[3];
         dwdt[1] = w[4];
@@ -79,14 +91,15 @@ struct GpuDescForce {
     the force descriptor does not carry, and only the Hermite scheme uses it. */
 template<typename T>
 struct GpuDescForce2 {
-    potential::GpuPotDesc<T> desc;
+    const potential::GpuPotDesc<T>* desc;
+    double timeBegin;   ///< absolute time at the start of the current step
 
-    AGAMA_DEVICE_INLINE void operator()(T /*t*/, const T x[], T d2xdt2[],
+    AGAMA_DEVICE_INLINE void operator()(T t, const T x[], T d2xdt2[],
         T* /*d3xdt3 (unused: Hermite-only)*/, T* accFac) const
     {
         T Epot, acc[3];
-        potential::gpu_desc_phi_acc(desc, x[0], x[1], x[2],
-            accFac ? &Epot : (T*)NULL, acc);
+        potential::gpu_desc_phi_acc(*desc, x[0], x[1], x[2],
+            accFac ? &Epot : (T*)NULL, acc, T(timeBegin + t));
         d2xdt2[0] = acc[0];
         d2xdt2[1] = acc[1];
         d2xdt2[2] = acc[2];
@@ -108,10 +121,13 @@ struct GpuDescForce2 {
     time sign * interval * j, interval = |totalTime| / (trajsize-1); samples
     that the integration never reaches (stepper error / step limit) stay NAN. */
 template<typename T>
-AGAMA_DEVICE_INLINE void integrate_one_orbit(const GpuDescForce<T>& force,
-    const T ic6[6], double totalTime, T accuracy,
+AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
+    const T ic6[6], double timeStart, double totalTime, T accuracy,
     unsigned long long maxNumSteps, std::size_t trajsize, T* traj)
 {
+    // `force` is taken BY VALUE (it is a pointer plus a scalar) so this thread can
+    // advance its timeBegin without disturbing any other thread.
+    force.timeBegin = timeStart;
     const int NDIM = 6;
     // pre-fill with NAN: anything not overwritten below signals "not reached"
     for(std::size_t j = 0; j < trajsize * 6; j++)
@@ -135,6 +151,8 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(const GpuDescForce<T>& force,
     unsigned long long numSteps = 0;
     while(tcur != totalTime) {
         double timeRemaining = totalTime - tcur;
+        // the stepper's stage times are offsets from here
+        force.timeBegin = timeStart + tcur;
         T h = math::dop853_step(force, NDIM, accuracy, /*accAbs*/ T(0),
             state, xt, nextTimeStep, T(timeRemaining));
         if(!(double(h) * sign > 0)) {   // stepper signalled an error
@@ -180,10 +198,12 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(const GpuDescForce<T>& force,
     is method-agnostic about that rescaling. force1 is used only for the initial
     timestep estimate (as in dprkn8_init); force2 supplies the acceleration. */
 template<typename T>
-AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(const GpuDescForce<T>& force1,
-    const GpuDescForce2<T>& force2, const T ic6[6], double totalTime, T accuracy,
-    unsigned long long maxNumSteps, std::size_t trajsize, T* traj)
+AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
+    GpuDescForce2<T> force2, const T ic6[6], double timeStart, double totalTime,
+    T accuracy, unsigned long long maxNumSteps, std::size_t trajsize, T* traj)
 {
+    force1.timeBegin = timeStart;
+    force2.timeBegin = timeStart;
     const int NDIM = 6;         // full 2nd-order system size (numVar = 3)
     for(std::size_t j = 0; j < trajsize * 6; j++)
         traj[j] = T(NAN);
@@ -203,6 +223,7 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(const GpuDescForce<T>& force
     unsigned long long numSteps = 0;
     while(tcur != totalTime) {
         double timeRemaining = totalTime - tcur;
+        force2.timeBegin = timeStart + tcur;
         T h = math::dprkn8_step(force2, NDIM, accuracy,
             state, scratch, nextTimeStep, qold, T(timeRemaining));
         if(!(double(h) * sign > 0)) {   // stepper signalled an error
@@ -244,22 +265,28 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(const GpuDescForce<T>& force
     Serial/OpenMP, device pointers for Cuda). */
 template<typename T, class Policy>
 void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc, int method,
-    std::size_t Norb, const T* ic, const double* times, std::size_t trajsize,
-    T accuracy, unsigned long long maxNumSteps, T* traj)
+    std::size_t Norb, const T* ic, const double* times, const double* timeStart,
+    std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, T* traj)
 {
-    GpuDescForce<T>  force  = { desc };  // 1st-order r.h.s. (DOP853 + DPRKN8 init)
-    GpuDescForce2<T> force2 = { desc };  // 2nd-order r.h.s. (DPRKN8 stages)
+    // The functors are built INSIDE the kernel so that each thread gets its own
+    // (tiny) copy pointing at the single descriptor captured by value here. Built
+    // outside, a host-side &desc would be meaningless on the device, and holding
+    // the descriptor by value in each of the two functors would put two multi-KiB
+    // copies into the kernel argument space.
     // `method` is a kernel-uniform runtime value: every thread branches the same
     // way, so there is no warp divergence from this test.
     agama::forall(pol, Norb, [=] AGAMA_DEVICE (std::size_t i) {
         T ic6[6];
         for(int k = 0; k < 6; k++)
             ic6[k] = ic[i*6 + k];
+        const double t0 = timeStart ? timeStart[i] : 0.0;
+        GpuDescForce<T>  force  = { &desc, t0 };  // 1st-order r.h.s. (DOP853 + DPRKN8 init)
+        GpuDescForce2<T> force2 = { &desc, t0 };  // 2nd-order r.h.s. (DPRKN8 stages)
         if(method == orbit::ORBIT_GPU_DPRKN8)
-            integrate_one_orbit_dprkn8(force, force2, ic6, times[i], accuracy,
+            integrate_one_orbit_dprkn8(force, force2, ic6, t0, times[i], accuracy,
                 maxNumSteps, trajsize, traj + i * trajsize * 6);
         else
-            integrate_one_orbit(force, ic6, times[i], accuracy, maxNumSteps,
+            integrate_one_orbit(force, ic6, t0, times[i], accuracy, maxNumSteps,
                 trajsize, traj + i * trajsize * 6);
     });
 }
@@ -348,27 +375,28 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
                        std::size_t maxNumSteps,
                        T* traj,
                        const char* device,
-                       int method)
+                       int method,
+                       const double* timeStart)
 {
     if(trajsize < 1)
         return ORBIT_GPU_EUNSUPP;
     if(method != ORBIT_GPU_DOP853 && method != ORBIT_GPU_DPRKN8)
         return ORBIT_GPU_EUNSUPP;
     potential::GpuPotDesc<double> desc0;
-    // requireTimeIndependent=true is load-bearing, not defensive: the descriptor is
-    // built ONCE here and then evaluated at every RK stage of every orbit, at times
-    // this function never sees. Building it at some nominal time would integrate a
-    // frozen snapshot of a moving potential and return a plausible wrong answer, so
-    // a time-varying modifier is refused outright.
-    if(!potential::buildGpuPotDesc(pot, desc0, /*time*/ 0, /*requireTimeIndependent*/ true)) {
-        // Separate the two failure reasons for the user's benefit: retrying without
-        // the time-independence requirement tells us whether the descriptor was
-        // blocked by an unrepresentable potential type or purely by time dependence.
-        potential::GpuPotDesc<double> probe;
-        return potential::buildGpuPotDesc(pot, probe, /*time*/ 0, /*requireTimeIndependent*/ false)
-            ? ORBIT_GPU_ETIMEDEP : ORBIT_GPU_EUNSUPP;
-    }
-    const potential::GpuPotDesc<T> desc = potential::castGpuPotDesc<T>(desc0);
+    // Pass a spline buffer, which is what tells the builder to emit re-evaluable
+    // GpuModStage entries for time-VARYING modifier chains instead of folding them
+    // at one nominal time. That distinction is load-bearing here: the descriptor is
+    // built ONCE and then evaluated at every RK stage of every orbit, at times this
+    // function never sees, so a folded moving potential would silently integrate a
+    // frozen snapshot. Constant chains are still folded on the host and cost the
+    // kernel nothing.
+    std::vector<double> splineData0;
+    if(!potential::buildGpuPotDesc(pot, desc0, /*time*/ 0, &splineData0))
+        return ORBIT_GPU_EUNSUPP;
+    potential::GpuPotDesc<T> desc = potential::castGpuPotDesc<T>(desc0);
+    // Spline coefficients in the kernel's working precision; `desc.splineData` is
+    // pointed at whichever memory space the chosen policy will read from, below.
+    const std::vector<T> splineT = potential::castGpuSplineData<T>(splineData0);
     // Per-method base tolerance (in double): DPRKN8 applies the SAME empirical
     // rescaling as the CPU OdeStepperDPRKN8 constructor (10 * accuracy^0.9) so
     // the user-facing `accuracy` has an identical meaning for both methods and
@@ -393,12 +421,13 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
         std::vector<T> icT(Norb * 6);
         for(std::size_t j = 0; j < Norb * 6; j++)
             icT[j] = static_cast<T>(ic[j]);
+        desc.splineData = splineT.empty() ? NULL : splineT.data();
         if(std::strcmp(device, "serial") == 0)
             run_batch<T>(agama::Serial{}, desc, method, Norb, icT.data(), times,
-                trajsize, accT, maxNumSteps, traj);
+                timeStart, trajsize, accT, maxNumSteps, traj);
         else
             run_batch<T>(agama::OpenMP{}, desc, method, Norb, icT.data(), times,
-                trajsize, accT, maxNumSteps, traj);
+                timeStart, trajsize, accT, maxNumSteps, traj);
         return ORBIT_GPU_OK;
     }
     if(std::strcmp(device, "cuda") == 0) {
@@ -417,11 +446,22 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
         StreamBuffer<T>      d_ic   (Norb * 6,            stream.s);
         StreamBuffer<double> d_times(Norb,                stream.s);
         StreamBuffer<T>      d_traj (Norb * trajsize * 6, stream.s);
+        // modifier spline coefficients must be device-resident for the kernel to
+        // re-evaluate the chain per step; empty for a time-independent potential
+        StreamBuffer<T>      d_spline(splineT.size(),        stream.s);
+        StreamBuffer<double> d_tstart(timeStart ? Norb : 0,  stream.s);
         d_ic.from_host(icT.data(), Norb * 6);
         d_times.from_host(times, Norb);
+        if(!splineT.empty()) {
+            d_spline.from_host(splineT.data(), splineT.size());
+            desc.splineData = d_spline.data();
+        }
+        if(timeStart)
+            d_tstart.from_host(timeStart, Norb);
         agama::Cuda pol;
         pol.stream = stream.s;
         run_batch<T>(pol, desc, method, Norb, d_ic.data(), d_times.data(),
+            timeStart ? d_tstart.data() : NULL,
             trajsize, accT, maxNumSteps, d_traj.data());
         d_traj.to_host(traj, Norb * trajsize * 6);
         // wait only for THIS call's work; other threads' streams keep running
@@ -436,8 +476,8 @@ int integrateOrbitsGPU(const potential::BasePotential& pot,
 
 // Explicit instantiations for the two precisions the Python boundary exposes.
 template int integrateOrbitsGPU<float >(const potential::BasePotential&, std::size_t,
-    const double*, const double*, std::size_t, double, std::size_t, float*,  const char*, int);
+    const double*, const double*, std::size_t, double, std::size_t, float*,  const char*, int, const double*);
 template int integrateOrbitsGPU<double>(const potential::BasePotential&, std::size_t,
-    const double*, const double*, std::size_t, double, std::size_t, double*, const char*, int);
+    const double*, const double*, std::size_t, double, std::size_t, double*, const char*, int, const double*);
 
 }  // namespace orbit

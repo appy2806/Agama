@@ -103,24 +103,45 @@ namespace math{
 /// nvcc emits both host and __device__ versions of the same body, and the CPU build sees plain
 /// `inline` (see gpu_device.h) -- bit-for-bit identical machine code path to before this move.
 
+/** Blocks template-argument deduction for the parameter it wraps.
+
+    `typename nondeduced<NumT>::type*` is spelled out rather than `NumT*` for the OUTPUT
+    pointers of the polynomial leaves below. Those functions deduce NumT from their input
+    arguments; if the outputs were also deducible, a call site passing a literal NULL
+    would try to deduce NumT from `long int` and fail to compile. Several call sites in
+    math_spline.cpp do exactly that. */
+template<typename U> struct nondeduced { typedef U type; };
+
 /** compute the value and up to 3 derivatives of (possibly several, K>=1) cubic spline(s);
     input arguments contain the value(s) and 1st derivative(s) of these splines
-    at the boundaries of interval [xl..xh] that contain the point x. */
-template<unsigned int K>
+    at the boundaries of interval [xl..xh] that contain the point x.
+
+    Templated on the value type NumT so a single-precision device kernel can evaluate
+    a single-precision spline. NumT is deduced from the INPUT arguments only: the
+    output pointers go through nondeduced<> so that call sites passing a literal NULL
+    (of which there are several) still compile -- NULL would otherwise fail to deduce
+    NumT*. Every pre-existing call site is written `evalCubicSplines<K>(...)` and is
+    unaffected: NumT deduces to double and the generated code is unchanged.
+
+    Why it needs to be templated at all: evaluating an fp64 spline from an fp32 kernel
+    costs ~64x per operation on the 1:64 fp64:fp32 cards this project targets, which for
+    a handful of lookups per force evaluation outweighs the potential's own arithmetic by
+    orders of magnitude. See the modifier-spline notes in potential_descriptor.h. */
+template<unsigned int K, typename NumT>
 AGAMA_DEVICE_INLINE void evalCubicSplines(
-    const double x,    // input:   value of x at which the spline is computed (xl <= x <= xh)
-    const double xl,   // input:   lower boundary of the interval
-    const double xh,   // input:   upper boundary of the interval
-    const double* fl,  // input:   f_k (xl)
-    const double* fh,  // input:   f_k (xh)
-    const double* dl,  // input:   df_k/dx (xl)
-    const double* dh,  // input:   df_k/dx (xh)
-    double* f,         // output:  f_k(x)      if f   != NULL
-    double* df,        // output:  df_k/dx     if df  != NULL
-    double* d2f,       // output:  d^2f_k/dx^2 if d2f != NULL
-    double* d3f=NULL)  // output:  d^3f_k/dx^3 if d3f != NULL
+    const NumT x,     // input:   value of x at which the spline is computed (xl <= x <= xh)
+    const NumT xl,    // input:   lower boundary of the interval
+    const NumT xh,    // input:   upper boundary of the interval
+    const NumT* fl,   // input:   f_k (xl)
+    const NumT* fh,   // input:   f_k (xh)
+    const NumT* dl,   // input:   df_k/dx (xl)
+    const NumT* dh,   // input:   df_k/dx (xh)
+    typename nondeduced<NumT>::type* f,        // output:  f_k(x)      if f   != NULL
+    typename nondeduced<NumT>::type* df,       // output:  df_k/dx     if df  != NULL
+    typename nondeduced<NumT>::type* d2f,      // output:  d^2f_k/dx^2 if d2f != NULL
+    typename nondeduced<NumT>::type* d3f=NULL) // output:  d^3f_k/dx^3 if d3f != NULL
 {
-    const double
+    const NumT
         h      =  xh - xl,
         hi     =  1 / h,
         t      =  (x-xl) / h,  // NOT (x-xl)*hi, because this doesn't always give an exact result if x==xh
@@ -138,7 +159,7 @@ AGAMA_DEVICE_INLINE void evalCubicSplines(
         d2f_dh = -(6*T-4) * hi,
         d2f_dif= -(d2f_dl + d2f_dh) * hi;
     for(unsigned int k=0; k<K; k++) {
-        const double dif = fh[k] - fl[k];
+        const NumT dif = fh[k] - fl[k];
         if(f)
             f[k]   = dl[k] *   f_dl  +  dh[k] *   f_dh  +  fl[k] * f_fl  +  fh[k] * f_fh;
         if(df)
@@ -151,7 +172,7 @@ AGAMA_DEVICE_INLINE void evalCubicSplines(
 #else
     tT = t*T;
     for(unsigned int k=0; k<K; k++) {
-        const double dif = fh[k] - fl[k], Q = 3 * (dl[k] + dh[k]) - 6 * hi * dif;
+        const NumT dif = fh[k] - fl[k], Q = 3 * (dl[k] + dh[k]) - 6 * hi * dif;
         if(f)
             f[k]   = fl[k] * T  +  fh[k] * t  +  (dif * (t-T)  +  (dl[k] * T - dh[k] * t) * h) * tT;
         if(df)
@@ -244,9 +265,13 @@ AGAMA_DEVICE_INLINE void evalQuinticSplines(
     above-grid linear extrapolation reproduces CubicSpline::evalDeriv exactly
     (deriv2/deriv3 are 0 in the extrapolated regions; NaN for an empty spline or
     NaN input). */
-AGAMA_DEVICE_INLINE void evalCubicSplineRaw(const double x,
-    const double* xval, const double* fval, const double* fder, const int size,
-    double* value, double* deriv = NULL, double* deriv2 = NULL, double* deriv3 = NULL)
+template<typename NumT>
+AGAMA_DEVICE_INLINE void evalCubicSplineRaw(const NumT x,
+    const NumT* xval, const NumT* fval, const NumT* fder, const int size,
+    typename nondeduced<NumT>::type* value,
+    typename nondeduced<NumT>::type* deriv  = NULL,
+    typename nondeduced<NumT>::type* deriv2 = NULL,
+    typename nondeduced<NumT>::type* deriv3 = NULL)
 {
     if(size == 0 || x != x) {           // empty spline or NaN input
         if(value)  *value  = NAN;
