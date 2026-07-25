@@ -6,7 +6,21 @@ and this python module (py/pygama.py) and merges them into a single namespace; h
 >>> pot = agama.GalpyPotential(type='Plummer')  # use classes and routines from this file...
 >>> af  = agama.ActionFinder(pot)               # ...or those defined in the C++ library
 '''
-import numpy as _numpy, agama as _agama
+import numpy as _numpy
+# Bind the C++ extension module that sits next to THIS file's package, not whatever
+# a top-level `import agama` happens to resolve to. An absolute import is only
+# accidentally correct: it works upstream solely because the package is itself named
+# `agama`, so `import agama` finds the partially-initialized parent that has already
+# merged the extension's namespace. Under any other distribution name -- this fork
+# installs as `agama_migrate` (see setup.py) -- the absolute form silently binds a
+# DIFFERENT, separately-installed `agama`, which made setUnits() a no-op here while
+# reconfiguring the other install's global unit system as a side effect.
+# The relative form resolves to <thispackage>.agama and is correct for both layouts.
+try:
+    from .. import agama as _agama
+except (ImportError, ValueError):
+    # not imported as part of a package (e.g. `import py.pygama` from a source tree)
+    import agama as _agama
 
 ### -------------------------
 ### unit conversion routines:
