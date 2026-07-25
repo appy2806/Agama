@@ -39,9 +39,20 @@ MiyamotoNagai, Logarithmic, Harmonic), verifies that:
     Py_BEGIN_ALLOW_THREADS) -- verified in a subprocess so a regression cannot
     kill this test runner.
 
+  * fp32 accuracy across NFW's Pade-vs-closed-form crossover in r/r_s, which the
+    parity sweep above is structurally blind to -- see nfw_fp32_crossover_test().
+
 Tolerances:
   fp64: relative ~1e-12 vs max|phi| (1 ULP ~ 1e-16, leaves margin for FMA)
-  fp32: relative ~5e-6  vs max|phi| (1 ULP ~ 1e-7)
+  fp32: relative ~5e-6  vs max|phi| for the potential; 2e-6 for density and 3e-6 for
+        force (the force exception is NFW's genuine fp32 floor near its Pade crossover,
+        pinned independently by nfw_fp32_crossover_test)
+
+  These are PARITY tolerances -- legacy vs device path for the same precision -- and a
+  loose one hides a real accuracy defect rather than a backend difference. The fp32 force
+  budget was 5e-6 until an actual 4.7e-4 error in NFW's dPhi/dr was found underneath it
+  (fp64-tuned Pade thresholds reused in fp32; fixed by nfw_pade_guard<T>). Before widening
+  any tolerance here, check whether the number it is accommodating is a bug.
 """
 import subprocess
 import sys
@@ -242,10 +253,27 @@ def _check_fd(name, pot, xyz, device, dtype, ref, op):
 
     ref is the legacy CPU result (pot.force(xyz) -> (N,3), pot.density(xyz) -> (N,)).
     Tolerances: rtol 1e-12 (fp64) / 2e-6 (fp32) vs max|ref| -- except fp32 FORCE,
-    which uses 5e-6 (same as the fp32 potential parity tolerance): NFW's fp32
-    dPhi/dr accumulates ~30 ULP through log(1+r/rs)/r - 1/(r+rs), measured at
-    2.7e-6 relative IDENTICALLY on serial/cpu/openmp/cuda, i.e. inherent fp32
-    rounding of the shared leaf math, not a backend difference."""
+    which uses 3e-6.
+
+    That exception is a real fp32 floor, not slack for a bug. NFW's dPhi/dr is the
+    worst case at ~2e-6 pointwise relative near its Pade crossover, because the closed
+    form there subtracts two nearly-equal O(1/r_s) terms. It is identical on
+    serial/cpu/openmp/cuda, i.e. a property of the shared leaf math, not a backend diff.
+
+    READ THIS BEFORE TIGHTENING IT. This sweep is a PARITY test and is a poor accuracy
+    test, because it normalizes by max|ref| (taken at small r) and samples uniform(-5,5)^3,
+    which lands in the narrow shell that matters only by accident. Measured for NFW force:
+    9.6e-7 with the fp32 guard bug present vs 5.1e-7 with it fixed, against a 1.06e-6
+    budget -- i.e. at 3e-6 this sweep does NOT discriminate the bug, and at 2e-6 it would
+    discriminate it only by 1.4x on each side, which is a flake, not a gate. The accuracy
+    of this leaf is therefore pinned where it can be measured properly, by
+    nfw_fp32_crossover_test() below, which separates the two builds by 40x.
+
+    HISTORY: this tolerance was 5e-6 and its comment blamed "~30 ULP" of inherent fp32
+    rounding. That was wrong. nfw_eval's Pade crossovers were inherited from upstream,
+    which is fp64-only, and were ~20x too small for fp32 -- costing 4.7e-4 in dPhi/dr.
+    Fixed by nfw_pade_guard<T> in src/potential_analytic.h. A tolerance widened to fit a
+    measurement, with a comment naming the potential responsible, is a bug report."""
     out = getattr(pot, op)(xyz, device=device, dtype=dtype)
     label = f"{name:14s} {op:8s} {device:6s} {dtype.__name__:8s}"
     if out.dtype != dtype:
@@ -255,13 +283,79 @@ def _check_fd(name, pot, xyz, device, dtype, ref, op):
         print(f"  FAIL {label} : shape {out.shape} != {ref.shape}")
         return False
     max_ref = float(np.max(np.abs(ref))) if ref.size else 1.0
-    rel_tol = (5e-6 if op == "force" else 2e-6) if dtype == np.float32 else 1e-12
+    rel_tol = (3e-6 if op == "force" else 2e-6) if dtype == np.float32 else 1e-12
     abs_tol = rel_tol * max_ref
     err = float(np.max(np.abs(out.astype(np.float64) - ref)))
     ok = err <= abs_tol
     print(f"  {'OK  ' if ok else 'FAIL'} {label} "
           f": max|ref|={max_ref:.3e}  |err|={err:.3e}  tol={abs_tol:.3e}")
     return ok
+
+
+def nfw_fp32_crossover_test():
+    """fp32 accuracy across NFW's Pade-vs-closed-form crossover in r/r_s.
+
+    WHY THIS EXISTS. nfw_eval switches from the closed form to a Pade expansion below a
+    threshold in r/r_s. Above it, dPhi/dr subtracts two nearly-equal O(1/r_s) terms, so the
+    closed form loses ~eps/(r/r_s)^2 relative accuracy; below it the Pade truncation error
+    grows. The crossover that balances those two scales as sqrt(eps), so it is ~20x higher
+    in fp32 than fp64 -- and AGAMA's constants came from upstream, which has no fp32 path.
+    Reusing them cost 4.7e-4 in dPhi/dr and 4.5e-2 in d2Phi/dr2 before nfw_pade_guard<T>.
+
+    The main() parity sweep could not catch that, and this test exists because of how it
+    failed: it samples uniform(-5,5)^3 with scaleRadius=1, so it lands in the narrow
+    affected shell only by accident, and averages it away against max|ref| taken at small r.
+    Here r/r_s is walked deliberately across the crossover on a log grid, and the error is
+    POINTWISE relative -- NFW's Phi, |F| and rho are nonzero and monotone over this range,
+    so no point can hide behind a larger one elsewhere.
+
+    Reference is the legacy fp64 CPU path, so this measures the fp32 leaf itself rather
+    than a backend difference; it is run on every device to confirm exactly that.
+
+    NOT covered: d2Phi/dr2, whose fp32 error was the largest (4.5e-2). The device path
+    exposes only potential/force/density (GPUEvalOp in interface_python.cpp), so the fp32
+    hessian is unreachable from Python today and the guard fix for it is preventive. If an
+    fp32 hessian path is ever added (fp32 variational/Lyapunov integration, fp32 action
+    finders), extend this test to it.
+    """
+    print("\n== NFW fp32 accuracy across the Pade crossover in r/r_s ==")
+    pot = agama.Potential(type='NFW', mass=1.0, scaleRadius=1.0)
+    rrel = np.logspace(-3, 1, 600)                  # spans both sides of every threshold
+    u = np.array([0.4759473, -0.6235637, 0.6199788])
+    u /= np.linalg.norm(u)                          # off-axis; NFW is spherical anyway
+    xyz = rrel[:, None] * u[None, :]
+
+    # Measured, identical on serial/cpu/cuda, with the guard fix vs with it reverted to
+    # the fp64 thresholds (verified by rebuilding both ways, 2026-07-24):
+    #                fixed      pre-fix                 tol
+    #   potential    1.7e-7     3.2e-6  @r/rs=0.0164    1e-6   -> 5.8x margin / FAILs 3.2x
+    #   force        2.0e-6     4.0e-4  @r/rs=0.0164    1e-5   -> 5.0x margin / FAILs 40x
+    #   density      2.9e-7     2.9e-7  (no guard, unaffected)  1e-6
+    # The pre-fix peaks land exactly on the old crossover, and the post-fix peaks land on
+    # the new one (r/rs ~ 0.29-0.32) -- that co-location is the signature to look for if
+    # these numbers ever move.
+    TOL = {'potential': 1e-6, 'force': 1e-5, 'density': 1e-6}
+    all_ok = True
+    for device in ("serial", "cpu", "cuda"):
+        for op in ("potential", "force", "density"):
+            try:
+                ref = np.asarray(getattr(pot, op)(xyz), dtype=float)      # legacy fp64 CPU
+                got = np.asarray(getattr(pot, op)(xyz, device=device,
+                                                  dtype=np.float32), dtype=float)
+                if ref.ndim == 2:            # force: compare the radial magnitude
+                    ref, got = (np.linalg.norm(ref, axis=1), np.linalg.norm(got, axis=1))
+                rel = np.abs(got - ref) / np.abs(ref)
+                worst = float(np.max(rel))
+                ok = worst <= TOL[op]
+                print(f"  {'OK  ' if ok else 'FAIL'} NFW {op:9s} {device:6s} float32 : "
+                      f"max pointwise rel={worst:.3e} @r/rs={rrel[int(np.argmax(rel))]:.4g}"
+                      f"  tol={TOL[op]:.0e}")
+                if not ok:
+                    all_ok = False
+            except Exception as e:
+                print(f"  FAIL NFW {op:9s} {device:6s} float32 : {type(e).__name__}: {e}")
+                all_ok = False
+    return all_ok
 
 
 def force_density_cupy_tests(targets, xyz):
@@ -682,6 +776,10 @@ def main():
     # -- Force & density through the CuPy passthrough (incl. (N,3) force shape) --
     print("\n== Force & density: CuPy in -> CuPy out parity ==")
     if not force_density_cupy_tests(pots + [("Composite3", composite)], xyz):
+        all_ok = False
+
+    # -- fp32 accuracy where the parity sweep above is structurally blind --
+    if not nfw_fp32_crossover_test():
         all_ok = False
 
     print("\n" + ("PASS" if all_ok else "FAIL"))
