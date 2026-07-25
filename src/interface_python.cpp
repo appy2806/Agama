@@ -3447,8 +3447,50 @@ static PyObject* Potential_batch_cai_impl(
 /// `dtype_given` / `npy_typenum` describe the optional dtype kwarg: when the
 /// kwarg is absent, T is inferred from the array's typestr (the dtype follows
 /// the device array -- unlike the numpy path's float64 default).
+/// Build a numpy scalar of type `npy_typenum` holding `value`, e.g. numpy.float32(v).
+/// Used to scale a device-resident array by a unit factor: passing a genuine numpy
+/// scalar (rather than a Python float) makes CuPy perform the elementwise multiply in
+/// the ARRAY's dtype, which is what reproduces the host path's
+/// `const T Ft = static_cast<T>(F); out[i] *= Ft` bit-for-bit. Returns a new reference,
+/// or NULL with a Python error set.
+static PyObject* Potential_npy_scalar(int npy_typenum, double value)
+{
+    PyArray_Descr* descr = PyArray_DescrFromType(npy_typenum);
+    if(!descr)
+        return NULL;
+    PyObject* sctype = (PyObject*)descr->typeobj;   // borrowed from the descr
+    if(!sctype) {
+        Py_DECREF(descr);
+        PyErr_SetString(PyExc_TypeError, "no numpy scalar type for this dtype");
+        return NULL;
+    }
+    Py_INCREF(sctype);
+    Py_DECREF(descr);
+    PyObject* result = PyObject_CallFunction(sctype, "d", value);
+    Py_DECREF(sctype);
+    return result;
+}
+
+/// Multiply a device-resident (CuPy) array by a unit factor.
+/// `inplace` selects `arr *= f` (for an output buffer we own) vs `arr * f`
+/// (for the caller's input, which must NOT be mutated -- that allocates a new
+/// device array, which is why the cost is paid only under a non-trivial unit
+/// system). Returns a new reference to the result, or NULL with an error set.
+static PyObject* Potential_scale_device_array(PyObject* arr, int npy_typenum,
+                                             double factor, bool inplace)
+{
+    PyObject* f = Potential_npy_scalar(npy_typenum, factor);
+    if(!f)
+        return NULL;
+    PyObject* result = inplace ? PyNumber_InPlaceMultiply(arr, f)
+                              : PyNumber_Multiply(arr, f);
+    Py_DECREF(f);
+    return result;
+}
+
 static PyObject* Potential_batch_cai(
     const potential::BasePotential& pot,
+    PyObject* xyz_obj,             // the original device-array object (borrowed)
     PyObject* cai,                 // the (owned-by-caller) CAI dict
     const char* device_str,
     bool dtype_given,
@@ -3579,24 +3621,92 @@ static PyObject* Potential_batch_cai(
             return NULL;
     }
 
-    // -- unit systems: v1 limitation --------------------------------------
-    // The host path scales xyz by lengthUnit on the way in and the result by
-    // the op-specific output factor on the way out; doing that for
-    // device-resident data would need an extra kernel (or fusing the scale
-    // into every evaluator). The default unit system has all factors == 1.
-    if(conv->lengthUnit != 1 || GPU_op_out_factor(op) != 1) {
-        PyErr_Format(PyExc_NotImplementedError,
-            "%s(device='cuda'): device-resident input is not yet supported "
-            "with a non-trivial unit system (agama.setUnits); use the default unit "
-            "system or pass a host (numpy) array", GPU_op_name(op));
-        return NULL;
+    // -- unit systems ------------------------------------------------------
+    // Supported since 2026-07-25 (previously this raised NotImplementedError).
+    //
+    // Handled HERE, at the Python boundary, not in potential_gpu.cpp: every other
+    // unit conversion in this file lives at this boundary, and the GPU core is
+    // documented as working purely in internal units (the same reason
+    // integrateOrbitsGPU keeps unit conversion in a separate function rather than
+    // in the orbit kernel). Pushing unit factors into evalGPUDeviceCommon would
+    // have given the core its first knowledge of the unit system for no benefit.
+    //
+    // Mechanism: CuPy does the arithmetic. The input belongs to the CALLER and must
+    // not be mutated, so a non-unit lengthUnit produces a scaled COPY (`arr * L`),
+    // whose device pointer we then use; the output buffer is one we allocated, so
+    // it is scaled in place (`arr *= F`). Both are single elementwise multiplies by
+    // a numpy scalar of the array's own dtype, which is exactly the host path's
+    // `in_data[i] * L` / `out_data[i] *= Ft` with the factor cast to T -- so the
+    // result is bit-identical to the host path, not merely close. A lone multiply
+    // also has no FMA-contraction opportunity, so there is nothing for the compiler
+    // to reassociate.
+    //
+    // Cost: one extra device array plus one pass over 3N values, paid ONLY under a
+    // non-trivial unit system -- a path that previously refused to run at all. The
+    // default unit system has both factors exactly 1, takes neither branch, and is
+    // byte-for-byte the code it always was.
+    //
+    // NOTE: this is deliberately independent of the potential's structure. It scales
+    // the coordinate array and the result array, never the evaluation, so it behaves
+    // identically for a single analytic potential, a Composite, or a modifier chain
+    // of any depth. (Folding the factors into the descriptor's GpuPotXform would NOT
+    // have that property: it would have to compose with modifier chains, and density
+    // carries an extra scale^2 -- which is why that option was rejected.)
+    const double outFactor = GPU_op_out_factor(op);
+    PyObject* scaledInput = NULL;   // owned; non-NULL only when lengthUnit != 1
+    if(conv->lengthUnit != 1) {
+        // wrap the caller's device array as a CuPy view (zero-copy for any object
+        // exposing __cuda_array_interface__, not just CuPy's own arrays), then
+        // multiply into a fresh device array we own
+        PyObject* cupy = Potential_get_cupy(op);
+        if(!cupy)
+            return NULL;
+        PyObject* view = PyObject_CallMethod(cupy, "asarray", "O", xyz_obj);
+        if(!view)
+            return NULL;
+        scaledInput = Potential_scale_device_array(view, cai_typenum,
+            conv->lengthUnit, /*inplace*/ false);
+        Py_DECREF(view);
+        if(!scaledInput)
+            return NULL;
+        // re-read the device pointer from the SCALED array; the caller's original
+        // buffer is untouched. Its stream is CuPy's, and the multiply above was
+        // enqueued on it, so the downstream sync contract still applies.
+        PyObject* scaledCai = PyObject_GetAttrString(scaledInput,
+            "__cuda_array_interface__");
+        bool ok = scaledCai && PyDict_Check(scaledCai) &&
+            Potential_cai_data_ptr(scaledCai, &in_ptr);
+        if(scaledCai && !PyDict_Check(scaledCai))
+            PyErr_SetString(PyExc_TypeError,
+                "cupy returned an array whose __cuda_array_interface__ is not a dict");
+        Py_XDECREF(scaledCai);
+        if(!ok) {
+            Py_DECREF(scaledInput);
+            return NULL;
+        }
     }
 
-    return cai_typenum == NPY_FLOAT
+    PyObject* result = cai_typenum == NPY_FLOAT
         ? Potential_batch_cai_impl<float >(pot, in_ptr, N, single_point,
                                            input_stream, device_str, op, time)
         : Potential_batch_cai_impl<double>(pot, in_ptr, N, single_point,
                                            input_stream, device_str, op, time);
+    // the scaled copy has served its purpose once the kernel has run (the impl
+    // synchronizes before returning, so the device read is complete)
+    Py_XDECREF(scaledInput);
+    if(!result)
+        return NULL;
+
+    if(outFactor != 1) {
+        PyObject* scaled = Potential_scale_device_array(result, cai_typenum,
+            outFactor, /*inplace*/ true);
+        // in-place multiply returns a new reference to (normally) the same object
+        Py_DECREF(result);
+        if(!scaled)
+            return NULL;
+        result = scaled;
+    }
+    return result;
 }
 
 /// Shared device-kwarg entry for pot.{potential,force,density}(xyz, device=..., dtype=..., t=...).
@@ -3698,7 +3808,7 @@ static PyObject* Potential_batch_gpu_entry(
     PyObject* cai = PyObject_GetAttrString(xyz_obj, "__cuda_array_interface__");
     if(cai) {
         PyObject* result = Potential_batch_cai(
-            pot, cai, device_str, dtype_given, npy_typenum, op, time);
+            pot, xyz_obj, cai, device_str, dtype_given, npy_typenum, op, time);
         Py_DECREF(cai);
         return result;
     }
