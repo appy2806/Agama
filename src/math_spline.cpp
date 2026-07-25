@@ -1262,27 +1262,10 @@ QuinticSpline::QuinticSpline(
 void QuinticSpline::evalDeriv(const double x,
     double* value, double* deriv, double* deriv2, double* deriv3) const
 {
-    int size = xval.size();
-    if(size == 0 || x!=x) {
-        fillVals(value, deriv, deriv2, deriv3);
-        return;
-    }
-    int index = binSearch(x, &xval[0], size);
-    if(index < 0) {
-        fillVals(value, deriv, deriv2, deriv3,
-            fval[0] + (fder[0]==0 ? 0 : fder[0] * (x-xval[0])),
-            fder[0], 0, 0);
-        return;
-    }
-    if(index >= size-1) {
-        fillVals(value, deriv, deriv2, deriv3,
-            fval[size-1] + (fder[size-1]==0 ? 0 : fder[size-1] * (x-xval[size-1])),
-            fder[size-1], 0, 0);
-        return;
-    }
-    evalQuinticSplines<1> (x, xval[index], xval[index+1],
-        &fval[index], &fval[index+1], &fder[index], &fder[index+1], &fder2[index], &fder2[index+1],
-        /*output*/ value, deriv, deriv2, deriv3);
+    // single source of math: the stateless raw-pointer core lives in math_spline.h
+    // (device-callable); this method is the thin std::vector-backed wrapper.
+    evalQuinticSplineRaw(x, xval.data(), fval.data(), fder.data(), fder2.data(),
+        static_cast<int>(xval.size()), value, deriv, deriv2, deriv3);
 }
 
 double QuinticSpline::integrate(double x1, double x2, int n) const
@@ -2393,64 +2376,18 @@ void QuinticSpline2d::evalDeriv(const double x, const double y,
     double* z, double* z_x, double* z_y,
     double* z_xx, double* z_xy, double* z_yy) const
 {
+    // host-side behaviour is preserved bit-for-bit, including the throw on an empty
+    // spline: the raw evaluator (device-callable, so it cannot throw) returns NaN for
+    // this case instead, but the host wrapper still throws before ever calling it.
     if(fval.empty())
         throw std::length_error("Empty 2d spline");
-    const int
-        nx = xval.size(),
-        ny = yval.size(),
-        // indices of grid cell in x and y
-        xi = binSearch(x, &xval.front(), nx),
-        yi = binSearch(y, &yval.front(), ny),
-        // indices in flattened 2d arrays:
-        ill = xi * ny + yi, // xlow,ylow
-        ilu = ill + 1,      // xlow,yupp
-        iul = ill + ny,     // xupp,ylow
-        iuu = iul + 1;      // xupp,yupp
-    if(xi<0 || xi>=nx-1 || yi<0 || yi>=ny-1) {
-        fillVals(z, z_x, z_y);
-        fillVals(z_xx, z_xy, z_yy);
-        return;
-    }
-    bool der  = z_y!=NULL || z_xy!=NULL;
-    bool der2 = z_yy!=NULL;
-    const double
-        // coordinates of corner points
-        xlow = xval[xi],
-        xupp = xval[xi+1],
-        ylow = yval[yi],
-        yupp = yval[yi+1],
-        // shift the four corner points by the same offset (pick up one of the four corner values),
-        // to avoid roundoff errors in intermediate calculations; add it back to final output
-        f_offset = x==xupp ? (y==yupp ? fval[iuu] : fval[iul]) : (y==yupp ? fval[ilu] : fval[ill]),
-        fval_ill = fval[ill] - f_offset,
-        fval_iul = fval[iul] - f_offset,
-        fval_ilu = fval[ilu] - f_offset,
-        fval_iuu = fval[iuu] - f_offset,
-        // values and derivatives for the intermediate splines
-        fl [6] = { fval_ill , fval_iul , fx  [ill], fx  [iul], fxx  [ill], fxx  [iul] },
-        fu [6] = { fval_ilu , fval_iuu , fx  [ilu], fx  [iuu], fxx  [ilu], fxx  [iuu] },
-        f1l[6] = { fy  [ill], fy  [iul], fxy [ill], fxy [iul], fxxy [ill], fxxy [iul] },
-        f1u[6] = { fy  [ilu], fy  [iuu], fxy [ilu], fxy [iuu], fxxy [ilu], fxxy [iuu] },
-        f2l[6] = { fyy [ill], fyy [iul], fxyy[ill], fxyy[iul], fxxyy[ill], fxxyy[iul] },
-        f2u[6] = { fyy [ilu], fyy [iuu], fxyy[ilu], fxyy[iuu], fxxyy[ilu], fxxyy[iuu] };
-    // compute intermediate splines
-    double
-        F  [6],  // {   f    (xlow/upp, y),  df/dx   (xl/u, y), d2f/dx2   (xl/u, y) }
-        dF [6],  // {  df/dy (xlow/upp, y), d2f/dxdy (xl/u, y), d3f/dx2dy (xl/u, y) }
-        d2F[6];  // { d2f/dy2(xlow/upp, y), d3f/dxdy2(xl/u, y), d4f/dx2dy2(xl/u, y) }
-    evalQuinticSplines<6> (y, ylow, yupp, fl, fu, f1l, f1u, f2l, f2u,
-            /*output*/ F, der? dF : NULL, der2? d2F : NULL);
-    // compute and output requested values and derivatives
-    evalQuinticSplines<1> (x, xlow, xupp, &F[0], &F[1], &F[2], &F[3], &F[4], &F[5],
-            /*output*/ z, z_x, z_xx);
-    if(z)
-        *z += f_offset;
-    if(z_y || z_xy)
-        evalQuinticSplines<1> (x, xlow, xupp, &dF[0], &dF[1], &dF[2], &dF[3], &dF[4], &dF[5],
-            /*output*/ z_y, z_xy, NULL);
-    if(z_yy)
-        evalQuinticSplines<1> (x, xlow, xupp, &d2F[0], &d2F[1], &d2F[2], &d2F[3], &d2F[4], &d2F[5],
-            /*output*/ z_yy, NULL, NULL);
+    // single source of math: the stateless raw-pointer core lives in math_spline.h
+    // (device-callable); this method is the thin std::vector-backed wrapper.
+    evalQuinticSpline2dRaw(x, y,
+        xval.data(), yval.data(), static_cast<int>(xval.size()), static_cast<int>(yval.size()),
+        fval.data(), fx.data(), fy.data(), fxx.data(), fxy.data(), fyy.data(),
+        fxxy.data(), fxyy.data(), fxxyy.data(),
+        z, z_x, z_y, z_xx, z_xy, z_yy);
 }
 
 

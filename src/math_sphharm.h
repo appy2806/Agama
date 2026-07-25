@@ -322,6 +322,56 @@ void trigMultiAngle(const double phi, const unsigned int m, const bool needSine,
 
     \endcode
 */
+/** Device-callable POD mirror of SphHarmIndices (declared below).
+
+    SphHarmIndices itself cannot cross into a CUDA kernel: it holds a std::vector<int>
+    lmin_arr. That array is however a pure closed form of (lmax, mmax, sym) -- see the
+    constructor in math_sphharm.cpp, whose only inputs are the symmetry predicates in
+    coord.h, all of which are already AGAMA_DEVICE_INLINE. So the whole indexing scheme
+    collapses to these four ints, and the Tier 2 Multipole descriptor needs no device
+    pointer for it.
+
+    Build one ONLY via SphHarmIndices::pod(). Reconstructing it from the lmax/mmax/sym a
+    caller originally asked for is WRONG: the constructor augments sym after validating
+    its arguments (mmax==0 implies z-rotation + x/y-reflection symmetry, lmax==0 implies
+    full rotation + z- and xyz-reflection), and lmin() reads the augmented value. */
+struct SphHarmIndicesPod {
+    int lmax;  ///< order of expansion in theta (>=0)
+    int mmax;  ///< order of expansion in phi (0<=mmax<=lmax)
+    int step;  ///< 1 if all l terms are used, 2 if only every other l term for each m is used
+    int sym;   ///< coord::SymmetryType, AFTER the constructor's augmentation
+
+    /// number of elements in the array of spherical-harmonic coefficients
+    AGAMA_DEVICE_INLINE int size() const { return (lmax+1)*(lmax+1); }
+
+    /// index of coefficient with the given l and m (no range check, as in SphHarmIndices)
+    AGAMA_DEVICE_INLINE static int index(int l, int m) { return l*(l+1)+m; }
+
+    /// minimum m-index
+    AGAMA_DEVICE_INLINE int mmin() const {
+        return isYReflSymmetric(static_cast<coord::SymmetryType>(sym)) ? 0 : -mmax;
+    }
+
+    /** minimum l-index for the given m (if larger than lmax, this m is not used).
+        Restatement of the loop body that fills SphHarmIndices::lmin_arr; the test in
+        tests/test_gpu_policy.cpp asserts the two agree for every m over a sweep of
+        (lmax, mmax, sym) including the lmax==0 and mmax==0 augmentation cases. */
+    AGAMA_DEVICE_INLINE int lmin(int m) const {
+        if(!(m>=-mmax && m<=mmax))
+            return lmax+1;
+        const coord::SymmetryType s = static_cast<coord::SymmetryType>(sym);
+        const int absm = m<0 ? -m : m;
+        const bool odd = m%2 != 0;
+        if( (isYReflSymmetric(s) && m<0) ||
+            (isXReflSymmetric(s) && ((m<0) ^ odd)) ||
+            (isBisymmetric(s)    && odd) )
+            return lmax+1;               // don't consider this m at all
+        if(isReflSymmetric(s) && odd)
+            return absm+1;               // start from the next even l, because step in l is 2
+        return absm;
+    }
+};
+
 class SphHarmIndices {
 public:
     const int
@@ -359,6 +409,18 @@ public:
 
     /// minimum m-index
     inline int mmin() const { return isYReflSymmetric(sym) ? 0 : -mmax; }
+
+    /** the device-callable POD view of this indexing scheme -- the only sanctioned way to
+        construct a SphHarmIndicesPod, because it is the only place the augmented `sym` is
+        visible (see the comment on that struct). */
+    inline SphHarmIndicesPod pod() const {
+        SphHarmIndicesPod p;
+        p.lmax = lmax;
+        p.mmax = mmax;
+        p.step = step;
+        p.sym  = static_cast<int>(sym);
+        return p;
+    }
 
 private:
     coord::SymmetryType sym;   ///< symmetry properties of this index set
