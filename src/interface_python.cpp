@@ -3128,13 +3128,21 @@ static void Potential_gpu_set_error(int rc, const char* device_str,
                 "%s(device='cuda'): library built without CUDA support; "
                 "recompile with HAVE_CUDA=1", opname);
             break;
-        case potential::POT_GPU_EUNSUPP:
+        case potential::POT_GPU_EUNSUPP: {
             // For a Composite this names the first non-GPU-capable member
             // (with its component index) rather than the joined composite name.
+            // The reason clause matters for the types whose GPU capability is a
+            // property of the instance rather than the type (Multipole above
+            // LEGENDRE_MMAX, non-spherical Dehnen, DiskAnsatz with user-supplied
+            // profile functions): without it the message reads as "this type never
+            // works on the GPU", which is wrong for all three.
+            const std::string reason = potential::unsupportedGPUPotentialReason(pot);
             PyErr_Format(PyExc_NotImplementedError,
-                "%s(device='%s'): not supported for potential type '%s'",
-                opname, device_str, potential::unsupportedGPUPotentialName(pot).c_str());
+                "%s(device='%s'): not supported for potential type '%s'%s%s",
+                opname, device_str, potential::unsupportedGPUPotentialName(pot).c_str(),
+                reason.empty() ? "" : " -- ", reason.c_str());
             break;
+        }
         default:
             PyErr_Format(PyExc_RuntimeError,
                 "%s(device='%s'): unknown error (rc=%d)", opname, device_str, rc);
@@ -8679,12 +8687,17 @@ static void Orbit_gpu_set_error(int rc, const std::string& deviceStr,
                 "orbit(device='cuda'): library built without CUDA support; "
                 "recompile with HAVE_CUDA=1");
             break;
-        case orbit::ORBIT_GPU_EUNSUPP:
-            // for a Composite this names the first non-GPU-capable member
+        case orbit::ORBIT_GPU_EUNSUPP: {
+            // for a Composite this names the first non-GPU-capable member; the
+            // reason clause distinguishes "this type never works" from "this
+            // instance is out of range" -- see Potential_gpu_set_error.
+            const std::string reason = potential::unsupportedGPUPotentialReason(pot);
             PyErr_Format(PyExc_NotImplementedError,
-                "orbit(device='%s'): not supported for potential type '%s'",
-                deviceStr.c_str(), potential::unsupportedGPUPotentialName(pot).c_str());
+                "orbit(device='%s'): not supported for potential type '%s'%s%s",
+                deviceStr.c_str(), potential::unsupportedGPUPotentialName(pot).c_str(),
+                reason.empty() ? "" : " -- ", reason.c_str());
             break;
+        }
         case orbit::ORBIT_GPU_ETIMEDEP:
             // No longer produced for a time-varying modifier -- those are supported now,
             // via device-resident modifier splines. Retained so that any future

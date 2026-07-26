@@ -13,9 +13,11 @@
 #include "potential_multipole.h"
 #include "potential_descriptor.h"
 #include "gpu_policy.h"
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <stdexcept>
+#include <vector>
 #ifdef HAVE_CUDA
 #include <mutex>
 #endif
@@ -527,6 +529,57 @@ std::string unsupportedGPUPotentialName(const BasePotential& pot)
                     " (component #" + std::to_string(c) + " of the composite)";
     }
     return pot.name();
+}
+
+std::string unsupportedGPUPotentialReason(const BasePotential& pot)
+{
+    if(const Composite* comp = dynamic_cast<const Composite*>(&pot)) {
+        for(unsigned int c = 0; c < comp->size(); c++)
+            if(!can_dispatch(*comp->component(c)))
+                return unsupportedGPUPotentialReason(*comp->component(c));
+    }
+    // The three types below are GPU-capable per INSTANCE, not per type -- they are
+    // deliberately absent from AGAMA_GPU_POT_LIST for exactly that reason (see
+    // try_dispatch). For them the bare "not supported for potential type 'X'"
+    // message is actively misleading, because it reads as "type X never works"
+    // when in fact most instances of X do. Name the instance property instead.
+    if(const Multipole* mp = dynamic_cast<const Multipole*>(&pot)) {
+        // getCoefs is the only public route to the achieved order: Phi is indexed
+        // [coefIndex][radiusIndex] with coefIndex spanning ind.size() = (lmax+1)^2.
+        // Note the ACHIEVED order is what matters and is not necessarily the order
+        // the user asked for -- restrictSphHarmCoefs trims all-zero trailing
+        // harmonics and lowers it.
+        std::vector<double> radii;
+        std::vector<std::vector<double> > Phi, dPhi;
+        mp->getCoefs(radii, Phi, dPhi);
+        const int lmax = static_cast<int>(std::sqrt(double(Phi.size())) + 0.5) - 1;
+        if(lmax > math::LEGENDRE_MMAX)
+            return "its expansion order lmax=" + std::to_string(lmax) +
+                " exceeds the device limit of " + std::to_string(math::LEGENDRE_MMAX) +
+                " (math::LEGENDRE_MMAX, the extent of the tabulated Legendre "
+                "normalisation coefficients); a Multipole of order <=" +
+                std::to_string(math::LEGENDRE_MMAX) + " does run on the GPU";
+        // Deliberately NO fallback text for a within-cap Multipole. This function
+        // is shared by the potential/force/density path and the orbit path, and
+        // those two reject a Multipole for different reasons -- the former only
+        // when buildMultipoleDeviceDesc refuses the instance's layout, the latter
+        // also when the orbit kernels themselves decline it. Naming the descriptor
+        // builder here would be a confident wrong answer on the orbit path, so say
+        // nothing beyond the type and let the message degrade to the generic form.
+        return std::string();
+    }
+    if(const Dehnen* p = dynamic_cast<const Dehnen*>(&pot)) {
+        if(!isSpherical(p->symmetry()))
+            return "only the spherical case of Dehnen is GPU-dispatchable; this one "
+                "is flattened or triaxial";
+    }
+    if(const DiskAnsatz* p = dynamic_cast<const DiskAnsatz*>(&pot)) {
+        DiskAnsatzDesc<double> d;
+        if(!p->gpuDesc(d))
+            return "this DiskAnsatz uses an arbitrary user-supplied radial or "
+                "vertical profile function, which cannot be called from a kernel";
+    }
+    return std::string();
 }
 
 template<typename T>

@@ -54,8 +54,10 @@ Tolerances:
   (fp64-tuned Pade thresholds reused in fp32; fixed by nfw_pade_guard<T>). Before widening
   any tolerance here, check whether the number it is accommodating is a bug.
 """
+import os
 import subprocess
 import sys
+import tempfile
 import threading
 import numpy as np
 import agama_migrate as agama
@@ -733,7 +735,80 @@ def multipole_fail_closed_test():
     except Exception as e:
         print(f"  FAIL 5-Multipole composite: {type(e).__name__}: {e}")
         all_ok = False
-    # (b) the OTHER Tier 2 expansion, CylSpline, must still be refused by name --
+    # (b) THE ORDER CAP ITSELF. Two things must hold: the above-cap object is
+    #     refused, AND the message says WHY. The bare form ("not supported for
+    #     potential type 'Multipole'") is actively misleading here, because
+    #     Multipole IS supported -- capability is a property of the instance, not
+    #     the type -- so a user reading it would wrongly conclude the whole type is
+    #     off-limits rather than lowering lmax. See unsupportedGPUPotentialReason().
+    #
+    #     TRAP: Multipole::create does NOT hand back the order you asked for.
+    #     restrictSphHarmCoefs trims all-zero trailing harmonics and silently
+    #     LOWERS the order, so a nearly-spherical density asked for lmax=33 comes
+    #     back well below the cap and this test would pass vacuously. Hence the
+    #     deliberately lumpy density below (an off-centre Plummer inside a triaxial
+    #     Dehnen breaks every symmetry, including m<0), and hence the achieved order
+    #     is read BACK out of export() and asserted, not assumed.
+    over = agama.Potential(
+        type='Multipole',
+        density=agama.Density(
+            agama.Density(type='Dehnen', mass=1.0, scaleRadius=1.0, gamma=1.0,
+                          axisRatioY=0.7, axisRatioZ=0.5),
+            agama.Density(type='Plummer', mass=0.3, scaleRadius=0.6,
+                          center=[0.8, 0.5, 0.3])),
+        lmax=33, mmax=33, gridSizeR=25)
+    achieved = None
+    with tempfile.NamedTemporaryFile(suffix='.coef', delete=False) as fh:
+        coefpath = fh.name
+    try:
+        over.export(coefpath)
+        with open(coefpath) as f:
+            for line in f:
+                if line.startswith('lmax='):
+                    achieved = int(line.split('=')[1])
+                    break
+    finally:
+        os.unlink(coefpath)
+    if achieved is None or achieved <= 32:
+        print(f"  FAIL above-cap Multipole: achieved lmax={achieved}, which is NOT "
+              f"above the cap of 32 -- restrictSphHarmCoefs lowered the order, so this "
+              f"case would have tested nothing. Make the density lumpier.")
+        all_ok = False
+    else:
+        try:
+            over.potential(xyz, device='cuda')
+            print(f"  FAIL Multipole lmax={achieved} was ACCEPTED on device='cuda' "
+                  f"(above math::LEGENDRE_MMAX = 32)")
+            all_ok = False
+        except NotImplementedError as e:
+            msg = str(e)
+            # The message must let the user act: it has to name the cap, not just
+            # the type.  '32' and the achieved order are both required so that a
+            # future refactor cannot degrade this back to the generic form.
+            informative = '32' in msg and str(achieved) in msg
+            print(f"  {'OK  ' if informative else 'FAIL'} Multipole lmax={achieved} -> "
+                  f"NotImplementedError naming the order cap: {msg[:160]}")
+            all_ok = all_ok and informative
+        except RuntimeError as e:
+            if "without CUDA support" in str(e):
+                print("  SKIP above-cap Multipole: library built with HAVE_CUDA=0")
+            else:
+                print(f"  FAIL above-cap Multipole: RuntimeError: {e}")
+                all_ok = False
+        except Exception as e:
+            print(f"  FAIL above-cap Multipole: {type(e).__name__}: {e}")
+            all_ok = False
+        # ... and the above-cap object still evaluates on the CPU, at full order
+        try:
+            v = over.potential(xyz)
+            ok = np.all(np.isfinite(v))
+            print(f"  {'OK  ' if ok else 'FAIL'} above-cap Multipole still evaluates on "
+                  f"the CPU path (the cap is a DEVICE limit, not a library limit)")
+            all_ok = all_ok and ok
+        except Exception as e:
+            print(f"  FAIL above-cap Multipole CPU path: {type(e).__name__}: {e}")
+            all_ok = False
+    # (c) the OTHER Tier 2 expansion, CylSpline, must still be refused by name --
     #     adding GPU_POT_MULTIPOLE must not have widened capability to BFEs in general
     cs = agama.Potential(type='CylSpline', density='Disk', surfaceDensity=1.0,
                          scaleRadius=2.0, scaleHeight=0.3, mmax=0,

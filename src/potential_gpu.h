@@ -78,6 +78,20 @@ int evalDensityGPU(const BasePotential& pot,
     in the error message than the composite's joined name. */
 std::string unsupportedGPUPotentialName(const BasePotential& pot);
 
+/** For a POT_GPU_EUNSUPP result: a human-readable reason WHY, to be appended to
+    the type name from unsupportedGPUPotentialName(), or an empty string when no
+    more specific reason than the type itself is available.
+
+    This exists because for three types -- Multipole, Dehnen and DiskAnsatz --
+    GPU capability is a property of the INSTANCE and not of the type (which is
+    why they are absent from AGAMA_GPU_POT_LIST and handled individually in
+    try_dispatch). For those, a bare "not supported for potential type
+    'Multipole'" is misleading: it reads as "Multipole never works on the GPU",
+    when in fact only this particular instance is out of range -- e.g. an
+    expansion order above math::LEGENDRE_MMAX. Recurses into composites, picking
+    the same first non-capable member unsupportedGPUPotentialName() names. */
+std::string unsupportedGPUPotentialReason(const BasePotential& pot);
+
 /** Compute Phi at N Cartesian positions that are ALREADY resident in GPU
     memory (Phase B: `__cuda_array_interface__` passthrough). No host<->device
     copies, no scratch buffers, no mutex — the kernel reads/writes the caller's
