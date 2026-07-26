@@ -48,6 +48,7 @@
 #include "potential_base.h"
 #include "particles_base.h"
 #include "math_sphharm.h"
+#include "math_spline.h"   // evalQuinticSplineRaw / evalQuinticSpline2dRaw (device leaves)
 #include "smart.h"
 
 namespace potential {
@@ -370,6 +371,807 @@ AGAMA_DEVICE_INLINE void tauToCylDerivs(const double R, const double z, const do
 }
 
 
+// =====================================================================
+// Tier 2 commit 5: the whole Multipole evaluator, device-callable.
+//
+// Two pieces:
+//   MultipoleDeviceDesc<T> + buildMultipoleDeviceDesc<T>()  -- a by-value POD
+//       descriptor plus ONE flat blob of T holding every knot vector and every
+//       spline/power-law coefficient of a Multipole object. Built on the host
+//       from the live object; the blob is what a kernel would upload once and
+//       keep resident.
+//   multipoleEvalDevice<T>()  -- reproduces Multipole::evalCyl's 4-branch
+//       dispatch (inner PowerLaw / outer PowerLaw / MultipoleInterp1d /
+//       MultipoleInterp2d) reading only the descriptor + blob, calling the
+//       device leaves that already exist (fourierTransformAzimuthT,
+//       multipoleUnscaleLogT, sphToCylDerivs, tauToCylDerivs,
+//       math::evalQuinticSplineRaw / evalQuinticSpline2dRaw,
+//       math::sphHarmArray / trigMultiAngle).
+//
+// WHAT IS AND IS NOT SINGLE-SOURCED WITH THE CPU PATH, AND WHY
+//
+// All the *arithmetic kernels* are shared with the virtual CPU path: the two
+// spline evaluators, the harmonics, the azimuthal Fourier synthesis, the
+// Interp2d log-unscaling and both derivative transforms are literally the same
+// functions the .cpp calls. What is restated here is the LOOP STRUCTURE around
+// them (the per-(l,m) / per-m gather, the Interp1d log-scaling chain rule, and
+// the PowerLaw coefficient expression) -- for one deliberate reason:
+// PowerLawMultipole's device shape is FUSED. Upstream materializes
+// Phi_lm[3*(lmax+1)^2] in one loop and consumes it in another; at order 32 that
+// is 30,112 B/thread of local memory (measured, -Xptxas -v), versus 3,968 B when
+// each (l,m) coefficient is computed inside the harmonic loop that consumes it.
+// Every element's defining expression is unchanged -- the single copy of it is
+// multipolePowerLawTermT() below, called by both the fused loop and the lmax==0
+// fast track -- so fusing cannot move a bit, and the CPU-side round-trip gate in
+// tests/test_gpu_policy.cpp proves it did not: the device path is compared
+// BIT-FOR-BIT (doubles as integers) against Multipole::eval on the same points,
+// across all four branches, all three symmetry classes and all output
+// combinations. A tolerance would be worthless here; identity is the property.
+//
+// Folding the .cpp's own eval bodies onto these functions (making
+// PowerLawMultipole::evalCyl etc. thin wrappers) is the natural follow-up and
+// would remove the restated loops entirely, but it perturbs the call context of
+// coord::toGrad/toHess inside the CPU path and therefore MUST be gated on
+// local_notes/crosscheck_expansions.py -- see the FMA rule at the top of this
+// file. It is deliberately not done in this commit, so that this commit cannot
+// change a single CPU-path bit.
+//
+// SCRATCH is caller-provided, as everywhere else in this file: pass
+// multipoleDeviceScratchSize(desc) elements of T, or the compile-time worst case
+// MultipoleDeviceScratchMax<ORDER>::value for a kernel with a fixed order cap.
+//
+// ORDER CAP is math::LEGENDRE_MMAX (32) and nothing lower: the builder rejects
+// anything above it (keeping legendrePmm's NAN branch unreachable on device),
+// and MultipoleInterp2d -- the branch every realistic GalPot MW potential takes
+// -- was measured at only 3.7 KB/thread and 155 registers with ZERO spills at
+// order 32, because its scratch scales with mmax, not lmax^2.
+// =====================================================================
+
+/// component order for the T gradCyl[3] arrays below: coord::GradCyl's member
+/// order (coord.h), so the conversion is a field-by-field copy with no reordering
+enum CylGradIndex { CYL_DR = 0, CYL_DZ = 1, CYL_DPHI = 2 };
+
+/// component order for the T hessCyl[6] arrays below: coord::HessCyl's member order
+enum CylHessIndex {
+    CYL_DR2 = 0, CYL_DZ2 = 1, CYL_DPHI2 = 2,
+    CYL_DRDZ = 3, CYL_DZDPHI = 4, CYL_DRDPHI = 5
+};
+
+/// which interpolator Multipole::impl is; mirrors the LMAX_1D_SPLINE choice made
+/// in the Multipole constructor (1d splines per (l,m) iff lmax <= 2, else one 2d
+/// spline per azimuthal m)
+enum MultipoleImplKind { MULTIPOLE_IMPL_INTERP1D = 0, MULTIPOLE_IMPL_INTERP2D = 1 };
+
+/** By-value POD description of a Multipole potential for the device path: fixed
+    size, no pointers, no std:: containers, trivially copyable into a kernel
+    argument or into a descriptor table. All bulk data lives in a separate flat
+    array of T ("the blob") and is addressed by the integer element offsets below,
+    which is the shape potential_descriptor.h prescribes for coefficient-carrying
+    potentials (one payload pointer for the whole object, offsets in the term).
+
+    Build one ONLY via buildMultipoleDeviceDesc(); it is the only place that can
+    see MultipoleInterp1d/MultipoleInterp2d (declared inside
+    potential_multipole.cpp) and the only place that validates the assumptions the
+    layout below depends on. It FAILS CLOSED -- returns false, caller falls back
+    to the CPU -- for any order above math::LEGENDRE_MMAX, any unrecognised branch
+    class, any non-shared knot vector, or any unexpected array size. A wrong
+    descriptor is far worse than a CPU fallback.
+
+    ### BLOB LAYOUT
+
+    All offsets are ELEMENT indices into the blob (not bytes), all entries are T.
+    The blob has exactly the size buildMultipoleDeviceDesc() gave the vector, and
+    every region below is contiguous, in this order:
+
+      [offXval, offXval+nx)     the ln(r) knot vector. SHARED by every spline in
+                                the object -- MultipoleInterp1d builds all its
+                                (l,m) splines on one gridR, MultipoleInterp2d all
+                                its m splines on one (gridR, gridT) -- so it is
+                                stored ONCE, not per harmonic. The builder
+                                verifies that against every present spline and
+                                returns false if any disagrees. offXval == 0 and
+                                nx == the number of radial grid nodes.
+
+      [offYval, offYval+ny)     the tau = cos(theta)/(sin(theta)+1) knot vector.
+                                MULTIPOLE_IMPL_INTERP2D only; for INTERP1D
+                                ny == 0 and this region is empty.
+
+      [offCoefs, offCoefs + nslot*slotStride)    the coefficient block:
+
+        MULTIPOLE_IMPL_INTERP2D:
+            nslot      = 2*ind.mmax + 1          (mirrors MultipoleInterp2d::spl)
+            slotStride = 9*nx*ny
+            slot index = m + ind.mmax   for ind.mmin() <= m <= ind.mmax
+            slot content: nine contiguous nx*ny arrays, each row-major with the
+            ln(r) index major (exactly as math::Matrix / BaseInterpolator2d store
+            them: element (i,j) at i*ny+j), in precisely the argument order of
+            math::evalQuinticSpline2dRaw:
+                +0*nx*ny fval   +1*nx*ny fx     +2*nx*ny fy
+                +3*nx*ny fxx    +4*nx*ny fxy    +5*nx*ny fyy
+                +6*nx*ny fxxy   +7*nx*ny fxyy   +8*nx*ny fxxyy
+
+        MULTIPOLE_IMPL_INTERP1D:
+            nslot      = ind.size() = (ind.lmax+1)^2  (mirrors MultipoleInterp1d::spl)
+            slotStride = 3*nx
+            slot index = c = math::SphHarmIndicesPod::index(l,m)
+            slot content: three contiguous nx arrays, in evalQuinticSplineRaw order:
+                +0*nx fval      +1*nx fder      +2*nx fder2
+
+        Slots belonging to an m (or an (l,m)) that the indexing scheme does not
+        use -- ind.lmin(m) > ind.lmax -- are PRESENT but zero-filled and never
+        read: multipoleEvalDevice skips exactly the harmonics the CPU loop skips.
+        Keeping the full 2*mmax+1 / (lmax+1)^2 stride makes the slot index
+        identical to the CPU container index, at the cost of leaving the m<0 half
+        unused when the model is y-reflection symmetric (mmin()==0). That waste is
+        bounded by 2x on a ~1 MB payload and buys an indexing rule a kernel author
+        can apply from this comment alone.
+
+      [offInnerSUW, +3*ind.size())   the inner PowerLawMultipole's coefficients as
+                                     three contiguous ind.size() arrays: S, U, W.
+      [offOuterSUW, +3*ind.size())   the same three arrays for the outer asymptote.
+
+    Note ind.size() == indInner.size() == indOuter.size(): PowerLawMultipole
+    derives its own indexing scheme from the U array via
+    math::getIndicesFromCoefs, which fixes lmax = sqrt(U.size())-1, so the three
+    schemes always share lmax and can differ only in mmax and symmetry.
+
+    Coefficients are stored in the blob as T. For T=float that is a narrowing cast
+    AT UPLOAD, which is the established pattern for the device fp32 path; the host
+    classes keep their fp64 storage untouched.
+*/
+template<typename T>
+struct MultipoleDeviceDesc {
+    math::SphHarmIndicesPod ind;       ///< indexing scheme of the interpolated (impl) expansion
+    math::SphHarmIndicesPod indInner;  ///< ... of the inner power-law asymptote
+    math::SphHarmIndicesPod indOuter;  ///< ... of the outer power-law asymptote
+    T rminSq;        ///< inner branch boundary, ALREADY squared and safety-factored
+    T rmaxSq;        ///< outer branch boundary, likewise
+    int implKind;    ///< one of MultipoleImplKind
+    int logScaling;  ///< impl's logScaling flag (int, to keep this POD trivially printable)
+    T invPhi0;       ///< impl's inverse potential at origin; may be zero
+    int offXval, nx; ///< ln(r) knot vector: shared across all m / all (l,m)
+    int offYval, ny; ///< tau knot vector (MULTIPOLE_IMPL_INTERP2D only; ny==0 otherwise)
+    int offCoefs;    ///< start of the coefficient block
+    T r0sqInner, r0sqOuter;   ///< PowerLaw reference radii, squared
+    T qInner, qOuter;         ///< PowerLaw Q coefficient (the r^2 term of the inner monopole)
+    int offInnerSUW, offOuterSUW;  ///< start of each asymptote's {S,U,W} block
+};
+
+class Multipole;
+
+/** Extract a device-ready descriptor + coefficient blob from a live Multipole.
+    Host-only (it needs RTTI and std::vector). Returns false, having left `desc`
+    unspecified and `blob` empty, if anything about the object is not exactly one
+    of the shapes the layout above describes -- see the fail-closed list on
+    MultipoleDeviceDesc. Instantiated for T = double and T = float.
+    \param[in]  pot   is the potential to describe.
+    \param[out] desc  receives the POD descriptor.
+    \param[out] blob  receives the flat coefficient payload, indexed by desc.
+    \return  true on success; false means "no device path for this object".
+*/
+template<typename T>
+bool buildMultipoleDeviceDesc(const Multipole& pot, MultipoleDeviceDesc<T>& desc,
+    std::vector<T>& blob);
+
+/** Evaluate a Multipole at numPoints points (packed {R,z,phi} triplets) through
+    BOTH the virtual CPU path and multipoleEvalDevice<double>, and return both sets
+    of numbers for a bit-for-bit comparison by the caller. Each output array holds
+    10*numPoints doubles: {Phi, grad[3] in CylGradIndex order, hess[6] in
+    CylHessIndex order} per point, with unrequested slots zeroed on both sides.
+
+    This is the round-trip gate's engine, and it lives in potential_multipole.cpp
+    ON PURPOSE: comparing a header-inlined device evaluator in the CALLER's
+    translation unit against the CPU path compiled in the library's is not a
+    bit-for-bit test at all -- coord::toGrad/toHess are header-inline, so the two
+    contexts fuse their multiply-adds differently and the observed divergence count
+    tracks the caller's compiler flags rather than the code (132 / 2,604 / 7,308
+    values out of 50,688 for project defaults / -fno-inline / -ffp-contract=off,
+    with the library binary unchanged). Compiled together here, both sides move
+    together under codegen drift and only real arithmetic changes separate them.
+
+    \return false if no device descriptor could be built for this object, in which
+    case nothing is written to the output arrays. */
+bool multipoleEvalBothPaths(const Multipole& pot, MultipoleDeviceDesc<double>& desc,
+    int numPoints, const double* Rzphi, bool wantGrad, bool wantHess,
+    double* outCpu, double* outDev);
+
+/** Does this indexing scheme hit sphHarmTransformInverseDeriv's optimized
+    lmax==2 special case (potential_multipole.cpp: the {0,0},{2,0},{2,2} shortcut)?
+    The device path must take the same fork, or it would compute different numbers
+    for the very common triaxial lmax=2 model. */
+AGAMA_DEVICE_INLINE bool multipoleDeriv2Shape(const math::SphHarmIndicesPod& ind)
+{
+    return ind.lmax==2 && ind.mmin()==0 && ind.step==2;
+}
+
+/** Scratch, in elements of T, for one branch of the dispatch with the given
+    indexing scheme. The four terms are, in blob-free order:
+      6*(2*mmax+1)      C_m, sized exactly as sphHarmTransformInverseDeriv's sizeC
+      3*(lmax+1)        P_lm, dP_lm, d2P_lm for math::sphHarmArray
+      2*mmax            trig_m for fourierTransformAzimuthT (cos and sin halves)
+      3*(lmax+1)^2      Phi_lm, dPhi_lm, d2Phi_lm -- ONLY when the branch has to
+                        materialize the (l,m) coefficient array, i.e. the
+                        MultipoleInterp1d branch (which always does) and the
+                        PowerLaw branch when it takes the lmax==2 shortcut (where
+                        the term is at most 3*9 = 27). The fused PowerLaw loop
+                        never needs it, which is the whole point of fusing. */
+AGAMA_DEVICE_INLINE int multipoleBranchScratch(const math::SphHarmIndicesPod& ind,
+    const bool needCoefArray)
+{
+    return 6*(2*ind.mmax+1) + 3*(ind.lmax+1) + 2*ind.mmax
+        + (needCoefArray ? 3*(ind.lmax+1)*(ind.lmax+1) : 0);
+}
+
+/** Number of T elements of scratch multipoleEvalDevice needs for this descriptor:
+    the worst case over the four branches, since a single point takes exactly one
+    of them and the caller cannot know which in advance. */
+template<typename T>
+AGAMA_DEVICE_INLINE int multipoleDeviceScratchSize(const MultipoleDeviceDesc<T>& d)
+{
+    int n = multipoleBranchScratch(d.ind, d.implKind == MULTIPOLE_IMPL_INTERP1D);
+    const int i = multipoleBranchScratch(d.indInner, multipoleDeriv2Shape(d.indInner));
+    const int o = multipoleBranchScratch(d.indOuter, multipoleDeriv2Shape(d.indOuter));
+    if(i > n) n = i;
+    if(o > n) n = o;
+    return n;
+}
+
+/** Compile-time worst-case scratch size (in elements of T) for ANY Multipole with
+    lmax, mmax <= ORDER -- what a kernel with a fixed order cap declares as a local
+    array. Dominant term is C_m; the +27 is the materialized coefficient array of
+    the two branches that need one, both of which are pinned to lmax<=2 (the
+    Interp1d branch by LMAX_1D_SPLINE, the PowerLaw shortcut by its own shape
+    test), so it does NOT grow as 3*(ORDER+1)^2.
+
+    At the shipping cap ORDER = math::LEGENDRE_MMAX = 32 this is 580 elements:
+    4,640 B/thread in fp64, 2,320 B in fp32. */
+template<int ORDER>
+struct MultipoleDeviceScratchMax {
+    static const int value = 6*(2*ORDER+1) + 3*(ORDER+1) + 2*ORDER + 27;
+};
+
+/** One {l,m} power-law coefficient of a PowerLawMultipole, and its first two
+    derivatives w.r.t. ln(r). The single copy of this expression on the device
+    path: called from the fused harmonic loop AND from the lmax==0 fast track, so
+    the fused and un-fused shapes cannot drift apart.
+
+    \param[in]  s, u, w   are S[c], U[c], W[c] for this harmonic;
+    \param[in]  v         is l for the inward and -l-1 for the outward extrapolation;
+    \param[in]  Q         is the extra r^2 coefficient (used only when v==0);
+    \param[in]  rsq       is R^2+z^2, and r0sq the squared reference radius;
+    \param[in]  dlogr     is ln(r/r0) = log(rsq/r0sq)*0.5, computed once by the caller;
+    \param[in]  needD1, needD2  whether the derivative outputs are wanted;
+    \param[out] p0, p1, p2  receive Phi_lm, dPhi_lm/dlnr, d2Phi_lm/dlnr^2.
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void multipolePowerLawTermT(const T s, const T u, const T w, const T v,
+    const T Q, const T rsq, const T r0sq, const T dlogr,
+    const bool needD1, const bool needD2, T* p0, T* p1, T* p2)
+{
+    const T rv  = v!=0 ? std::exp( dlogr * v ) : T(1);                    // (r/r0)^v
+    const T rs  = s!=v ? (s!=0 ? std::exp( dlogr * s ) : T(1)) : rv;     // (r/r0)^s
+    const T urs = u * rs * (s!=v || u==0 ? T(1) : dlogr);  // if s==v, multiply by ln(r/r0)
+    const T wrv = w * rv;
+    const T qr2 = v==0 ? Q * rsq / r0sq : T(0);  // Q * (r/r0)^2, only for the inner monopole
+    *p0 = urs + wrv + qr2;
+    if(needD1)
+        *p1 = urs*s + wrv*v + (s!=v ? T(0) : u*rs) + qr2*2;
+    if(needD2)
+        *p2 = urs*s*s + wrv*v*v + (s!=v ? T(0) : 2*s*u*rs) + qr2*4;
+}
+
+/** Device-callable restatement of sphHarmTransformInverseDeriv2 -- the optimized
+    lmax==2, mmin==0, step==2 shortcut, processing only {0,0}, {2,0} and (if
+    mmax==2) {2,2}. Outputs are plain T arrays in SphGradIndex / SphHessIndex
+    order, the same convention fourierTransformAzimuthT uses.
+
+    NOTE the sine/cosine pair is taken from math::sincos, which is fp64-only; at
+    T=float this costs one double sincos. That is deliberate and cheap: this
+    function only ever runs for lmax==2 models, and using a float sincos here
+    would make the fp32 path disagree with the fp64 reference for no benefit. */
+template<typename T>
+AGAMA_DEVICE_INLINE void sphHarmTransformInverseDeriv2T(
+    const math::SphHarmIndicesPod& ind, const T R, const T z, const T phi,
+    const T* C_lm, const T* dC_lm, const T* d2C_lm,
+    T* val, T* grad, T* hess)
+{
+    const int i00 = math::SphHarmIndicesPod::index(0,0),
+              i20 = math::SphHarmIndicesPod::index(2,0),
+              i22 = math::SphHarmIndicesPod::index(2,2);
+    const T C2 = std::sqrt(T(1.25)), D2 = std::sqrt(T(3.75));
+    const T
+    tau = z == 0 ? T(0) : z / (std::sqrt(pow_2(R) + pow_2(z)) + R),
+    ct  =      2 * tau  / (1 + tau*tau),  // cos(theta)
+    st  = (1 - tau*tau) / (1 + tau*tau),  // sin(theta)
+    cc  = ct * ct, cs = ct * st, ss = st * st,
+    Y20       = (3*C2 * cc - C2),
+    dY20      = -6*C2 * cs,
+    d2Y20     =-12*C2 * cc + 6*C2;
+    if(val)
+        *val          =   Y20 *   C_lm[i20] +   C_lm[i00];
+    if(grad) {
+        grad[SPH_DR]     =   Y20 *  dC_lm[i20] +  dC_lm[i00];
+        grad[SPH_DTHETA] =  dY20 *   C_lm[i20];
+        grad[SPH_DPHI]   = 0;
+    }
+    if(hess) {
+        hess[SPH_DR2]      =   Y20 * d2C_lm[i20] + d2C_lm[i00];
+        hess[SPH_DRDTHETA] =  dY20 *  dC_lm[i20];
+        hess[SPH_DTHETA2]  = d2Y20 *   C_lm[i20];
+        hess[SPH_DRDPHI]   = hess[SPH_DTHETADPHI] = hess[SPH_DPHI2] = 0;
+    }
+    if(ind.mmax == 2) {
+        double sp_d, cp_d;
+        math::sincos(2 * static_cast<double>(phi), sp_d, cp_d);
+        const T sp = static_cast<T>(sp_d), cp = static_cast<T>(cp_d);
+        const T
+        Y22       =    D2 * ss,
+        dY22      =  2*D2 * cs,
+        d2Y22     =  4*D2 * cc - 2*D2;
+        if(val)
+            *val += Y22 * C_lm[i22] * cp;
+        if(grad) {
+            grad[SPH_DR]     +=  Y22 *  dC_lm[i22] *    cp;
+            grad[SPH_DTHETA] += dY22 *   C_lm[i22] *    cp;
+            grad[SPH_DPHI]   +=  Y22 *   C_lm[i22] * -2*sp;
+        }
+        if(hess) {
+            hess[SPH_DR2]        +=   Y22 * d2C_lm[i22] *    cp;
+            hess[SPH_DRDTHETA]   +=  dY22 *  dC_lm[i22] *    cp;
+            hess[SPH_DTHETA2]    += d2Y22 *   C_lm[i22] *    cp;
+            hess[SPH_DRDPHI]     +=   Y22 *  dC_lm[i22] * -2*sp;
+            hess[SPH_DTHETADPHI] +=  dY22 *   C_lm[i22] * -2*sp;
+            hess[SPH_DPHI2]      +=   Y22 *   C_lm[i22] * -4*cp;
+        }
+    }
+}
+
+/** Device-callable restatement of sphHarmTransformInverseDeriv: the inverse
+    spherical-harmonic transform of the coefficient arrays C_lm and their first
+    two derivatives w.r.t. an arbitrary function of radius, into value / gradient /
+    hessian in (that function of) spherical coordinates. Dispatches to
+    sphHarmTransformInverseDeriv2T for the optimized shape, exactly as the CPU
+    version does, and finishes through the existing fourierTransformAzimuthT leaf.
+
+    \param[in]  ind       is the POD indexing scheme;
+    \param[in]  R, z, phi is the position in cylindrical coordinates;
+    \param[in]  C_lm, dC_lm, d2C_lm  are the ind.size()-long coefficient arrays
+                (dC_lm/d2C_lm are read only when grad/hess are requested);
+    \param[in]  scratch   is at least multipoleBranchScratch(ind, false) elements,
+                and is not touched at all on the sphHarmTransformInverseDeriv2T fork;
+    \param[out] val, grad, hess  as in fourierTransformAzimuthT.
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void sphHarmTransformInverseDerivT(
+    const math::SphHarmIndicesPod& ind, const T R, const T z, const T phi,
+    const T* C_lm, const T* dC_lm, const T* d2C_lm, T* scratch,
+    T* val, T* grad, T* hess)
+{
+    if(multipoleDeriv2Shape(ind)) {   // an optimized special case
+        sphHarmTransformInverseDeriv2T<T>(ind, R, z, phi, C_lm, dC_lm, d2C_lm, val, grad, hess);
+        return;
+    }
+    const int numQuantities = hess!=NULL ? 6 : grad!=NULL ? 3 : 1;  // number of quantities in C_m
+    const int sizeC = 6 * (2*ind.mmax+1), sizeP = ind.lmax+1;
+    T*   C_m  = scratch;
+    T*   P_lm = C_m + sizeC;
+    T*  dP_lm = numQuantities>=3 ? P_lm + sizeP   : NULL;
+    T* d2P_lm = numQuantities==6 ? P_lm + sizeP*2 : NULL;
+    T* trig_m = P_lm + sizeP*3;
+    const T tau = z == 0 ? T(0) : z / (std::sqrt(pow_2(R) + pow_2(z)) + R);
+    const int nm = ind.mmax - ind.mmin() + 1;  // number of azimuthal harmonics in C_m array
+    for(int mm=0; mm<nm; mm++) {
+        const int m = mm + ind.mmin();
+        const int lmin = ind.lmin(m);
+        if(lmin > ind.lmax)
+            continue;
+        // extra factor sqrt{2} for m!=0 trig fncs
+        const T mul = m==0 ? T(2*M_SQRTPI) : T(2*M_SQRTPI*M_SQRT2);
+        for(int q=0; q<numQuantities; q++)
+            C_m[mm + q*nm] = 0;
+        const int absm = m<0 ? -m : m;
+        math::sphHarmArray<T>(ind.lmax, absm, tau, P_lm, dP_lm, d2P_lm);
+        for(int l=lmin; l<=ind.lmax; l+=ind.step) {
+            const int c = math::SphHarmIndicesPod::index(l, m), p = l-absm;
+            C_m[mm] += P_lm[p] * C_lm[c] * mul;
+            if(numQuantities>=3) {
+                C_m[mm + nm  ] +=  P_lm[p] * dC_lm[c] * mul;   // dPhi_m/dr
+                C_m[mm + nm*2] += dP_lm[p] *  C_lm[c] * mul;   // dPhi_m/dtheta
+            }
+            if(numQuantities==6) {
+                C_m[mm + nm*3] +=   P_lm[p] * d2C_lm[c] * mul; // d2Phi_m/dr2
+                C_m[mm + nm*4] +=  dP_lm[p] *  dC_lm[c] * mul; // d2Phi_m/drdtheta
+                C_m[mm + nm*5] += d2P_lm[p] *   C_lm[c] * mul; // d2Phi_m/dtheta2
+            }
+        }
+    }
+    fourierTransformAzimuthT<T>(ind, phi, C_m, trig_m, val, grad, hess);
+}
+
+/// copy a plain-T spherical grad/hess pair into the coord:: structs the two
+/// fp64-only derivative transforms take (a pure copy -- no arithmetic, hence no
+/// bit movement; the CPU's fourierTransformAzimuth wrapper does exactly this)
+template<typename T>
+AGAMA_DEVICE_INLINE void multipoleUnpackSph(const T* grad, const T* hess,
+    coord::GradSph* gradSph, coord::HessSph* hessSph)
+{
+    if(grad) {
+        gradSph->dr     = grad[SPH_DR];
+        gradSph->dtheta = grad[SPH_DTHETA];
+        gradSph->dphi   = grad[SPH_DPHI];
+    }
+    if(hess) {
+        hessSph->dr2        = hess[SPH_DR2];
+        hessSph->drdtheta   = hess[SPH_DRDTHETA];
+        hessSph->dtheta2    = hess[SPH_DTHETA2];
+        hessSph->drdphi     = hess[SPH_DRDPHI];
+        hessSph->dthetadphi = hess[SPH_DTHETADPHI];
+        hessSph->dphi2      = hess[SPH_DPHI2];
+    }
+}
+
+/// copy the cylindrical grad/hess out of the coord:: structs into the plain-T
+/// output arrays (again a pure copy, in CylGradIndex / CylHessIndex order)
+template<typename T>
+AGAMA_DEVICE_INLINE void multipolePackCyl(const coord::GradCyl& gc, const coord::HessCyl& hc,
+    T* gradCyl, T* hessCyl)
+{
+    if(gradCyl) {
+        gradCyl[CYL_DR]   = static_cast<T>(gc.dR);
+        gradCyl[CYL_DZ]   = static_cast<T>(gc.dz);
+        gradCyl[CYL_DPHI] = static_cast<T>(gc.dphi);
+    }
+    if(hessCyl) {
+        hessCyl[CYL_DR2]    = static_cast<T>(hc.dR2);
+        hessCyl[CYL_DZ2]    = static_cast<T>(hc.dz2);
+        hessCyl[CYL_DPHI2]  = static_cast<T>(hc.dphi2);
+        hessCyl[CYL_DRDZ]   = static_cast<T>(hc.dRdz);
+        hessCyl[CYL_DZDPHI] = static_cast<T>(hc.dzdphi);
+        hessCyl[CYL_DRDPHI] = static_cast<T>(hc.dRdphi);
+    }
+}
+
+/** The PowerLawMultipole branch (both asymptotes: `inner` selects the exponent
+    convention v = l vs v = -l-1 and the extreme-regime test), in its FUSED form:
+    no Phi_lm[3*(lmax+1)^2] is materialized in the general case; each harmonic's
+    coefficient triple is produced by multipolePowerLawTermT() inside the loop
+    that consumes it. The one exception is the lmax==2 shortcut, where the
+    consumer indexes three fixed harmonics instead of looping, so the small
+    (<= 27 element) array is materialized and handed to
+    sphHarmTransformInverseDerivT, which then forks to the same shortcut the CPU
+    takes.
+
+    \param[in]  ind     is the asymptote's own indexing scheme (NOT the Multipole's:
+                PowerLawMultipole derives it from the nonzero pattern of U);
+    \param[in]  inner   selects inward vs outward extrapolation;
+    \param[in]  r0sq, Q are the squared reference radius and the extra r^2 coefficient;
+    \param[in]  S, U, W are ind.size()-long coefficient arrays inside the blob;
+    \param[in]  R, z, phi is the position; scratch as documented above;
+    \param[out] potential, gradCyl, hessCyl  are the T outputs (any may be NULL).
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void multipolePowerLawEvalDeviceT(
+    const math::SphHarmIndicesPod& ind, const bool inner,
+    const T r0sq, const T Q, const T* S, const T* U, const T* W,
+    const T R, const T z, const T phi, T* scratch,
+    T* potential, T* gradCyl, T* hessCyl)
+{
+    const bool needGrad = gradCyl!=NULL || hessCyl!=NULL;
+    const bool needHess = hessCyl!=NULL;
+    const int ncoefs = ind.size();
+    const T rsq   = pow_2(R) + pow_2(z);
+    const T dlogr = std::log(rsq / r0sq) * T(0.5);
+    // simplified treatment in strongly asymptotic regime - retain only l==0 term
+    const int lmax = (inner && rsq < r0sq*T(1e-16)) || (!inner && rsq > r0sq*T(1e16)) ? 0 : ind.lmax;
+
+    if(lmax == 0) {  // fast track
+        T p0 = 0, p1 = 0, p2 = 0;
+        multipolePowerLawTermT<T>(S[0], U[0], W[0], inner ? T(0) : T(-1), Q, rsq, r0sq, dlogr,
+            needGrad, needHess, &p0, &p1, &p2);
+        if(potential)
+            *potential = p0;
+        const T rsqinv = rsq>0 ? T(1)/rsq : T(0),
+            Rr2 = rsq<INFINITY ? R * rsqinv : T(0),
+            zr2 = rsq<INFINITY ? z * rsqinv : T(0);
+        if(gradCyl) {
+            gradCyl[CYL_DR]   = p1 * Rr2;
+            gradCyl[CYL_DZ]   = p1 * zr2;
+            gradCyl[CYL_DPHI] = 0;
+        }
+        if(hessCyl) {
+            const T d2 = p2 - 2 * p1;
+            hessCyl[CYL_DR2]  = d2 * pow_2(Rr2) + p1 * rsqinv;
+            hessCyl[CYL_DZ2]  = d2 * pow_2(zr2) + p1 * rsqinv;
+            hessCyl[CYL_DRDZ] = d2 * Rr2 * zr2;
+            hessCyl[CYL_DRDPHI] = hessCyl[CYL_DZDPHI] = hessCyl[CYL_DPHI2] = 0;
+        }
+        return;
+    }
+
+    T g[3], h[6];
+    if(multipoleDeriv2Shape(ind)) {
+        // the consumer is the {0,0}/{2,0}/{2,2} shortcut, which random-accesses three
+        // harmonics rather than looping, so fusing does not apply: materialize the
+        // (at most 27-element) coefficient array, exactly as the CPU body does.
+        T*   Phi_lm = scratch;
+        T*  dPhi_lm = Phi_lm + ncoefs;
+        T* d2Phi_lm = Phi_lm + ncoefs*2;
+        for(int m=ind.mmin(); m<=ind.mmax; m++)
+            for(int l=ind.lmin(m); l<=lmax; l+=ind.step) {
+                const int c = math::SphHarmIndicesPod::index(l, m);
+                multipolePowerLawTermT<T>(S[c], U[c], W[c], inner ? T(l) : T(-l-1),
+                    Q, rsq, r0sq, dlogr, needGrad, needHess,
+                    &Phi_lm[c], &dPhi_lm[c], &d2Phi_lm[c]);
+            }
+        sphHarmTransformInverseDerivT<T>(ind, R, z, phi, Phi_lm, dPhi_lm, d2Phi_lm,
+            scratch + ncoefs*3, potential, needGrad ? g : NULL, needHess ? h : NULL);
+    } else {
+        // the fused general case: sphHarmTransformInverseDerivT's loop with the
+        // power-law coefficients computed where they are used
+        const int numQuantities = needHess ? 6 : needGrad ? 3 : 1;
+        const int sizeC = 6 * (2*ind.mmax+1), sizeP = ind.lmax+1;
+        T*   C_m  = scratch;
+        T*   P_lm = C_m + sizeC;
+        T*  dP_lm = numQuantities>=3 ? P_lm + sizeP   : NULL;
+        T* d2P_lm = numQuantities==6 ? P_lm + sizeP*2 : NULL;
+        T* trig_m = P_lm + sizeP*3;
+        const T tau = z == 0 ? T(0) : z / (std::sqrt(pow_2(R) + pow_2(z)) + R);
+        const int nm = ind.mmax - ind.mmin() + 1;
+        for(int mm=0; mm<nm; mm++) {
+            const int m = mm + ind.mmin();
+            const int lmin = ind.lmin(m);
+            if(lmin > ind.lmax)
+                continue;
+            const T mul = m==0 ? T(2*M_SQRTPI) : T(2*M_SQRTPI*M_SQRT2);
+            for(int q=0; q<numQuantities; q++)
+                C_m[mm + q*nm] = 0;
+            const int absm = m<0 ? -m : m;
+            math::sphHarmArray<T>(ind.lmax, absm, tau, P_lm, dP_lm, d2P_lm);
+            for(int l=lmin; l<=ind.lmax; l+=ind.step) {
+                const int c = math::SphHarmIndicesPod::index(l, m), p = l-absm;
+                T p0 = 0, p1 = 0, p2 = 0;
+                multipolePowerLawTermT<T>(S[c], U[c], W[c], inner ? T(l) : T(-l-1),
+                    Q, rsq, r0sq, dlogr, numQuantities>=3, numQuantities==6, &p0, &p1, &p2);
+                C_m[mm] += P_lm[p] * p0 * mul;
+                if(numQuantities>=3) {
+                    C_m[mm + nm  ] +=  P_lm[p] * p1 * mul;
+                    C_m[mm + nm*2] += dP_lm[p] * p0 * mul;
+                }
+                if(numQuantities==6) {
+                    C_m[mm + nm*3] +=   P_lm[p] * p2 * mul;
+                    C_m[mm + nm*4] +=  dP_lm[p] * p1 * mul;
+                    C_m[mm + nm*5] += d2P_lm[p] * p0 * mul;
+                }
+            }
+        }
+        fourierTransformAzimuthT<T>(ind, phi, C_m, trig_m, potential,
+            needGrad ? g : NULL, needHess ? h : NULL);
+    }
+    if(needGrad) {
+        coord::GradSph gradSph = {0, 0, 0};
+        coord::HessSph hessSph = {0, 0, 0, 0, 0, 0};
+        multipoleUnpackSph<T>(g, needHess ? h : NULL, &gradSph, &hessSph);
+        coord::GradCyl gc = {0, 0, 0};
+        coord::HessCyl hc = {0, 0, 0, 0, 0, 0};
+        sphToCylDerivs(coord::PosCyl(R, z, phi), gradSph, hessSph,
+            gradCyl ? &gc : NULL, hessCyl ? &hc : NULL);
+        multipolePackCyl<T>(gc, hc, gradCyl, hessCyl);
+    }
+}
+
+/** The MultipoleInterp1d branch (taken when lmax <= LMAX_1D_SPLINE = 2): one 1d
+    quintic spline in ln(r) per {l,m}, optional log-scaling of the l=0 term with
+    the other terms stored as ratios to it, then the inverse harmonic transform.
+
+    \param[in]  ind, logScaling, invPhi0  are the interpolator's own parameters;
+    \param[in]  xval, nx   is the shared ln(r) knot vector;
+    \param[in]  coefs      points at the descriptor's coefficient block: ind.size()
+                slots of 3*nx, slot c = index(l,m) holding {fval, fder, fder2};
+    \param[in]  R, z, phi, scratch, and the outputs, as in multipolePowerLawEvalDeviceT.
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void multipoleInterp1dEvalDeviceT(
+    const math::SphHarmIndicesPod& ind, const int logScaling, const T invPhi0,
+    const T* xval, const int nx, const T* coefs,
+    const T R, const T z, const T phi, T* scratch,
+    T* potential, T* gradCyl, T* hessCyl)
+{
+    const bool needGrad = gradCyl!=NULL || hessCyl!=NULL;
+    const bool needHess = hessCyl!=NULL;
+    const T r = std::sqrt(pow_2(R) + pow_2(z)), logr = std::log(r);
+    const int ncoefs = (ind.lmax+1) * (ind.lmax+1);
+    T*   Phi_lm = scratch;
+    T*  dPhi_lm = Phi_lm + ncoefs;
+    T* d2Phi_lm = Phi_lm + ncoefs*2;
+    coord::GradSph gradSph = {0, 0, 0};
+    coord::HessSph hessSph = {0, 0, 0, 0, 0, 0};
+
+    // first compute the l=0 coefficient, possibly log-unscaled
+    math::evalQuinticSplineRaw<T>(logr, xval, coefs, coefs+nx, coefs+nx*2, nx,
+        Phi_lm, needGrad ? dPhi_lm : NULL, needHess ? d2Phi_lm : NULL);
+    if(logScaling) {
+        const T expX = std::exp(Phi_lm[0]), Phi = T(1) / (invPhi0 - expX);
+        Phi_lm[0] = Phi;
+        if(needGrad) {
+            const T dPhidX = pow_2(Phi) * expX;
+            if(needHess)
+                d2Phi_lm[0] = dPhidX * (d2Phi_lm[0] + pow_2(dPhi_lm[0]) * Phi * (invPhi0 + expX));
+            dPhi_lm[0] *= dPhidX;
+        }
+    }
+    if(ind.lmax == 0) {   // fast track in the spherical case
+        if(potential)
+            *potential = Phi_lm[0];
+        if(needGrad) {
+            gradSph.dr = dPhi_lm[0];
+            gradSph.dtheta = gradSph.dphi = 0;
+        }
+        if(needHess) {
+            hessSph.dr2 = d2Phi_lm[0];
+            hessSph.dtheta2 = hessSph.dphi2 = hessSph.drdtheta =
+                hessSph.drdphi = hessSph.dthetadphi = 0;
+        }
+    } else {
+        // compute spherical-harmonic coefs
+        for(int m=ind.mmin(); m<=ind.mmax; m++)
+            for(int l=ind.lmin(m); l<=ind.lmax; l+=ind.step) {
+                const int c = math::SphHarmIndicesPod::index(l, m);
+                if(c==0)
+                    continue;
+                const T* sc = coefs + c*3*nx;
+                math::evalQuinticSplineRaw<T>(logr, xval, sc, sc+nx, sc+nx*2, nx,
+                    &Phi_lm[c], needGrad ? &dPhi_lm[c] : NULL, needHess ? &d2Phi_lm[c] : NULL);
+                // if necessary, scale by the value of l=0 coef
+                if(logScaling) {
+                    if(needHess)
+                        d2Phi_lm[c] = d2Phi_lm[c] * Phi_lm[0] + 2 * dPhi_lm[c] * dPhi_lm[0] +
+                            Phi_lm[c] * d2Phi_lm[0];
+                    if(needGrad)
+                        dPhi_lm[c] = dPhi_lm[c] * Phi_lm[0] + Phi_lm[c] * dPhi_lm[0];
+                    Phi_lm[c] *= Phi_lm[0];
+                }
+            }
+        T g[3], h[6];
+        sphHarmTransformInverseDerivT<T>(ind, R, z, phi, Phi_lm, dPhi_lm, d2Phi_lm,
+            scratch + ncoefs*3, potential, needGrad ? g : NULL, needHess ? h : NULL);
+        multipoleUnpackSph<T>(needGrad ? g : NULL, needHess ? h : NULL, &gradSph, &hessSph);
+    }
+    if(needGrad) {
+        coord::GradCyl gc = {0, 0, 0};
+        coord::HessCyl hc = {0, 0, 0, 0, 0, 0};
+        sphToCylDerivs(coord::PosCyl(R, z, phi), gradSph, hessSph,
+            gradCyl ? &gc : NULL, hessCyl ? &hc : NULL);
+        multipolePackCyl<T>(gc, hc, gradCyl, hessCyl);
+    }
+}
+
+/** The MultipoleInterp2d branch (lmax > 2, i.e. every realistic GalPot MW model):
+    one 2d quintic spline in (ln r, tau) per azimuthal harmonic m, with all l
+    folded into the tau grid -- so this branch never calls sphHarmArray at all,
+    and its scratch scales with mmax rather than lmax^2.
+
+    \param[in]  xval, nx / yval, ny  are the shared ln(r) and tau knot vectors;
+    \param[in]  coefs  points at the coefficient block: 2*ind.mmax+1 slots of
+                9*nx*ny, slot m+ind.mmax holding the nine node arrays in
+                evalQuinticSpline2dRaw order (see MultipoleDeviceDesc);
+    \param[in]  everything else as in multipoleInterp1dEvalDeviceT.
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void multipoleInterp2dEvalDeviceT(
+    const math::SphHarmIndicesPod& ind, const int logScaling, const T invPhi0,
+    const T* xval, const int nx, const T* yval, const int ny, const T* coefs,
+    const T R, const T z, const T phi, T* scratch,
+    T* potential, T* gradCyl, T* hessCyl)
+{
+    const T
+        r         = std::sqrt(pow_2(R) + pow_2(z)),
+        logr      = std::log(r),
+        rplusRinv = T(1) / (r + std::fabs(R)),
+        tau       = R==0 ? math::sign(z) : z * rplusRinv;
+
+    // number of azimuthal harmonics to compute
+    const int mmin = ind.mmin(), nm = ind.mmax - mmin + 1;
+
+    // only compute those quantities that will be needed in output
+    const int numQuantities = hessCyl!=NULL ? 6 : gradCyl!=NULL ? 3 : 1;
+
+    // Phi, two first and three second derivs for each m -- the same C_m layout the
+    // CPU body allocates on the stack, here carved out of the caller's scratch. Six
+    // rows are always reserved (not numQuantities rows) because multipoleUnscaleLogT
+    // forms all six row pointers unconditionally, as the original body does.
+    T* C_m = scratch;
+    T* trig_m = C_m + nm*6;
+    const int npt = nx*ny, stride = npt*9;
+
+    // compute azimuthal harmonics
+    for(int mm=0; mm<nm; mm++) {
+        const int m = mm + mmin;
+        if(ind.lmin(m) > ind.lmax)
+            continue;
+        const T* c = coefs + (m + ind.mmax) * stride;
+        math::evalQuinticSpline2dRaw<T>(logr, tau, xval, yval, nx, ny,
+            c, c+npt, c+npt*2, c+npt*3, c+npt*4, c+npt*5, c+npt*6, c+npt*7, c+npt*8,
+            &C_m[mm],
+            numQuantities>=3 ? &C_m[mm+nm  ] : NULL,
+            numQuantities>=3 ? &C_m[mm+nm*2] : NULL,
+            numQuantities==6 ? &C_m[mm+nm*3] : NULL,
+            numQuantities==6 ? &C_m[mm+nm*4] : NULL,
+            numQuantities==6 ? &C_m[mm+nm*5] : NULL);
+    }
+
+    if(logScaling)
+        multipoleUnscaleLogT<T>(ind, numQuantities, invPhi0, C_m);
+
+    // Fourier synthesis from azimuthal harmonics to actual quantities, still in scaled coords
+    T trPot, g[3], h[6];
+    fourierTransformAzimuthT<T>(ind, phi, C_m, trig_m, &trPot,
+        numQuantities>=3 ? g : NULL, numQuantities==6 ? h : NULL);
+
+    if(potential)
+        *potential = trPot;
+    if(numQuantities==1)
+        return;   // nothing else needed
+
+    coord::GradSph trGrad = {0, 0, 0};
+    coord::HessSph trHess = {0, 0, 0, 0, 0, 0};
+    multipoleUnpackSph<T>(g, numQuantities==6 ? h : NULL, &trGrad, &trHess);
+    coord::GradCyl gc = {0, 0, 0};
+    coord::HessCyl hc = {0, 0, 0, 0, 0, 0};
+    // deliberately NOT sphToCylDerivs -- that one's second scaled coordinate is theta,
+    // this one's is tau
+    tauToCylDerivs(R, z, r, rplusRinv, tau, trGrad, trHess,
+        gradCyl ? &gc : NULL, hessCyl ? &hc : NULL);
+    multipolePackCyl<T>(gc, hc, gradCyl, hessCyl);
+}
+
+/** Evaluate a Multipole potential on the device from its descriptor and blob.
+    Reproduces Multipole::evalCyl's four-branch dispatch on radius: inner
+    power-law asymptote below rminSq, outer above rmaxSq, and the interpolator in
+    between (1d or 2d splines per implKind). The branch boundaries in the
+    descriptor are already squared and safety-factored, so the test here is the
+    same comparison the CPU makes on the same rsq.
+
+    \param[in]  d       is the descriptor from buildMultipoleDeviceDesc();
+    \param[in]  blob    is its coefficient payload (host or device pointer);
+    \param[in]  R, z, phi  is the position in cylindrical coordinates;
+    \param[out] Phi     receives the potential   if != NULL;
+    \param[out] gradCyl receives 3 components    if != NULL (CylGradIndex order);
+    \param[out] hessCyl receives 6 components    if != NULL (CylHessIndex order);
+    \param[in]  scratch is caller-provided, at least multipoleDeviceScratchSize(d)
+                elements of T (or MultipoleDeviceScratchMax<ORDER>::value for a
+                kernel with a compile-time order cap).
+
+    As on the CPU path, asking for the hessian without the gradient still computes
+    the gradient internally; and asking for neither takes the cheap value-only
+    route through every branch.
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void multipoleEvalDevice(const MultipoleDeviceDesc<T>& d, const T* blob,
+    T R, T z, T phi, T* Phi, T* gradCyl, T* hessCyl, T* scratch)
+{
+    const T rsq = pow_2(R) + pow_2(z);
+    if(rsq < d.rminSq) {
+        const int n = d.indInner.size();
+        const T* SUW = blob + d.offInnerSUW;
+        multipolePowerLawEvalDeviceT<T>(d.indInner, true, d.r0sqInner, d.qInner,
+            SUW, SUW+n, SUW+n*2, R, z, phi, scratch, Phi, gradCyl, hessCyl);
+    } else if(rsq > d.rmaxSq) {
+        const int n = d.indOuter.size();
+        const T* SUW = blob + d.offOuterSUW;
+        multipolePowerLawEvalDeviceT<T>(d.indOuter, false, d.r0sqOuter, d.qOuter,
+            SUW, SUW+n, SUW+n*2, R, z, phi, scratch, Phi, gradCyl, hessCyl);
+    } else if(d.implKind == MULTIPOLE_IMPL_INTERP1D) {
+        multipoleInterp1dEvalDeviceT<T>(d.ind, d.logScaling, d.invPhi0,
+            blob + d.offXval, d.nx, blob + d.offCoefs,
+            R, z, phi, scratch, Phi, gradCyl, hessCyl);
+    } else {
+        multipoleInterp2dEvalDeviceT<T>(d.ind, d.logScaling, d.invPhi0,
+            blob + d.offXval, d.nx, blob + d.offYval, d.ny, blob + d.offCoefs,
+            R, z, phi, scratch, Phi, gradCyl, hessCyl);
+    }
+}
+
+
 /** Spherical-harmonic expansion of density with coefficients being spline functions of radius */
 class DensitySphericalHarmonic: public BaseDensity {
 public:
@@ -516,6 +1318,11 @@ private:
     /// re-implement the density computation to avoid cancellation errors at large radii,
     /// by using only the U-terms which have non-zero Laplacian
     virtual double densityCyl(const coord::PosCyl &pos, double /*time*/) const;
+
+    /// the device-descriptor builder reads ind/r0sq/inner/S/U/W/Q directly rather than
+    /// widening this class's public surface with accessors that nothing else would use
+    template<typename T> friend bool buildMultipoleDeviceDesc(const Multipole& pot,
+        MultipoleDeviceDesc<T>& desc, std::vector<T>& blob);
 };
 
 
@@ -618,6 +1425,12 @@ private:
         double* potential, coord::GradCyl* deriv, coord::HessCyl* deriv2, double /*time*/) const;
 
     virtual double densityCyl(const coord::PosCyl &pos, double /*time*/) const;
+
+    /// the device-descriptor builder walks gridRadii / ind / impl / asymptInner / asymptOuter;
+    /// it is defined in potential_multipole.cpp, the only place MultipoleInterp1d and
+    /// MultipoleInterp2d are visible
+    template<typename T> friend bool buildMultipoleDeviceDesc(const Multipole& pot,
+        MultipoleDeviceDesc<T>& desc, std::vector<T>& blob);
 };
 
 

@@ -1324,6 +1324,12 @@ private:
 
     virtual void evalCyl(const coord::PosCyl &pos,
         double* potential, coord::GradCyl* deriv, coord::HessCyl* deriv2, double /*time*/) const;
+
+    /// buildMultipoleDeviceDesc() packs spl/logScaling/invPhi0 into a flat device blob.
+    /// This class stays internal to this TU (potential_multipole.h must not learn about
+    /// it), so the builder gets friendship instead of the class getting accessors.
+    template<typename T> friend bool buildMultipoleDeviceDesc(const Multipole& pot,
+        MultipoleDeviceDesc<T>& desc, std::vector<T>& blob);
 };
 
 class MultipoleInterp2d: public BasePotentialCyl {
@@ -1347,6 +1353,10 @@ private:
 
     virtual void evalCyl(const coord::PosCyl &pos,
         double* potential, coord::GradCyl* deriv, coord::HessCyl* deriv2, double /*time*/) const;
+
+    /// see the same declaration in MultipoleInterp1d above
+    template<typename T> friend bool buildMultipoleDeviceDesc(const Multipole& pot,
+        MultipoleDeviceDesc<T>& desc, std::vector<T>& blob);
 };
 
 template<class BaseDensityOrPotential>
@@ -1981,6 +1991,301 @@ void MultipoleInterp2d::evalCyl(const coord::PosCyl &pos,
     // Deliberately NOT transformDerivsSphToCyl -- that one's second scaled coordinate is
     // theta, this one's is tau.
     tauToCylDerivs(pos.R, pos.z, r, rplusRinv, tau, trGrad, trHess, grad, hess);
+}
+
+
+// ------- device descriptor extraction ------- //
+
+// Flatten a live Multipole into MultipoleDeviceDesc<T> + one blob of T, so that
+// multipoleEvalDevice() in potential_multipole.h can reproduce Multipole::evalCyl
+// without touching a single C++ object. Lives here, not in the header, because
+// MultipoleInterp1d and MultipoleInterp2d are declared in this TU and must stay
+// that way; the builder is a friend of both rather than the classes growing
+// accessors nothing else would use.
+//
+// THE CONTRACT IS FAIL-CLOSED. Every assumption the blob layout depends on is
+// checked and any violation returns false with an empty blob, so the caller falls
+// back to the CPU path. A wrong descriptor is far worse than no descriptor: it
+// would silently evaluate the wrong potential inside a kernel. In particular this
+// function does NOT reconstruct anything it can read (the knot vectors come from
+// the splines themselves, the indexing schemes from SphHarmIndices::pod(), the
+// asymptote parameters from the PowerLawMultipole objects) and does not assume the
+// shared-grid property that makes the layout compact -- it verifies it.
+//
+// The blob layout is documented in full on MultipoleDeviceDesc in the header;
+// this function is its only writer.
+template<typename T>
+bool buildMultipoleDeviceDesc(const Multipole& pot, MultipoleDeviceDesc<T>& desc,
+    std::vector<T>& blob)
+{
+    blob.clear();
+    const math::SphHarmIndices& ind = pot.ind;
+
+    // (1) order cap. LEGENDRE_MMAX = 32 is a standing requirement, not a tuning knob:
+    // above it math::legendrePmm falls back to a host-only branch that writes NAN on
+    // the device, so the host must reject those expansions here. Measured (findings.md):
+    // MultipoleInterp2d needs only 3.7 KB/thread at order 32 with zero spills, so there
+    // is no reason for a lower cap.
+    if(ind.lmax < 0 || ind.mmax < 0 || ind.mmax > ind.lmax)
+        return false;
+    if(ind.lmax > math::LEGENDRE_MMAX || ind.mmax > math::LEGENDRE_MMAX)
+        return false;
+
+    // (2) radial grid and the two branch boundaries, squared and safety-factored exactly
+    // as Multipole::evalCyl does, so the device dispatch tests the identical numbers
+    const int nx = static_cast<int>(pot.gridRadii.size());
+    if(nx < static_cast<int>(MULTIPOLE_MIN_GRID_SIZE))
+        return false;
+    desc.ind     = ind.pod();
+    desc.rminSq  = static_cast<T>(pow_2(pot.gridRadii.front() * (1+GRID_SAFETY_FACTOR)));
+    desc.rmaxSq  = static_cast<T>(pow_2(pot.gridRadii.back()  * (1-GRID_SAFETY_FACTOR)));
+
+    // (3) both asymptotes must be PowerLawMultipole, with the expected inner/outer roles
+    // and coefficient arrays of exactly ind.size() (which getIndicesFromCoefs guarantees,
+    // since it derives lmax from U.size() -- checked rather than assumed)
+    const PowerLawMultipole* pin =
+        dynamic_cast<const PowerLawMultipole*>(pot.asymptInner.get());
+    const PowerLawMultipole* pout =
+        dynamic_cast<const PowerLawMultipole*>(pot.asymptOuter.get());
+    if(!pin || !pout)
+        return false;
+    if(!pin->inner || pout->inner)
+        return false;
+    const int ncoefLM = static_cast<int>(ind.size());
+    if(static_cast<int>(pin->S.size())  != ncoefLM || static_cast<int>(pin->U.size())  != ncoefLM ||
+       static_cast<int>(pin->W.size())  != ncoefLM || static_cast<int>(pout->S.size()) != ncoefLM ||
+       static_cast<int>(pout->U.size()) != ncoefLM || static_cast<int>(pout->W.size()) != ncoefLM)
+        return false;
+    desc.indInner = pin->ind.pod();
+    desc.indOuter = pout->ind.pod();
+    if(desc.indInner.lmax != ind.lmax || desc.indOuter.lmax != ind.lmax)
+        return false;   // the three schemes must share lmax; see the header comment
+    if(desc.indInner.mmax > math::LEGENDRE_MMAX || desc.indOuter.mmax > math::LEGENDRE_MMAX)
+        return false;
+    desc.r0sqInner = static_cast<T>(pin->r0sq);
+    desc.r0sqOuter = static_cast<T>(pout->r0sq);
+    desc.qInner    = static_cast<T>(pin->Q);
+    desc.qOuter    = static_cast<T>(pout->Q);
+
+    // (4) which interpolator, and its shared knot vectors
+    const MultipoleInterp1d* i1 = dynamic_cast<const MultipoleInterp1d*>(pot.impl.get());
+    const MultipoleInterp2d* i2 = dynamic_cast<const MultipoleInterp2d*>(pot.impl.get());
+    const std::vector<double> *xref = NULL, *yref = NULL;
+    int ny = 0, nslot = 0, slotStride = 0;
+    if(i2 && !i1) {
+        desc.implKind   = MULTIPOLE_IMPL_INTERP2D;
+        desc.logScaling = i2->logScaling ? 1 : 0;
+        desc.invPhi0    = static_cast<T>(i2->invPhi0);
+        if(i2->ind.lmax != ind.lmax || i2->ind.mmax != ind.mmax ||
+           i2->ind.step != ind.step || i2->ind.symmetry() != ind.symmetry())
+            return false;
+        if(ind.lmax <= LMAX_1D_SPLINE)
+            return false;   // the constructor would have chosen 1d splines for this lmax
+        if(static_cast<int>(i2->spl.size()) != 2*ind.mmax+1)
+            return false;
+        // every 2d spline must live on the SAME (ln r, tau) grid -- that is what lets the
+        // blob store the two knot vectors once instead of per harmonic
+        for(int m=ind.mmin(); m<=ind.mmax; m++) {
+            if(ind.lmin(m) > ind.lmax)
+                continue;
+            const math::QuinticSpline2d& s = i2->spl[m+ind.mmax];
+            if(s.xvalues().empty() || s.yvalues().empty())
+                return false;
+            if(!xref) {
+                xref = &s.xvalues();
+                yref = &s.yvalues();
+            } else if(s.xvalues() != *xref || s.yvalues() != *yref)
+                return false;
+        }
+        if(!xref || static_cast<int>(xref->size()) != nx)
+            return false;
+        ny = static_cast<int>(yref->size());
+        if(ny < 2)
+            return false;
+        nslot      = 2*ind.mmax + 1;
+        slotStride = 9*nx*ny;
+    } else if(i1 && !i2) {
+        desc.implKind   = MULTIPOLE_IMPL_INTERP1D;
+        desc.logScaling = i1->logScaling ? 1 : 0;
+        desc.invPhi0    = static_cast<T>(i1->invPhi0);
+        if(i1->ind.lmax != ind.lmax || i1->ind.mmax != ind.mmax ||
+           i1->ind.step != ind.step || i1->ind.symmetry() != ind.symmetry())
+            return false;
+        if(ind.lmax > LMAX_1D_SPLINE)
+            return false;   // ... and 2d splines for this one. Also what pins the
+                            // materialized-coefficient term of the scratch bound to 27.
+        if(static_cast<int>(i1->spl.size()) != ncoefLM)
+            return false;
+        for(int m=ind.mmin(); m<=ind.mmax; m++)
+            for(int l=ind.lmin(m); l<=ind.lmax; l+=ind.step) {
+                const math::QuinticSpline& s = i1->spl[ind.index(l, m)];
+                if(s.xvalues().empty())
+                    return false;
+                if(!xref)
+                    xref = &s.xvalues();
+                else if(s.xvalues() != *xref)
+                    return false;
+            }
+        if(!xref || static_cast<int>(xref->size()) != nx)
+            return false;
+        nslot      = ncoefLM;
+        slotStride = 3*nx;
+    } else
+        return false;       // unrecognised (or ambiguous) implementation class
+
+    // (5) offsets, then one allocation. Unused slots stay zero and are never read.
+    desc.offXval     = 0;
+    desc.nx          = nx;
+    desc.offYval     = nx;
+    desc.ny          = ny;
+    desc.offCoefs    = nx + ny;
+    desc.offInnerSUW = desc.offCoefs + nslot*slotStride;
+    desc.offOuterSUW = desc.offInnerSUW + 3*ncoefLM;
+    const std::size_t total = static_cast<std::size_t>(desc.offOuterSUW) + 3*ncoefLM;
+    blob.assign(total, T(0));
+
+    // (6) knot vectors
+    for(int k=0; k<nx; k++)
+        blob[desc.offXval + k] = static_cast<T>((*xref)[k]);
+    for(int k=0; k<ny; k++)
+        blob[desc.offYval + k] = static_cast<T>((*yref)[k]);
+
+    // (7) coefficients. Storage in the blob is T: for T=float this is the narrowing
+    // cast at upload that the device fp32 path is built around; the classes keep fp64.
+    if(desc.implKind == MULTIPOLE_IMPL_INTERP2D) {
+        const int npt = nx*ny;
+        for(int m=ind.mmin(); m<=ind.mmax; m++) {
+            if(ind.lmin(m) > ind.lmax)
+                continue;
+            const math::QuinticSpline2d& s = i2->spl[m+ind.mmax];
+            // exactly the argument order of math::evalQuinticSpline2dRaw
+            const std::vector<double>* src[9] = {
+                &s.fvalues(), &s.dfdx(), &s.dfdy(),
+                &s.d2fdx2(), &s.d2fdxdy(), &s.d2fdy2(),
+                &s.d3fdx2dy(), &s.d3fdxdy2(), &s.d4fdx2dy2() };
+            T* dst = &blob[desc.offCoefs + (m + ind.mmax)*slotStride];
+            for(int a=0; a<9; a++) {
+                if(static_cast<int>(src[a]->size()) != npt) {
+                    blob.clear();
+                    return false;
+                }
+                for(int i=0; i<npt; i++)
+                    dst[a*npt + i] = static_cast<T>((*src[a])[i]);
+            }
+        }
+    } else {
+        for(int m=ind.mmin(); m<=ind.mmax; m++)
+            for(int l=ind.lmin(m); l<=ind.lmax; l+=ind.step) {
+                const unsigned int c = ind.index(l, m);
+                const math::QuinticSpline& s = i1->spl[c];
+                if(static_cast<int>(s.fvalues().size())  != nx ||
+                   static_cast<int>(s.fderivs().size())  != nx ||
+                   static_cast<int>(s.fderivs2().size()) != nx) {
+                    blob.clear();
+                    return false;
+                }
+                T* dst = &blob[desc.offCoefs + static_cast<int>(c)*slotStride];
+                for(int k=0; k<nx; k++) {
+                    dst[     k] = static_cast<T>(s.fvalues() [k]);
+                    dst[nx  +k] = static_cast<T>(s.fderivs() [k]);
+                    dst[nx*2+k] = static_cast<T>(s.fderivs2()[k]);
+                }
+            }
+    }
+
+    // (8) the two asymptotes' {S, U, W} blocks
+    for(int c=0; c<ncoefLM; c++) {
+        blob[desc.offInnerSUW            + c] = static_cast<T>(pin->S[c]);
+        blob[desc.offInnerSUW + ncoefLM  + c] = static_cast<T>(pin->U[c]);
+        blob[desc.offInnerSUW + ncoefLM*2+ c] = static_cast<T>(pin->W[c]);
+        blob[desc.offOuterSUW            + c] = static_cast<T>(pout->S[c]);
+        blob[desc.offOuterSUW + ncoefLM  + c] = static_cast<T>(pout->U[c]);
+        blob[desc.offOuterSUW + ncoefLM*2+ c] = static_cast<T>(pout->W[c]);
+    }
+    return true;
+}
+
+// fp64 is the correctness reference; fp32 is the shipping configuration on 1:64 cards
+template bool buildMultipoleDeviceDesc<double>(const Multipole&,
+    MultipoleDeviceDesc<double>&, std::vector<double>&);
+template bool buildMultipoleDeviceDesc<float>(const Multipole&,
+    MultipoleDeviceDesc<float>&, std::vector<float>&);
+
+
+// Round-trip self-check support: evaluate the same points through the virtual CPU
+// path AND through multipoleEvalDevice<double>, and hand both sets of numbers back
+// for a bit-for-bit comparison by the caller.
+//
+// WHY THIS LIVES HERE AND NOT IN THE TEST. Measured, and this is the whole reason
+// the function exists: doing the comparison from a test TU that #includes
+// potential_multipole.h is NOT a sound bit-for-bit gate. The device evaluator gets
+// header-inlined into the test TU while the CPU path stays compiled in this one,
+// and coord::toGrad/toHess (header-inline since 5e04db5) then contract their
+// a*b+c*d sums into FMAs differently in the two contexts. The observed 1-ULP
+// hessian divergence count was a pure function of the TEST TU's flags with the
+// library binary untouched:
+//
+//     test TU flags added        bitwise diffs / 50,688 values
+//     (none, project defaults)                 132
+//     -fno-inline                            2,604
+//     -ffp-contract=off                      7,308
+//
+// -- i.e. the arithmetic is the same expression tree and the difference is which
+// multiply-adds the compiler fuses, exactly the mechanism recorded for `875d7bc`
+// and for the fork-vs-upstream BFE comparison in findings.md. Compiling BOTH sides
+// here puts them under one set of flags in one translation unit, so ordinary
+// codegen drift moves them together (the same property the frozen-ref blocks in
+// tests/test_gpu_policy.cpp rely on) and only a real change in the arithmetic can
+// separate them. Measured 0 differences this way; see the [T2] block in that file.
+//
+// \param[in]  pot      is the potential to check;
+// \param[out] desc     receives the descriptor that was used (so the caller can
+//              classify each point's branch by the same rminSq/rmaxSq test);
+// \param[in]  numPoints, Rzphi  are N points packed as {R, z, phi} triplets;
+// \param[in]  wantGrad, wantHess  select the output combination to exercise --
+//              note wantHess without wantGrad is a legal shape on the CPU path
+//              and is routed identically here;
+// \param[out] outCpu, outDev  must each hold 10*numPoints doubles, filled per
+//              point as {Phi, grad[3] in CylGradIndex order, hess[6] in
+//              CylHessIndex order}; unrequested slots are set to zero on both
+//              sides so the caller can compare the whole record.
+// \return  false if no descriptor could be built (nothing is written then).
+bool multipoleEvalBothPaths(const Multipole& pot, MultipoleDeviceDesc<double>& desc,
+    int numPoints, const double* Rzphi, bool wantGrad, bool wantHess,
+    double* outCpu, double* outDev)
+{
+    std::vector<double> blob;
+    if(!buildMultipoleDeviceDesc<double>(pot, desc, blob))
+        return false;
+    std::vector<double> scratch(multipoleDeviceScratchSize(desc), 0.);
+    for(int i=0; i<numPoints; i++) {
+        const double R = Rzphi[i*3], z = Rzphi[i*3+1], phi = Rzphi[i*3+2];
+        double *oc = outCpu + i*10, *od = outDev + i*10;
+        for(int k=0; k<10; k++)
+            oc[k] = od[k] = 0;
+        // ---- the virtual CPU path
+        coord::GradCyl gc;
+        coord::HessCyl hc;
+        pot.eval(coord::PosCyl(R, z, phi), &oc[0],
+            wantGrad ? &gc : NULL, wantHess ? &hc : NULL);
+        if(wantGrad) {
+            oc[1+CYL_DR]   = gc.dR;
+            oc[1+CYL_DZ]   = gc.dz;
+            oc[1+CYL_DPHI] = gc.dphi;
+        }
+        if(wantHess) {
+            oc[4+CYL_DR2]    = hc.dR2;
+            oc[4+CYL_DZ2]    = hc.dz2;
+            oc[4+CYL_DPHI2]  = hc.dphi2;
+            oc[4+CYL_DRDZ]   = hc.dRdz;
+            oc[4+CYL_DZDPHI] = hc.dzdphi;
+            oc[4+CYL_DRDPHI] = hc.dRdphi;
+        }
+        // ---- the device path, same point, same TU
+        multipoleEvalDevice<double>(desc, &blob.front(), R, z, phi, &od[0],
+            wantGrad ? &od[1] : NULL, wantHess ? &od[4] : NULL, &scratch.front());
+    }
+    return true;
 }
 
 

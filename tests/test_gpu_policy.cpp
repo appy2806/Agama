@@ -16,6 +16,7 @@
 #include "coord.h"               // toPos<Car,Cyl>, toPos<Car,Sph> (Tier 0 Phase 2 device-inline)
 #include "potential_analytic.h"  // potential::NFW + nfw_phi leaf (Tier 1 worked example)
 #include "potential_dehnen.h"    // potential::Dehnen (spherical GPU path) + dehnen_eval leaf
+#include "potential_multipole.h"    // Multipole + MultipoleDeviceDesc/multipoleEvalDevice (Tier 2 commit 5)
 #include "potential_disk.h"      // potential::DiskAnsatz + disk_ansatz_eval/_rho leaves
 #include "potential_composite.h"    // Composite for the Tier 3 orbit workload; UniformAcceleration
 #include "potential_descriptor.h"   // GpuPotDesc + gpu_desc_phi_acc (Tier 3 force descriptor)
@@ -1293,6 +1294,285 @@ int main() {
         std::printf("[CPU]   evalQuinticSplineRaw<float>/evalQuinticSpline2dRaw<float> "
             "instantiate and evaluate finite -> %s\n", ok_fp32_finite ? "OK" : "FAIL");
         ok_quintic_raw = ok_quintic_raw && ok_fp32_finite;
+    }
+
+    // =====================================================================
+    // Tier 2 commit 5: the Multipole device descriptor + blob, and the device
+    // evaluator multipoleEvalDevice<double>, gated BIT-FOR-BIT against the
+    // virtual Multipole::eval on the same points.
+    //
+    // WHY BIT-FOR-BIT AND NOT A TOLERANCE. The whole design claim of this
+    // commit is that the device path calls the SAME leaves as the CPU path
+    // (evalQuinticSpline{,2d}Raw, sphHarmArray, fourierTransformAzimuthT,
+    // multipoleUnscaleLogT, sphToCylDerivs, tauToCylDerivs) and only restates
+    // the loops around them -- including the PowerLaw FUSION, which computes
+    // each (l,m) coefficient where it is consumed instead of materializing
+    // Phi_lm[3*(lmax+1)^2] (30 KB/thread -> 4 KB/thread at order 32, measured).
+    // Fusing leaves every element's defining expression unchanged, so the
+    // correct outcome is identity, not agreement-to-1e-13. A tolerance here
+    // would pass an accidental second copy of the physics; identity cannot.
+    // Same reason the frozen-reference blocks above avoid hard-coded literals:
+    // both sides are compiled in ONE TU here, so ordinary codegen/FMA drift
+    // moves them together and only a real divergence separates them.
+    //
+    // COVERAGE, chosen to hit every branch of the 4-way dispatch:
+    //   * source symmetry: spherical / axisymmetric / triaxial Dehnen (which is
+    //     also what varies mmin(), step and the y-reflection bit in the
+    //     indexing scheme, hence which harmonics are skipped);
+    //   * lmax=0 and lmax=2 -> the MultipoleInterp1d branch (LMAX_1D_SPLINE=2),
+    //     and lmax=2 triaxial specifically also exercises
+    //     sphHarmTransformInverseDeriv's optimized {0,0}/{2,0}/{2,2} shortcut,
+    //     which the device path must fork into or it would compute different
+    //     numbers; lmax=8 and lmax=24 -> the MultipoleInterp2d branch;
+    //   * radii inside the grid, inside the inner asymptote (r <
+    //     gridRadii.front()), beyond the outer one, and far enough out/in to
+    //     trip PowerLawMultipole's "retain only l=0" extreme-regime fast track;
+    //   * geometry: R==0 exactly (where tau = sign(z)), z==0 exactly, and
+    //     generic off-axis points, at several phi;
+    //   * output combinations: Phi only, Phi+grad, Phi+grad+hess, and Phi+hess
+    //     with grad==NULL (a shape the CPU allows and which routes differently).
+    // Plus the fail-closed contract: an lmax=34 expansion must be REJECTED by
+    // the builder (order cap = math::LEGENDRE_MMAX = 32, above which
+    // legendrePmm's host-only NAN branch would be reachable on device), and the
+    // fp32 instantiation must build a descriptor and evaluate finite.
+    // =====================================================================
+    bool ok_mpdev = true;
+    long mpdev_cmp[4][3] = {{0}}, mpdev_dif[4][3] = {{0}};
+    {
+        static const char* BR[4] = { "inner PowerLaw", "outer PowerLaw",
+                                     "MultipoleInterp1d", "MultipoleInterp2d" };
+        static const char* QN[3] = { "Phi", "grad", "hess" };
+        struct MpModel { const char* name; double axisY, axisZ; int lmax, mmax; };
+        const MpModel models[] = {
+            { "spherical   lmax=0 ", 1.0, 1.0,  0,  0 },
+            { "axisym      lmax=2 ", 1.0, 0.7,  2,  0 },
+            { "triaxial    lmax=2 ", 0.8, 0.6,  2,  2 },
+            { "axisym      lmax=8 ", 1.0, 0.7,  8,  0 },
+            { "triaxial    lmax=8 ", 0.8, 0.6,  8,  8 },
+            { "triaxial    lmax=24", 0.8, 0.6, 24, 24 }
+        };
+        int nmodel = 0;
+
+        // The whole gate for one Multipole object: build the descriptor + blob,
+        // sweep the point set, compare every output bit-for-bit against the
+        // virtual eval, then rebuild in fp32 as an instantiation check.
+        auto checkMp = [&](const potential::Multipole& mp, const char* name) {
+            ++nmodel;
+            potential::MultipoleDeviceDesc<double> desc;
+            std::vector<double> blob;
+            if(!potential::buildMultipoleDeviceDesc<double>(mp, desc, blob)) {
+                ok_mpdev = false;
+                std::printf("[T2]    Multipole desc BUILD FAILED for %s\n", name);
+                return;
+            }
+            const int need = potential::multipoleDeviceScratchSize(desc);
+            if(need > potential::MultipoleDeviceScratchMax<32>::value) {
+                ok_mpdev = false;
+                std::printf("[T2]    Multipole scratch %d exceeds the order-32 compile-time "
+                    "bound %d for %s\n", need,
+                    potential::MultipoleDeviceScratchMax<32>::value, name);
+            }
+            // radii spanning all four branches, including the extreme-asymptotic
+            // regimes where PowerLawMultipole drops to the l=0 term only
+            const std::vector<double>& gr = mp.getRadii();
+            const double rin = gr.front(), rout = gr.back();
+            const double radii[] = {
+                rin * 1e-9, rin * 1e-3, rin * 0.5, rin * 0.999,       // inner branch
+                rin * 1.5, std::sqrt(rin*rout), rout * 0.5, rout * 0.999,   // interpolated
+                rout * 1.001, rout * 2.0, rout * 1e3, rout * 1e9      // outer branch
+            };
+            const double thetas[] = { 0.0, 0.4, 1.0, M_PI/2, 2.2, M_PI };  // 0 and pi -> R==0
+            const double phis[]   = { 0.0, 0.7, 2.5, 4.1 };
+            const int NR = (int)(sizeof(radii)/sizeof(radii[0])),
+                      NT = (int)(sizeof(thetas)/sizeof(thetas[0])),
+                      NP_A = (int)(sizeof(phis)/sizeof(phis[0]));
+
+            // Collect the whole point set first, then evaluate it in ONE call per
+            // output combination: multipoleEvalBothPaths rebuilds the descriptor and
+            // blob on each call, and the lmax=24 blob is 660k doubles.
+            std::vector<double> pts;
+            std::vector<int> ptbranch;
+            for(int ir = 0; ir < NR; ++ir) {
+                const double r = radii[ir];
+                // branch this radius lands in, by the same test multipoleEvalDevice makes
+                const double rsq = r*r;
+                const int br = rsq < desc.rminSq ? 0 : rsq > desc.rmaxSq ? 1 :
+                    (desc.implKind == potential::MULTIPOLE_IMPL_INTERP1D ? 2 : 3);
+                for(int it = 0; it < NT; ++it) {
+                    // exact zeros on the axis / in the plane, not sin(pi) roundoff
+                    double R = r * std::sin(thetas[it]), z = r * std::cos(thetas[it]);
+                    if(thetas[it] == 0.0)      { R = 0;   z =  r; }
+                    if(thetas[it] == M_PI)     { R = 0;   z = -r; }
+                    if(thetas[it] == M_PI/2)   { R = r;   z =  0; }
+                    for(int ip = 0; ip < NP_A; ++ip) {
+                        pts.push_back(R);
+                        pts.push_back(z);
+                        pts.push_back(phis[ip]);
+                        ptbranch.push_back(br);
+                    }
+                }
+            }
+            const int NPT_MP = (int)ptbranch.size();
+            std::vector<double> vc(10*NPT_MP), vd(10*NPT_MP);
+            for(int combo = 0; combo < 4; ++combo) {
+                const bool wantG = combo == 1 || combo == 2;
+                const bool wantH = combo == 2 || combo == 3;
+                potential::MultipoleDeviceDesc<double> dchk;
+                if(!potential::multipoleEvalBothPaths(mp, dchk, NPT_MP, &pts.front(),
+                        wantG, wantH, &vc.front(), &vd.front())) {
+                    ok_mpdev = false;
+                    std::printf("[T2]    multipoleEvalBothPaths FAILED for %s\n", name);
+                    break;
+                }
+                // q = 0 Phi (1 value at offset 0), 1 grad (3 at 1), 2 hess (6 at 4)
+                const int qlo[3] = { 0, 1, 4 }, qn[3] = { 1, 3, 6 };
+                const bool qwant[3] = { true, wantG, wantH };
+                for(int i = 0; i < NPT_MP; ++i) {
+                    const int br = ptbranch[i];
+                    for(int q = 0; q < 3; ++q) {
+                        if(!qwant[q])
+                            continue;
+                        for(int k = 0; k < qn[q]; ++k) {
+                            const int idx = i*10 + qlo[q] + k;
+                            ++mpdev_cmp[br][q];
+                            if(!quinticBitsEq(vc[idx], vd[idx])) {
+                                ++mpdev_dif[br][q];
+                                if(mpdev_dif[br][q] == 1)
+                                    std::printf("[T2]    %s %s %s[%d] MISMATCH at "
+                                        "R=%.17g z=%.17g phi=%g: got %.17g want %.17g\n",
+                                        name, BR[br], QN[q], k, pts[i*3], pts[i*3+1],
+                                        pts[i*3+2], vd[idx], vc[idx]);
+                            }
+                        }
+                    }
+                }
+            }
+            std::printf("[T2]    Multipole %s -> ind(lmax=%2d,mmax=%2d,step=%d,mmin=%3d) %s, "
+                "nx=%d ny=%d blob=%6zu T, scratch=%3d/%d\n",
+                name, desc.ind.lmax, desc.ind.mmax, desc.ind.step, desc.ind.mmin(),
+                desc.implKind == potential::MULTIPOLE_IMPL_INTERP1D ? "Interp1d" : "Interp2d",
+                desc.nx, desc.ny, blob.size(), need,
+                potential::MultipoleDeviceScratchMax<32>::value);
+
+            // fp32: the descriptor and blob must build in float too, and the
+            // evaluator must instantiate and produce finite numbers (CLAUDE.md
+            // recipe item 7 -- fp32 accuracy is a separate, measured question)
+            potential::MultipoleDeviceDesc<float> descf;
+            std::vector<float> blobf;
+            if(!potential::buildMultipoleDeviceDesc<float>(mp, descf, blobf)) {
+                ok_mpdev = false;
+                std::printf("[T2]    Multipole fp32 desc BUILD FAILED for %s\n", name);
+            } else {
+                std::vector<float> scratchf(
+                    potential::MultipoleDeviceScratchMax<32>::value, 0.f);
+                float p32 = 0, g32[3] = {0,0,0}, h32[6] = {0,0,0,0,0,0};
+                potential::multipoleEvalDevice<float>(descf, blobf.data(),
+                    (float)(rin*2), (float)(rin*0.7), 0.9f, &p32, g32, h32, scratchf.data());
+                if(!(std::isfinite(p32) && std::isfinite(g32[0]) && std::isfinite(h32[0]))) {
+                    ok_mpdev = false;
+                    std::printf("[T2]    Multipole fp32 eval non-finite for %s "
+                        "(Phi=%g gR=%g hRR=%g)\n", name, p32, g32[0], h32[0]);
+                }
+            }
+        };
+
+        const int NDEHNEN = (int)(sizeof(models)/sizeof(models[0]));
+        for(int im = 0; im < NDEHNEN; ++im) {
+            const MpModel& M = models[im];
+            potential::Dehnen src(1.0, 1.0, 1.0, M.axisY, M.axisZ);
+            shared_ptr<const potential::Multipole> mp = potential::Multipole::create(
+                static_cast<const potential::BasePotential&>(src), coord::ST_UNKNOWN,
+                M.lmax, M.mmax, /*gridSizeR*/ 25, /*rmin*/ 0, /*rmax*/ 0, /*fixOrder*/ true);
+            checkMp(*mp, M.name);
+        }
+
+        // Every Dehnen above is y-reflection symmetric, hence mmin()==0, which
+        // leaves two things untested: the blob slots BELOW m=0 (the layout indexes
+        // MultipoleInterp2d's container as m+ind.mmax, so an off-by-mmax there
+        // would be invisible with mmin()==0) and the sine half of
+        // fourierTransformAzimuthT's trig table. So build two models directly from
+        // coefficient arrays carrying a nonzero m<0 harmonic -- one at lmax=2
+        // (Interp1d) and one at lmax=4 (Interp2d) -- which is also the only way to
+        // get mmin()<0 out of an analytic density here.
+        {
+            const int NR2 = 6;
+            const int lmaxes[2] = { 2, 4 };
+            const char* names[2] = { "m<0 synth   lmax=2 ", "m<0 synth   lmax=4 " };
+            for(int v = 0; v < 2; ++v) {
+                const int L = lmaxes[v], N = (L+1)*(L+1);
+                const int cneg = math::SphHarmIndices::index(L, -2);  // a nonzero m<0 term
+                std::vector<double> radii(NR2);
+                std::vector<std::vector<double> > Phi(N, std::vector<double>(NR2, 0.0)),
+                    dPhi(N, std::vector<double>(NR2, 0.0));
+                for(int k = 0; k < NR2; ++k) {
+                    const double r = 0.05 * std::pow(3.0, k);
+                    radii[k] = r;
+                    Phi [0][k] = -1.0 / (r + 1.0);            // Plummer-like monopole
+                    dPhi[0][k] =  1.0 / pow_2(r + 1.0);
+                    Phi [cneg][k] = 0.02 * Phi [0][k];        // same slope, small amplitude
+                    dPhi[cneg][k] = 0.02 * dPhi[0][k];
+                }
+                potential::Multipole mp(radii, Phi, dPhi);
+                checkMp(mp, names[v]);
+            }
+        }
+
+        // fail-closed: an expansion above the order cap must be REJECTED, not
+        // approximated. Built from explicit coefficient arrays rather than from a
+        // density fit, because Multipole::create routes through
+        // restrictSphHarmCoefs, which trims all-zero trailing harmonics and so
+        // silently lowers the order -- asking it for lmax=34 does NOT reliably
+        // produce an lmax=34 object. Going through the public
+        // Multipole(radii, Phi, dPhi) constructor does: math::getIndicesFromCoefs
+        // takes lmax from the ARRAY SIZE, (lmax+1)^2, not from the nonzero
+        // pattern, so a monopole-only model in a 35^2-long array is an honest
+        // lmax=34 expansion.
+        {
+            const int L34 = 34, N34 = (L34+1)*(L34+1), NR34 = 5;
+            std::vector<double> radii34(NR34);
+            std::vector<std::vector<double> > Phi34(N34, std::vector<double>(NR34, 0.0)),
+                dPhi34(N34, std::vector<double>(NR34, 0.0));
+            for(int k = 0; k < NR34; ++k) {
+                const double r = 0.1 * std::pow(2.0, k);
+                radii34[k] = r;
+                Phi34 [0][k] = -1.0 / (r + 1.0);          // a Plummer-like monopole
+                dPhi34[0][k] =  1.0 / pow_2(r + 1.0);
+            }
+            potential::Multipole mp34(radii34, Phi34, dPhi34);
+            potential::MultipoleDeviceDesc<double> d34;
+            std::vector<double> b34;
+            const bool built = potential::buildMultipoleDeviceDesc<double>(mp34, d34, b34);
+            const bool ok34 = !built && b34.empty();
+            if(!ok34)
+                ok_mpdev = false;
+            std::printf("[T2]    Multipole order cap: an lmax=%d expansion is rejected by the "
+                "builder (cap = LEGENDRE_MMAX = %d) and leaves the blob empty -> %s\n",
+                L34, math::LEGENDRE_MMAX, ok34 ? "OK" : "FAIL");
+        }
+
+        long tot_c = 0, tot_d = 0;
+        for(int b = 0; b < 4; ++b) {
+            long bc = 0, bd = 0;
+            for(int q = 0; q < 3; ++q) { bc += mpdev_cmp[b][q]; bd += mpdev_dif[b][q]; }
+            tot_c += bc; tot_d += bd;
+            std::printf("[T2]      branch %-18s: %7ld values, %ld bitwise diffs "
+                "(Phi %ld/%ld, grad %ld/%ld, hess %ld/%ld)\n", BR[b], bc, bd,
+                mpdev_dif[b][0], mpdev_cmp[b][0], mpdev_dif[b][1], mpdev_cmp[b][1],
+                mpdev_dif[b][2], mpdev_cmp[b][2]);
+        }
+        for(int b = 0; b < 4; ++b)
+            for(int q = 0; q < 3; ++q)
+                if(mpdev_cmp[b][q] == 0) {
+                    ok_mpdev = false;
+                    std::printf("[T2]    NO COVERAGE of branch %s / %s -- the sweep no longer "
+                        "reaches it, so this gate is not testing what it claims\n",
+                        BR[b], QN[q]);
+                }
+        if(tot_d != 0)
+            ok_mpdev = false;
+        std::printf("[T2]    multipoleEvalDevice<double> + buildMultipoleDeviceDesc vs virtual "
+            "Multipole::eval, %d models x 4 branches: %ld values compared, %ld bitwise "
+            "differences -> %s\n", nmodel, tot_c, tot_d, ok_mpdev ? "OK" : "FAIL");
     }
 
     // =====================================================================
@@ -2628,7 +2908,7 @@ int main() {
         LEG_LMAX, LEG_LMAX, LEG_NTAU, max_leg_relerr, LEG_TOL, ok_leg ? "OK" : "FAIL");
 
     if (!(ok_cpu && ok_gpu && ok_trig && ok_coord && ok_leg && ok_legtab && ok_powint &&
-          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_quintic_cuda &&
+          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_mpdev && ok_quintic_cuda &&
           ok_sphharm_frozen && ok_eps32 && ok_sphharm_cuda32)) {
         std::fprintf(stderr, "FAIL\n");
         return 1;
@@ -2716,7 +2996,7 @@ int main() {
     return 0;
 #else
     if (!(ok_cpu && ok_legtab && ok_powint && ok_coordderiv && ok_shipod && ok_quintic_raw &&
-          ok_sphharm_frozen && ok_eps32)) {
+          ok_mpdev && ok_sphharm_frozen && ok_eps32)) {
         std::fprintf(stderr, "FAIL (CPU only)\n");
         return 1;
     }
