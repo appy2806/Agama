@@ -1,8 +1,11 @@
 #include "potential_multipole.h"
+#include "potential_descriptor.h"   // multipoleDescBothPaths (round-trip gate, bottom of file)
 #include "math_core.h"
 #include "math_specfunc.h"
 #include "math_spline.h"
 #include "utils.h"
+#include <cstdint>
+#include <cstring>
 #include <cassert>
 #include <stdexcept>
 #include <cmath>
@@ -2284,6 +2287,169 @@ bool multipoleEvalBothPaths(const Multipole& pot, MultipoleDeviceDesc<double>& d
         // ---- the device path, same point, same TU
         multipoleEvalDevice<double>(desc, &blob.front(), R, z, phi, &od[0],
             wantGrad ? &od[1] : NULL, wantHess ? &od[4] : NULL, &scratch.front());
+    }
+    return true;
+}
+
+
+// Round-trip gate for the DESCRIPTOR path (Tier 2 commit 5b): the whole
+// GpuPotDesc pipeline -- buildGpuPotDesc's Multipole term, the payload offset, the
+// Cyl->Car conversion in gpu_multipole_phi_acc, and multipoleDensityDevice --
+// against the ordinary virtual path, both compiled here. See the declaration in
+// potential_descriptor.h for why this lives in this TU and why the CPU reference
+// calls coord::evalAndConvert explicitly rather than through the vtable.
+// The BIT-FOR-BIT half of the commit-5b gate: everything the descriptor's Multipole
+// term does AFTER the Cartesian->cylindrical position conversion, against the virtual
+// path, with ONE shared conversion so the comparison cannot be polluted by it.
+//
+// WHY THE SPLIT. The end-to-end comparison in multipoleDescBothPaths below cannot be
+// bit-for-bit even in principle, and the reason is instructive rather than a defect:
+// both paths must compute R = sqrt(x^2+y^2) from the Cartesian input, so the
+// expression x*x + y*y appears at two different inline sites in one function, and GCC
+// is free to contract it as fma(x,x, y*y) at one site and fma(y,y, x*x) at the other.
+// Those round differently, and a 1-ULP difference in R^2 survives into Phi at a
+// fraction of points. Measured: the residual moved from 25 rho differences to 0 when
+// unrelated code was added nearby, i.e. that count was codegen luck, exactly the
+// unsoundness the FMA rule at the top of potential_multipole.h warns about.
+//
+// So the path is gated as a COMPOSITION of two exact pieces instead:
+//   (1) gpu_car_to_cyl_deriv == coord.cpp's toPosDeriv<Car,Cyl>, bit-for-bit
+//       (counted by multipoleDescBothPaths' posDiffs output);
+//   (2) this function: given ONE conversion shared by both sides, the whole rest of
+//       the term -- multipoleEvalDevice, the coord::toGrad<Cyl,Car> that carries
+//       dPhi/dphi into Cartesian, and multipoleDensityDevice's three-way dispatch --
+//       is bit-for-bit.
+// plus the end-to-end number reported at a 1-ULP bound, which is what catches
+// plumbing errors (a wrong payload offset or mp[] index gives garbage, not 1 ULP).
+//
+// Output layout is the same 5 doubles per point as multipoleDescBothPaths.
+bool multipoleDescCylBothPaths(const Multipole& pot, int numPoints, const double* xyz,
+    double* outCpu, double* outDev)
+{
+    MultipoleDeviceDesc<double> desc;
+    std::vector<double> blob;
+    if(!buildMultipoleDeviceDesc<double>(pot, desc, blob))
+        return false;
+    std::vector<double> scratch(multipoleDeviceScratchSize(desc), 0.);
+    for(int i=0; i<numPoints; i++) {
+        double *oc = outCpu + i*5, *od = outDev + i*5;
+        // THE one conversion, shared by both sides
+        coord::PosDerivT<coord::Car, coord::Cyl> cd;
+        const coord::PosCyl pc = coord::toPosDeriv<coord::Car, coord::Cyl>(
+            coord::PosCar(xyz[i*3], xyz[i*3+1], xyz[i*3+2]), &cd);
+        // ---- virtual path
+        {
+            double phiv = 0;
+            coord::GradCyl gcyl = {0, 0, 0};
+            pot.eval(pc, &phiv, &gcyl, (coord::HessCyl*)NULL);
+            const coord::GradCar gcar = coord::toGrad<coord::Cyl, coord::Car>(gcyl, cd);
+            oc[0] = phiv;
+            oc[1] = -gcar.dx;
+            oc[2] = -gcar.dy;
+            oc[3] = -gcar.dz;
+            oc[4] = pot.density(pc);
+        }
+        // ---- device path
+        {
+            double phid = 0, g[3] = {0, 0, 0};
+            multipoleEvalDevice<double>(desc, &blob.front(), pc.R, pc.z, pc.phi,
+                &phid, g, (double*)NULL, &scratch.front());
+            coord::GradCyl gcyl;
+            gcyl.dR   = g[CYL_DR];
+            gcyl.dz   = g[CYL_DZ];
+            gcyl.dphi = g[CYL_DPHI];
+            const coord::GradCar gcar = coord::toGrad<coord::Cyl, coord::Car>(gcyl, cd);
+            od[0] = phid;
+            od[1] = -gcar.dx;
+            od[2] = -gcar.dy;
+            od[3] = -gcar.dz;
+            od[4] = multipoleDensityDevice<double>(desc, &blob.front(),
+                pc.R, pc.z, pc.phi, &scratch.front());
+        }
+    }
+    return true;
+}
+
+bool multipoleDescBothPaths(const BasePotential& pot, int numPoints, const double* xyz,
+    double* outCpu, double* outDev, int* nmp, bool* exactRef, long* posDiffs)
+{
+    if(posDiffs)
+        *posDiffs = 0;
+    GpuPotDesc<double> desc;
+    std::vector<double> payload;
+    if(!buildGpuPotDesc(pot, desc, /*time*/ 0, &payload, /*foldTimeVaryingModifiers*/ true))
+        return false;
+    if(nmp)
+        *nmp = desc.nmp;
+    desc.splineData = payload.empty() ? NULL : &payload.front();
+    // A BARE Multipole gets an EXACT reference: the two steps of
+    // coord::evalAndConvert<Cyl,Car> spelled out here (the real coord.cpp
+    // toPosDeriv<Car,Cyl>, then the header-inline toGrad<Cyl,Car> compiled in THIS
+    // TU, which is the same instance the descriptor path calls), plus
+    // Multipole::densityCyl reached through BaseDensity::density(PosCyl) so that the
+    // reference never routes through the header-inline BasePotentialCyl::densityCar
+    // whose out-of-line copy is a weak symbol the linker may take from elsewhere.
+    // Composites and modifier chains reorder and rescale things in ways the
+    // descriptor does differently by design, so those get the ordinary virtual
+    // Cartesian entry points and a tolerance rather than a bit comparison.
+    const Multipole* bare = dynamic_cast<const Multipole*>(&pot);
+    if(exactRef)
+        *exactRef = bare != NULL;
+    for(int i=0; i<numPoints; i++) {
+        const double x = xyz[i*3], y = xyz[i*3+1], z = xyz[i*3+2];
+        double *oc = outCpu + i*5, *od = outDev + i*5;
+        // ---- the virtual CPU path
+        if(bare) {
+            coord::PosDerivT<coord::Car, coord::Cyl> cd;
+            const coord::PosCyl pc = coord::toPosDeriv<coord::Car, coord::Cyl>(
+                coord::PosCar(x, y, z), &cd);
+            double phiCpu = 0;
+            coord::GradCyl gcyl = {0, 0, 0};
+            bare->eval(pc, &phiCpu, &gcyl, (coord::HessCyl*)NULL);
+            const coord::GradCar gcar = coord::toGrad<coord::Cyl, coord::Car>(gcyl, cd);
+            oc[0] = phiCpu;
+            oc[1] = -gcar.dx;
+            oc[2] = -gcar.dy;
+            oc[3] = -gcar.dz;
+            oc[4] = bare->density(coord::toPosCyl(coord::PosCar(x, y, z)));
+        } else {
+            double phiCpu = 0;
+            coord::GradCar gcar = {0, 0, 0};
+            pot.eval(coord::PosCar(x, y, z), &phiCpu, &gcar, (coord::HessCar*)NULL);
+            oc[0] = phiCpu;
+            oc[1] = -gcar.dx;
+            oc[2] = -gcar.dy;
+            oc[3] = -gcar.dz;
+            oc[4] = pot.density(coord::PosCar(x, y, z));
+        }
+        // ---- localize any divergence: is the transcribed gpu_car_to_cyl_deriv
+        // bit-identical to the coord.cpp toPosDeriv<Car,Cyl> it was copied from?
+        if(posDiffs) {
+            coord::PosDerivT<coord::Car, coord::Cyl> cdRef, cdDev;
+            const coord::PosCyl pcRef = coord::toPosDeriv<coord::Car, coord::Cyl>(
+                coord::PosCar(x, y, z), &cdRef);
+            double Rdev, phidev;
+            gpu_car_to_cyl_deriv(x, y, cdDev, Rdev, phidev);
+            const double refv[6] = { pcRef.R, pcRef.phi,
+                cdRef.dRdx, cdRef.dRdy, cdRef.dphidx, cdRef.dphidy };
+            const double devv[6] = { Rdev, phidev,
+                cdDev.dRdx, cdDev.dRdy, cdDev.dphidx, cdDev.dphidy };
+            for(int k=0; k<6; k++) {
+                uint64_t ba, bb;
+                std::memcpy(&ba, &refv[k], 8);
+                std::memcpy(&bb, &devv[k], 8);
+                if(ba != bb)
+                    ++*posDiffs;
+            }
+        }
+        // ---- the descriptor path, same point, same TU
+        double acc[3] = {0, 0, 0};
+        gpu_desc_phi_acc_ord<double, GPU_POT_MULTIPOLE_ORDER>(
+            desc, x, y, z, &od[0], acc, 0.);
+        od[1] = acc[0];
+        od[2] = acc[1];
+        od[3] = acc[2];
+        od[4] = gpu_desc_dens_ord<double, GPU_POT_MULTIPOLE_ORDER>(desc, x, y, z, 0.);
     }
     return true;
 }

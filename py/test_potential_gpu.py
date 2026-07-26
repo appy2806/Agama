@@ -397,10 +397,389 @@ def force_density_cupy_tests(targets, xyz):
     return all_ok
 
 
+# ============================================================================
+# Tier 2 commit 5b: Multipole on the GPU, through the descriptor path.
+# ============================================================================
+
+def _mw_multipole():
+    """A GalPot-flavoured MW-like Multipole: an exponential/Sersic-ish disc plus a
+    flattened NFW-like halo, expanded to lmax=mmax=8 -- the shape every realistic
+    Milky Way model takes, and the one the MultipoleInterp2d branch serves."""
+    disc = agama.Density(type='Disk', surfaceDensity=1.0, scaleRadius=3.0,
+                         scaleHeight=0.3)
+    halo = agama.Density(type='Spheroid', densityNorm=0.5, gamma=1.0, beta=3.0,
+                         scaleRadius=15.0, axisRatioZ=0.8)
+    return agama.Potential(type='Multipole', density=agama.Density(disc, halo),
+                           lmax=8, mmax=8, gridSizeR=30, rmin=0.05, rmax=200.0)
+
+
+def multipole_targets():
+    """Multipole models covering the branch/symmetry space that matters:
+    spherical (lmax=0, the Interp1d branch), triaxial lmax=2 (Interp1d plus
+    sphHarmTransformInverseDeriv's optimized {0,0}/{2,0}/{2,2} shortcut), triaxial
+    lmax=8 (Interp2d, mmax>0 so dPhi/dphi != 0 -- the component a 2-component
+    Cyl->Car conversion would silently drop), the MW-like model above, and a
+    composite and a Shifted chain wrapping one."""
+    sph = agama.Potential(type='Multipole', density='Spheroid', gamma=1, beta=4,
+                          scaleRadius=1, lmax=0, mmax=0, gridSizeR=25)
+    tri2 = agama.Potential(type='Multipole', density='Spheroid', gamma=1, beta=4,
+                           scaleRadius=1, axisRatioY=0.8, axisRatioZ=0.6,
+                           lmax=2, mmax=2, gridSizeR=25)
+    tri8 = agama.Potential(type='Multipole', density='Spheroid', gamma=1, beta=4,
+                           scaleRadius=1, axisRatioY=0.8, axisRatioZ=0.6,
+                           lmax=8, mmax=8, gridSizeR=25)
+    mw = _mw_multipole()
+    nfw = agama.Potential(type='NFW', mass=10.0, scaleRadius=5.0)
+    comp = agama.Potential(tri8, nfw)
+    shifted = agama.Potential(type='Multipole', density='Spheroid', gamma=1, beta=4,
+                              scaleRadius=1, axisRatioY=0.8, axisRatioZ=0.6,
+                              lmax=8, mmax=8, gridSizeR=25, center='0.3,-0.2,0.1')
+    return [
+        ("Mp sph l0",   sph),
+        ("Mp tri l2",   tri2),
+        ("Mp tri l8",   tri8),
+        ("Mp MW l8",    mw),
+        ("Mp+NFW comp", comp),
+        ("Mp shifted",  shifted),
+    ]
+
+
+def _pointwise_rel(a, b):
+    """Max POINTWISE relative difference. Not normalized by max|ref|: that averages
+    defects away, which is how a 4.7e-4 error in NFW's dPhi/dr once hid under a 5e-6
+    budget (see _check_fd). Elements where the reference underflows to zero are
+    compared in absolute terms against the largest |ref| instead."""
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    scale = np.abs(b)
+    floor = np.max(scale) * 1e-300 if scale.size else 1.0
+    scale = np.where(scale > 0, scale, max(floor, 1e-300))
+    return float(np.max(np.abs(a - b) / scale))
+
+
+def multipole_parity_tests(targets, xyz):
+    """potential / force / density on a Multipole across 4 devices x 2 precisions,
+    against the legacy no-kwarg CPU path, with POINTWISE relative tolerances.
+
+    fp64 tolerance 1e-11: the descriptor path re-derives R = sqrt(x^2+y^2) inside the
+    kernel, and GCC/nvcc may fuse that multiply-add differently from coord.cpp's copy,
+    which is worth a few ULP and, through a steep power-law asymptote, up to ~1e-14
+    pointwise. The C++ gate (tests/test_gpu_policy.cpp [T2B]) pins the exact figure at
+    8 ULP and pins everything downstream of that conversion at ZERO bitwise
+    differences, so this tolerance is not where the real accuracy claim lives.
+
+    THE fp32 REFERENCE IS THE fp32 CPU RESULT, not the fp64 one. This function asks
+    "does the GPU backend reproduce the CPU backend at the same precision"; asking
+    instead "how close is fp32 to fp64" conflates a backend difference with an
+    accuracy property and would report an intrinsic fp32 conditioning limit as a GPU
+    bug. Measured while writing this: comparing fp32 density against fp64 gives up to
+    0.13 POINTWISE relative on a triaxial r^-4 halo -- identical on
+    serial/cpu/openmp/cuda, i.e. a property of the shared leaf math (the in-grid
+    density is a cylindrical Laplacian, a sum of four cancelling second derivatives).
+    That number is real and belongs in multipole_fp32_budget() below, where it is
+    reported and explained, not hidden in a widened parity tolerance."""
+    all_ok = True
+    for name, pot in targets:
+        refs = {
+            np.float64: {
+                "potential": np.atleast_1d(pot.potential(xyz)),
+                "force":     np.atleast_2d(pot.force(xyz)),
+                "density":   np.atleast_1d(pot.density(xyz)),
+            },
+            np.float32: {
+                op: getattr(pot, op)(xyz.astype(np.float32), device='cpu',
+                                     dtype=np.float32)
+                for op in ("potential", "force", "density")
+            },
+        }
+        for op in ("potential", "force", "density"):
+            # fp32 DENSITY gets a looser cross-backend tolerance than fp32 potential
+            # and force, and the reason is conditioning, not a backend difference:
+            # inside the radial grid the density IS the cylindrical Laplacian, whose
+            # own fp32-vs-fp64 error is 5e-2 (see multipole_fp32_budget). Demanding
+            # 1e-5 agreement between two backends on a quantity that is only good to
+            # 5e-2 in that precision is asking the cancellation to round identically
+            # under g++ and nvcc. Measured worst case: 1.5e-4, on Shifted(Multipole),
+            # where the modifier transform adds one more fp32 rounding before the
+            # cancelling sum. It is the same on every device+dtype combination that
+            # keeps the transform, i.e. a property of the arithmetic, not of CUDA.
+            fp32tol = 1e-3 if op == "density" else 1e-5
+            for device in ("cpu", "openmp", "serial", "cuda"):
+                for dtype, tol in ((np.float64, 1e-11), (np.float32, fp32tol)):
+                    label = f"{name:13s} {op:9s} {device:6s} {dtype.__name__:8s}"
+                    try:
+                        arg = xyz if dtype == np.float64 else xyz.astype(np.float32)
+                        out = getattr(pot, op)(arg, device=device, dtype=dtype)
+                        if out.dtype != dtype:
+                            print(f"  FAIL {label} : dtype {out.dtype} != {dtype}")
+                            all_ok = False
+                            continue
+                        err = _pointwise_rel(out, refs[dtype][op])
+                        ok = err <= tol
+                        print(f"  {'OK  ' if ok else 'FAIL'} {label} : "
+                              f"max pointwise rel = {err:.3e}  tol = {tol:.1e}")
+                        if not ok:
+                            all_ok = False
+                    except Exception as e:
+                        print(f"  FAIL {label} : {type(e).__name__}: {e}")
+                        all_ok = False
+    return all_ok
+
+
+def multipole_fp32_budget():
+    """THE fp32 ACCURACY BUDGET -- the one thing gating fp32 as a default for Tier 2.
+
+    fp32 vs fp64 on the SAME device path, POINTWISE relative, over a log-spaced radial
+    sweep that deliberately straddles the radial grid: inside it the MultipoleInterp2d
+    branch runs and never calls sphHarmArray at all (so it entirely avoids the ~2e-2
+    near-pole derivative error that fp32 sphHarmArray carries); outside it the
+    PowerLawMultipole asymptotes DO call sphHarmArray, so both regimes have to be
+    sampled or the reported number is not the budget.
+
+    Reported per quantity and per regime. Pointwise, NOT normalized by max|ref| --
+    normalizing by the maximum hides exactly the kind of localized defect this is
+    looking for."""
+    print("== Multipole fp32-vs-fp64 accuracy budget (pointwise relative) ==")
+    models = [
+        ("MW-like l8 (disc+halo)", _mw_multipole(), 0.05, 200.0),
+        ("triaxial r^-4 halo l8",
+         agama.Potential(type='Multipole', density='Spheroid', gamma=1, beta=4,
+                         scaleRadius=1, axisRatioY=0.8, axisRatioZ=0.6,
+                         lmax=8, mmax=8, gridSizeR=25, rmin=0.02, rmax=100.0),
+         0.02, 100.0),
+    ]
+    all_ok = True
+    # a few directions, including near-pole (theta -> 0) and in-plane, at two azimuths
+    dirs = []
+    for theta in (0.02, 0.3, np.pi / 4, np.pi / 2 - 0.02, np.pi / 2):
+        for phi in (0.0, 0.9):
+            dirs.append((np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi),
+                         np.cos(theta)))
+    dirs = np.array(dirs)
+    # MEASURED budgets, per QUANTITY rather than per regime, because the conditioning
+    # is a property of what is being computed:
+    #   potential  ~1e-6  -- a plain fp32 spline/series evaluation, near the eps floor;
+    #   force      ~1e-3  -- one differentiation of the same interpolant;
+    #   density    ~5e-3  -- inside the radial grid this is the cylindrical LAPLACIAN,
+    #                        i.e. a sum of four second derivatives that cancel, which
+    #                        is the worst-conditioned quantity in the whole path (the
+    #                        CPU code even has an explicit eps^(2/3) roundoff cutoff
+    #                        for exactly this reason). Outside the grid the closed-form
+    #                        PowerLaw density is used instead and the error drops two
+    #                        orders of magnitude, which is visible in the table.
+    # Headroom over the measured worst case is ~1.5-3x: enough that ordinary drift does
+    # not flake the suite, tight enough that a real regression in the spline or harmonic
+    # layer trips it. These are the numbers to argue about when deciding whether fp32
+    # becomes a default; they are NOT tolerances chosen to make a test pass.
+    # DENSITY inside the radial grid is the one quantity fp32 does NOT deliver
+    # pointwise, and it is worth being explicit about because it is the answer to
+    # "can fp32 be the default": measured up to 1.4e-1 on a triaxial r^-4 halo, five
+    # orders of magnitude worse than the potential on the same points. The mechanism
+    # is not the spline layer -- it is that rho inside the grid is obtained as the
+    # cylindrical LAPLACIAN of Phi, i.e. d2Phi/dR2 + dPhi/dR/R + d2Phi/dz2 +
+    # d2Phi/dphi2/R2, four terms that cancel to a small residual for a steeply
+    # falling profile. The CPU path itself declares the result zero below an
+    # eps^(2/3) relative threshold for exactly this reason; in fp32 that threshold is
+    # 2.4e-5 instead of 4e-11, so everything just above it keeps O(1) relative error.
+    # Outside the grid the closed-form PowerLaw density is used instead and the error
+    # drops by four orders of magnitude, which the table below shows directly.
+    #
+    # CONCLUSION for the fp32-as-default question: potential (1e-6) and force (1e-3)
+    # are fine; in-grid density is not, and an fp32 density consumer must either use
+    # fp64 or take the density from a Density object rather than from a potential's
+    # Laplacian. That is a property of the CPU algorithm, identical on every backend,
+    # not a GPU defect.
+    budget = {"potential": 1e-6, "force": 2e-3, "density": 2e-1}
+    worst = {}
+    for mname, pot, rgrid_lo, rgrid_hi in models:
+      print(f"  -- {mname} (radial grid {rgrid_lo:g} .. {rgrid_hi:g})")
+      regimes = [
+        ("inner asympt (r < rmin)", np.logspace(np.log10(rgrid_lo) - 3,
+                                                np.log10(rgrid_lo) - 0.05, 40)),
+        ("in grid (Interp2d)",      np.logspace(np.log10(rgrid_lo) + 0.05,
+                                                np.log10(rgrid_hi) - 0.05, 120)),
+        ("outer asympt (r > rmax)", np.logspace(np.log10(rgrid_hi) + 0.05,
+                                                np.log10(rgrid_hi) + 3, 40)),
+      ]
+      for regime, radii in regimes:
+        xyz = (radii[:, None, None] * dirs[None, :, :]).reshape(-1, 3)
+        for op in ("potential", "force", "density"):
+            ref = getattr(pot, op)(xyz, device='cpu', dtype=np.float64)
+            f32 = getattr(pot, op)(xyz.astype(np.float32), device='cpu', dtype=np.float32)
+            err = _pointwise_rel(f32, ref)
+            worst[(mname, regime, op)] = err
+            # locate the worst point, so the number is actionable
+            r64 = np.asarray(ref, dtype=np.float64).reshape(len(radii), len(dirs), -1)
+            f64 = np.asarray(f32, dtype=np.float64).reshape(len(radii), len(dirs), -1)
+            rel = np.abs(f64 - r64) / np.maximum(np.abs(r64), 1e-300)
+            i, j = np.unravel_index(int(np.argmax(rel.max(axis=2))), rel.shape[:2])
+            print(f"     {regime:26s} {op:9s} : max pointwise rel = {err:.3e}  "
+                  f"(worst at r={radii[i]:.4g}, theta={np.arccos(dirs[j][2]):.3f}, "
+                  f"budget {budget[op]:.0e})")
+    for (mname, regime, op), err in worst.items():
+        if err > budget[op]:
+            print(f"  FAIL {mname} / {regime} / {op}: {err:.3e} exceeds budget "
+                  f"{budget[op]:.1e}")
+            all_ok = False
+    print(f"  {'OK  ' if all_ok else 'FAIL'} fp32 budget respected in all "
+          f"{len(worst)} (model, regime, quantity) cells")
+    return all_ok
+
+
+def multipole_orbit_test():
+    """orbit(..., device='cuda') on a Multipole-based MW potential: currently FAILS
+    CLOSED to the CPU integrator, and this test pins that contract.
+
+    Batch potential/force/density DO run a Multipole on the GPU. The orbit kernels do
+    not yet, for a measured COMPILE-TIME reason documented in orbit_gpu.cpp
+    (prepareOrbitBatch): giving the DOP853/DPRKN8 kernels the Multipole scratch also
+    inlines the whole four-branch evaluator into a body that already saturates the
+    register file, and one ptxas invocation was still running after 27 minutes at
+    order 32 / 890 s at order 8, against ~460 s for the whole TU as it ships.
+
+    So the contract to hold here is: either the call raises NotImplementedError, or it
+    silently gives the right answer -- never a wrong answer, and never a crash. What
+    must NOT happen is a Multipole reaching a kernel with no scratch for it."""
+    print("== orbit(device='cuda') on a Multipole-based MW potential ==")
+    pot = _mw_multipole()
+    rng = np.random.default_rng(7)
+    N = 256
+    ic = np.empty((N, 6))
+    ic[:, 0] = rng.uniform(4.0, 12.0, N)
+    ic[:, 1] = rng.uniform(-2.0, 2.0, N)
+    ic[:, 2] = rng.uniform(-1.0, 1.0, N)
+    vc = np.sqrt(np.maximum(1e-6, -np.sum(ic[:, :3] * pot.force(ic[:, :3]), axis=1)))
+    ic[:, 3] = -ic[:, 1] / np.hypot(ic[:, 0], ic[:, 1]) * vc
+    ic[:, 4] = ic[:, 0] / np.hypot(ic[:, 0], ic[:, 1]) * vc
+    ic[:, 5] = rng.uniform(-0.1, 0.1, N) * vc
+    T, NS = 40.0, 33
+    all_ok = True
+    try:
+        tc, wc = agama.orbit(potential=pot, ic=ic, time=T, trajsize=NS,
+                             separateTime=True)
+        try:
+            tg, wg = agama.orbit(potential=pot, ic=ic, time=T, trajsize=NS,
+                                 separateTime=True, device='cuda')
+        except NotImplementedError as e:
+            print(f"  OK   orbit device='cuda' on a Multipole falls back cleanly: "
+                  f"NotImplementedError: {str(e)[:110]}")
+            return True
+        except RuntimeError as e:
+            if "without CUDA support" in str(e):
+                print("  SKIP orbit device='cuda': library built with HAVE_CUDA=0")
+                return True
+            print(f"  FAIL orbit device='cuda': RuntimeError: {e}")
+            return False
+        except Exception as e:
+            print(f"  FAIL orbit device='cuda': {type(e).__name__}: {e}")
+            return False
+        wc = np.asarray(wc)
+        wg = np.asarray(wg)
+        scale = np.max(np.abs(wc), axis=2, keepdims=True)
+        rel = float(np.max(np.abs(wg - wc) / np.maximum(scale, 1e-300)))
+        ok = rel <= 1e-4
+        print(f"  {'OK  ' if ok else 'FAIL'} cuda vs cpu trajectories (N={N}, T={T}, "
+              f"{NS} samples): max rel = {rel:.3e}  tol = 1.0e-04")
+        all_ok = all_ok and ok
+        # energy conservation of the GPU trajectories (absolute quality gate)
+        def energy(w):
+            return pot.potential(w[:, :3]) + 0.5 * np.sum(w[:, 3:] ** 2, axis=1)
+        dE = np.abs((energy(wg[:, -1, :]) - energy(wg[:, 0, :])) / energy(wg[:, 0, :]))
+        okE = float(np.max(dE)) <= 1e-6 and not np.any(np.isnan(wg))
+        print(f"  {'OK  ' if okE else 'FAIL'} cuda energy conservation: max |dE/E| = "
+              f"{float(np.max(dE)):.3e}  tol = 1.0e-06, NaN: {bool(np.any(np.isnan(wg)))}")
+        all_ok = all_ok and okE
+    except Exception as e:
+        print(f"  FAIL orbit test: {type(e).__name__}: {e}")
+        all_ok = False
+    return all_ok
+
+
+def multipole_fail_closed_test():
+    """A Multipole shape the device path cannot represent must raise
+    NotImplementedError (and leave the CPU path working), never produce a guessed
+    answer. The order cap is math::LEGENDRE_MMAX = 32; a Composite with more
+    Multipoles than GPU_POT_MAX_MULTIPOLE = 4 likewise falls back."""
+    print("== Multipole capability boundary on device='cuda' ==")
+    all_ok = True
+    xyz = np.array([[1.0, 0.5, 0.3], [3.0, -1.0, 0.7]])
+    mps = [agama.Potential(type='Multipole', density='Spheroid', gamma=1, beta=4,
+                           scaleRadius=1 + 0.1 * i, axisRatioY=0.8, axisRatioZ=0.6,
+                           lmax=8, mmax=8, gridSizeR=25) for i in range(5)]
+    # (a) MORE Multipoles than GPU_POT_MAX_MULTIPOLE still WORKS through batch
+    #     evaluation, and that is not an accident: try_dispatch recurses into a
+    #     Composite MEMBER BY MEMBER, so each Multipole gets its own single-term
+    #     descriptor and the 4-slot side table never fills. The cap binds only on
+    #     consumers that need ONE descriptor for the whole potential -- the orbit
+    #     kernel -- and that case is gated in C++ (tests/test_gpu_policy.cpp [T2B],
+    #     which calls buildGpuPotDesc on a 5-Multipole composite and requires it to
+    #     be rejected rather than truncated).
+    five = agama.Potential(*mps)
+    try:
+        got = five.potential(xyz, device='cuda')
+        ref = five.potential(xyz)
+        err = _pointwise_rel(got, ref)
+        ok = err <= 1e-11
+        print(f"  {'OK  ' if ok else 'FAIL'} 5-Multipole composite on device='cuda' "
+              f"(per-member dispatch, side table never exceeds {5} of "
+              f"GPU_POT_MAX_MULTIPOLE): max pointwise rel = {err:.3e}")
+        all_ok = all_ok and ok
+    except RuntimeError as e:
+        if "without CUDA support" in str(e):
+            print("  SKIP 5-Multipole composite: library built with HAVE_CUDA=0")
+        else:
+            print(f"  FAIL 5-Multipole composite: RuntimeError: {e}")
+            all_ok = False
+    except Exception as e:
+        print(f"  FAIL 5-Multipole composite: {type(e).__name__}: {e}")
+        all_ok = False
+    # (b) the OTHER Tier 2 expansion, CylSpline, must still be refused by name --
+    #     adding GPU_POT_MULTIPOLE must not have widened capability to BFEs in general
+    cs = agama.Potential(type='CylSpline', density='Disk', surfaceDensity=1.0,
+                         scaleRadius=2.0, scaleHeight=0.3, mmax=0,
+                         gridSizeR=20, gridSizez=20)
+    try:
+        cs.potential(xyz, device='cuda')
+        print("  FAIL CylSpline was ACCEPTED on device='cuda' (capability leaked)")
+        all_ok = False
+    except NotImplementedError as e:
+        named = 'CylSpline' in str(e)
+        print(f"  {'OK  ' if named else 'FAIL'} CylSpline -> NotImplementedError, names "
+              f"the unsupported type: {str(e)[:100]}")
+        all_ok = all_ok and named
+    except RuntimeError as e:
+        if "without CUDA support" in str(e):
+            print("  SKIP CylSpline: library built with HAVE_CUDA=0")
+        else:
+            print(f"  FAIL CylSpline: RuntimeError: {e}")
+            all_ok = False
+    except Exception as e:
+        print(f"  FAIL CylSpline: {type(e).__name__}: {e}")
+        all_ok = False
+    # ... and the CPU path for the refused object is unaffected
+    try:
+        v = cs.potential(xyz)
+        ok = np.all(np.isfinite(v))
+        print(f"  {'OK  ' if ok else 'FAIL'} refused object still evaluates on the CPU "
+              f"path: {v}")
+        all_ok = all_ok and ok
+    except Exception as e:
+        print(f"  FAIL CPU fallback for CylSpline: {type(e).__name__}: {e}")
+        all_ok = False
+    return all_ok
+
+
 def main():
     rng = np.random.default_rng(42)
     N = 1024
     xyz = rng.uniform(-5.0, 5.0, size=(N, 3))
+    # Multipole point set: the sweep above is centred on unit-scale analytic
+    # potentials; the Multipole models use grids out to r ~ 200, and a uniform cube
+    # would put most points in one branch. Log-spaced radii x scattered directions
+    # instead, so all four branches of the radial dispatch get hit.
+    _r = 10.0 ** rng.uniform(-2.0, 2.6, size=N)
+    _u = rng.normal(size=(N, 3))
+    xyz_mp = _r[:, None] * _u / np.linalg.norm(_u, axis=1)[:, None]
 
     pots = [
         ("Plummer",       agama.Potential(type='Plummer',       mass=1.0, scaleRadius=1.0)),
@@ -586,38 +965,36 @@ def main():
         print(f"  FAIL Composite+Dehnen cuda raised wrong type {type(e).__name__}: {e}")
         all_ok = False
 
-    # -- DiskAnsatz (Tier 1) is GPU-capable, but not reachable bare from Python --
-    # There is no Python-level positive-parity test for DiskAnsatz in this file.
-    # The only way to construct one from Python is agama.Potential(type='Disk',
-    # ...), and potential_factory.cpp's GalPot scheme (see potential_factory.cpp,
-    # PT_DISK case) ALWAYS pairs it with a Multipole potential holding the
-    # residual density -- there is no "type=DiskAnsatz" factory entry and no
-    # other Python-visible way to obtain a bare DiskAnsatz. Multipole eval/fit is
-    # Tier 2 (not yet migrated), so the resulting Composite{DiskAnsatz, Multipole}
-    # can never fully dispatch today (can_dispatch requires ALL members
-    # dispatchable) -- this is a real, not host-side, blocker, so we do not work
-    # around it. What we CAN verify at the Python level: the composite's
-    # NotImplementedError now names 'Multipole' as the unsupported member, NOT
-    # 'DiskAnsatz' -- confirming DiskAnsatz itself is recognized as GPU-capable
-    # by the C++ dispatch tables end-to-end through the Python binding, and the
-    # sole remaining blocker is the (expected, Tier-2-pending) Multipole residual.
-    print("\n== type='Disk' composite: DiskAnsatz recognized, Multipole still blocks (Tier 2 pending) ==")
-    disk_composite = agama.Potential(type='Disk', surfaceDensity=1.0, scaleRadius=2.0, scaleHeight=0.2)
+    # -- DiskAnsatz (Tier 1) is GPU-capable but not reachable bare from Python: the
+    # only way to build one is agama.Potential(type='Disk', ...), and
+    # potential_factory.cpp's GalPot scheme ALWAYS pairs it with a Multipole holding
+    # the residual density. Until Tier 2 that Composite{DiskAnsatz, Multipole} could
+    # not dispatch at all (can_dispatch requires EVERY member), and this block used to
+    # assert that the resulting NotImplementedError named 'Multipole' rather than
+    # 'DiskAnsatz'. Tier 2 commit 5b changed the answer: the Multipole now dispatches
+    # too, so the whole GalPot-style composite runs on the GPU and this is a
+    # positive-parity test -- and incidentally the first end-to-end Python check that
+    # DiskAnsatz's device path produces right numbers, not just that it is recognized.
+    print("\n== type='Disk' composite (DiskAnsatz + Multipole residual): full GPU dispatch ==")
+    disk_composite = agama.Potential(type='Disk', surfaceDensity=1.0, scaleRadius=2.0,
+                                     scaleHeight=0.2)
     try:
-        disk_composite.potential(xyz, device='cuda', dtype=np.float64)
-        print("  FAIL Disk composite cuda : unexpectedly succeeded (Multipole should not dispatch yet)")
-        all_ok = False
+        ref_dc = disk_composite.potential(xyz)
+        for dtype, tol in ((np.float64, 1e-11), (np.float32, 1e-5)):
+            arg = xyz if dtype == np.float64 else xyz.astype(np.float32)
+            got = disk_composite.potential(arg, device='cuda', dtype=dtype)
+            err = _pointwise_rel(got, ref_dc if dtype == np.float64 else
+                                 disk_composite.potential(arg, device='cpu', dtype=dtype))
+            ok = err <= tol
+            print(f"  {'OK  ' if ok else 'FAIL'} Disk composite cuda {dtype.__name__:8s}: "
+                  f"max pointwise rel = {err:.3e}  tol = {tol:.1e}")
+            if not ok:
+                all_ok = False
     except NotImplementedError as e:
-        names_multipole = 'Multipole' in str(e)
-        names_diskansatz = 'DiskAnsatz' in str(e)
-        ok = names_multipole and not names_diskansatz
-        print(f"  {'OK  ' if ok else 'FAIL'} Disk composite cuda raised NotImplementedError "
-              f"(names Multipole: {names_multipole}, wrongly names DiskAnsatz: {names_diskansatz}):")
-        print(f"         {e}")
-        if not ok:
-            all_ok = False
+        print(f"  FAIL Disk composite cuda still refused: NotImplementedError: {e}")
+        all_ok = False
     except Exception as e:
-        print(f"  FAIL Disk composite cuda raised wrong type {type(e).__name__}: {e}")
+        print(f"  FAIL Disk composite cuda raised {type(e).__name__}: {e}")
         all_ok = False
 
     # -- Force + density parity: 6 potentials + Composite3, device x dtype --
@@ -780,6 +1157,25 @@ def main():
 
     # -- fp32 accuracy where the parity sweep above is structurally blind --
     if not nfw_fp32_crossover_test():
+        all_ok = False
+
+    # ---- Tier 2 commit 5b: Multipole through the descriptor path ----
+    mp_targets = multipole_targets()
+    print("\n== Multipole parity: 6 models x {potential,force,density} x 4 devices "
+          "x 2 precisions ==")
+    if not multipole_parity_tests(mp_targets, xyz_mp):
+        all_ok = False
+    print("\n== Multipole: CuPy in -> CuPy out (force & density) ==")
+    if not force_density_cupy_tests(mp_targets, xyz_mp):
+        all_ok = False
+    print()
+    if not multipole_fp32_budget():
+        all_ok = False
+    print()
+    if not multipole_fail_closed_test():
+        all_ok = False
+    print()
+    if not multipole_orbit_test():
         all_ok = False
 
     print("\n" + ("PASS" if all_ok else "FAIL"))

@@ -10,6 +10,7 @@
 #include "potential_composite.h"
 #include "potential_dehnen.h"
 #include "potential_disk.h"
+#include "potential_multipole.h"
 #include "potential_descriptor.h"
 #include "gpu_policy.h"
 #include <cstring>
@@ -95,6 +96,15 @@ bool is_modifier(const BasePotential& pot)
         || dynamic_cast<const Scaled  <BasePotential>*>(&pot) != NULL;
 }
 
+/** True iff `pot` is handled by the DESCRIPTOR path rather than by a concrete
+    class's own evalmany*T: a modifier wrapper chain (whose transform has to ride on
+    a descriptor term) or a Multipole (which has no per-class batch method and whose
+    coefficients travel in the descriptor's payload buffer). */
+bool needs_desc_path(const BasePotential& pot)
+{
+    return is_modifier(pot) || dynamic_cast<const Multipole*>(&pot) != NULL;
+}
+
 /** Capability predicate: true iff try_dispatch() would succeed for this
     potential. A Composite is dispatchable iff ALL of its members are
     (recursively, so nested composites work). Non-templated: capability
@@ -106,14 +116,17 @@ bool can_dispatch(const BasePotential& pot, double time = 0)
     AGAMA_GPU_POT_LIST(AGAMA_GPU_CAN)
     #undef AGAMA_GPU_CAN
     // A modifier chain is dispatchable iff buildGpuPotDesc can represent whatever
-    // it wraps AND the transform it collapses to at this `time` is finite. That
-    // function is the single authority on both questions, so ask it rather than
-    // duplicating the rules -- and ask it at the SAME time try_dispatch will use,
-    // so the composite all-or-nothing pre-check below cannot pass here and then
-    // fail there after partially writing the outputs.
-    if(is_modifier(pot)) {
+    // it wraps AND the transform it collapses to at this `time` is finite; a
+    // Multipole iff buildMultipoleDeviceDesc (reached through the same builder)
+    // accepts its shape. That function is the single authority on both questions,
+    // so ask it rather than duplicating the rules -- with the SAME arguments
+    // try_dispatch will use, so the composite all-or-nothing pre-check below cannot
+    // pass here and then fail there after partially writing the outputs.
+    if(needs_desc_path(pot)) {
         GpuPotDesc<double> desc;
-        return buildGpuPotDesc(pot, desc, time);
+        std::vector<double> payload;
+        return buildGpuPotDesc(pot, desc, time, &payload,
+            /*foldTimeVaryingModifiers*/ true);
     }
     // Dehnen is deliberately NOT in AGAMA_GPU_POT_LIST above: it is only
     // GPU-dispatchable in the spherical case (axisRatioY==axisRatioZ==1) --
@@ -172,8 +185,16 @@ enum EvalMode {
     adding a third Phi-only switch over the tags to guarantee it was judged not
     worth the duplicated per-tag glue, since Phi-alone on a modified potential is
     not a hot path (force and orbits are, and both need the derivative anyway).
-    Revisit if a profile ever says otherwise. */
-template<typename T, class Policy>
+    Revisit if a profile ever says otherwise.
+
+    ORDER is the compile-time Multipole scratch cap (see GpuDescScratch): the host
+    instantiates ORDER=0 for descriptors without a Multipole term, which is the
+    already-shipped analytic/modifier kernel unchanged (no local scratch array, so
+    its measured STACK:0 is preserved), and ORDER=GPU_POT_MULTIPOLE_ORDER only when a
+    Multipole is actually present. Making this a template parameter rather than an
+    unconditional local array is the whole point: 580 T of per-thread local memory
+    would otherwise be charged to every descriptor kernel in the library. */
+template<typename T, int ORDER, class Policy>
 void evalmanyDescT(Policy pol, std::size_t N, const T* xyz, EvalMode mode,
                    T* out1, T* out3, const GpuPotDesc<T>& desc, bool add)
 {
@@ -181,15 +202,16 @@ void evalmanyDescT(Policy pol, std::size_t N, const T* xyz, EvalMode mode,
     case MODE_PHI:
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             T phi, acc[3];
-            gpu_desc_phi_acc(desc, xyz[i*3+0], xyz[i*3+1], xyz[i*3+2], &phi, acc);
+            gpu_desc_phi_acc_ord<T, ORDER>(desc, xyz[i*3+0], xyz[i*3+1], xyz[i*3+2],
+                &phi, acc, T(0));
             out1[i] = add ? out1[i] + phi : phi;
         });
         break;
     case MODE_ACC:
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
             T phi, acc[3];
-            gpu_desc_phi_acc(desc, xyz[i*3+0], xyz[i*3+1], xyz[i*3+2],
-                out1 ? &phi : (T*)NULL, acc);
+            gpu_desc_phi_acc_ord<T, ORDER>(desc, xyz[i*3+0], xyz[i*3+1], xyz[i*3+2],
+                out1 ? &phi : (T*)NULL, acc, T(0));
             if(out1)
                 out1[i] = add ? out1[i] + phi : phi;
             out3[i*3+0] = add ? out3[i*3+0] + acc[0] : acc[0];
@@ -199,11 +221,82 @@ void evalmanyDescT(Policy pol, std::size_t N, const T* xyz, EvalMode mode,
         break;
     case MODE_DENS:
         agama::forall(pol, N, [=] AGAMA_DEVICE (std::size_t i) {
-            const T v = gpu_desc_dens(desc, xyz[i*3+0], xyz[i*3+1], xyz[i*3+2]);
+            const T v = gpu_desc_dens_ord<T, ORDER>(desc,
+                xyz[i*3+0], xyz[i*3+1], xyz[i*3+2], T(0));
             out1[i] = add ? out1[i] + v : v;
         });
         break;
     }
+}
+
+/** Where a descriptor's payload buffer (modifier spline nodes + Multipole
+    coefficient blobs) has to live for a given policy, and how it gets there.
+    Serial/OpenMP read it straight out of the host vector; Cuda needs a device copy,
+    which must outlive the (asynchronous) kernel launch -- hence finish(), called
+    before the RAII device_array goes out of scope. The generic template covers the
+    CPU policies; the Cuda specialization is nvcc-only, exactly like agama::Cuda
+    itself. */
+template<typename T, class Policy>
+struct DescPayloadStager {
+    static const T* stage(const std::vector<T>& host, agama::device_array<T>&)
+    { return host.empty() ? (const T*)NULL : host.data(); }
+    static void finish(Policy) {}
+};
+#if defined(HAVE_CUDA) && defined(__CUDACC__)
+template<typename T>
+struct DescPayloadStager<T, agama::Cuda> {
+    static const T* stage(const std::vector<T>& host, agama::device_array<T>& dev) {
+        if(host.empty())
+            return (const T*)NULL;
+        dev.reserve(host.size());
+        dev.from_host(host.data(), host.size());
+        return dev.data();
+    }
+    /** agama::forall(Cuda) only enqueues the launch, so the kernel may still be
+        reading the payload when the caller's device_array destructor calls
+        cudaFree. Both public entry points synchronize a moment later anyway (a D2H
+        copy on the host path, an explicit stream sync on the device-pointer path),
+        so this costs nothing measurable -- but relying on cudaFree's own implicit
+        device synchronization would be a silent correctness dependency. */
+    static void finish(agama::Cuda pol) { AGAMA_CUDA_CHECK(cudaStreamSynchronize(pol.stream)); }
+};
+#endif
+
+/** Build a descriptor for `pot`, put its payload where `pol`'s kernels can read it,
+    and run the batch. Shared by the modifier-chain and Multipole routes, which
+    differ only in what buildGpuPotDesc puts in the descriptor.
+
+    Time-varying modifier stages are FOLDED at `time` here (rather than emitted as
+    re-evaluable stages, which is what the orbit kernel asks for): the whole batch
+    shares one `time`, so folding is exact. That is the behaviour this path has
+    always had; passing a payload buffer no longer implies re-evaluability, which is
+    why buildGpuPotDesc takes the two as separate arguments. */
+template<typename T, class Policy>
+bool dispatch_desc(const BasePotential& pot, Policy pol,
+                   std::size_t N, const T* xyz_p, EvalMode mode,
+                   T* out1, T* out3, double time, bool add)
+{
+    GpuPotDesc<double> desc0;
+    std::vector<double> payload0;
+    if(!buildGpuPotDesc(pot, desc0, time, &payload0, /*foldTimeVaryingModifiers*/ true))
+        return false;
+    GpuPotDesc<T> desc = castGpuPotDesc<T>(desc0);
+    const std::vector<T> payload = castGpuSplineData<T>(payload0);
+    // RAII device buffer for the Cuda policy; unused (and, on a CPU-only build, a
+    // std::vector) otherwise. Not one of the process-wide persistent scratch buffers
+    // above on purpose: the device-pointer entry point evalGPUDeviceCommon runs
+    // WITHOUT the scratch mutex, so shared state here would be a data race. The cost
+    // is one cudaMalloc/cudaFree of ~1 MB per call; eliminating it means caching the
+    // upload on the Potential object itself (the "persistent device coefficients"
+    // item in pending_tasks.md), which is a separate change.
+    agama::device_array<T> d_payload;
+    desc.splineData = DescPayloadStager<T, Policy>::stage(payload, d_payload);
+    if(gpuDescNeedsMultipole(desc))
+        evalmanyDescT<T, GPU_POT_MULTIPOLE_ORDER>(pol, N, xyz_p, mode, out1, out3, desc, add);
+    else
+        evalmanyDescT<T, 0>(pol, N, xyz_p, mode, out1, out3, desc, add);
+    DescPayloadStager<T, Policy>::finish(pol);
+    return true;
 }
 
 /** Try-dispatch on concrete potential type. Returns true if `pot` matched one
@@ -276,18 +369,20 @@ bool try_dispatch(const BasePotential& pot, Policy pol,
         }
         return true;
     }
-    // Modifier chain (Shifted / Tilted / Rotating / Scaled, possibly nested):
-    // collapse the whole chain plus the object it wraps into a descriptor and
-    // run the descriptor kernel. Baking the transform in at `time` is EXACT
-    // here, not an approximation, because the whole batch shares one `time`.
-    if(is_modifier(pot)) {
-        GpuPotDesc<double> desc0;
-        if(!buildGpuPotDesc(pot, desc0, time))
-            return false;
-        evalmanyDescT<T>(pol, N, xyz_p, mode, out1, out3,
-            castGpuPotDesc<T>(desc0), add);
-        return true;
-    }
+    // The descriptor path: a modifier chain (Shifted / Tilted / Rotating / Scaled,
+    // possibly nested), whose whole chain plus the object it wraps collapses into a
+    // descriptor; or a Multipole, which has no per-class batch method at all and
+    // whose coefficient blob rides in the descriptor's payload buffer. A modifier
+    // wrapping a Multipole is one case, not two, and needs no extra code.
+    //
+    // Multipole is deliberately NOT in AGAMA_GPU_POT_LIST above, for the same reason
+    // as Dehnen and DiskAnsatz: capability is not a property of the type but of the
+    // instance (order <= math::LEGENDRE_MMAX, shared knot vectors, PowerLaw
+    // asymptotes -- see buildMultipoleDeviceDesc's ~20 fail-closed conditions), and
+    // the X-macro grants capability unconditionally per type. can_dispatch() asks
+    // the same builder with the same arguments, so the two cannot disagree.
+    if(needs_desc_path(pot))
+        return dispatch_desc<T>(pot, pol, N, xyz_p, mode, out1, out3, time, add);
     if(const Composite* comp = dynamic_cast<const Composite*>(&pot)) {
         if(!can_dispatch(pot, time))   // all-or-nothing: don't partially write outputs
             return false;

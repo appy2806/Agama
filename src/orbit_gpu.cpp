@@ -50,8 +50,15 @@ namespace {
     this functor and GpuDescForce2 would otherwise duplicate it into the kernel
     argument space. Each thread instead builds its own tiny functor pointing at
     the single captured descriptor, which is also what makes timeBegin safe to
-    mutate per thread. */
-template<typename T>
+    mutate per thread.
+
+    ORDER is the descriptor's compile-time Multipole scratch cap (see GpuDescScratch
+    in potential_descriptor.h). It is 0 for every descriptor without a Multipole
+    term, which keeps the analytic/modifier orbit kernels byte-for-byte the kernels
+    they were -- 580 T of per-thread local memory next to DOP853's state[60]+xt[60]
+    is not something to charge to every orbit run. run_batch() picks the
+    instantiation on the host from gpuDescNeedsMultipole(). */
+template<typename T, int ORDER>
 struct GpuDescForce {
     const potential::GpuPotDesc<T>* desc;
     double timeBegin;   ///< absolute time at the start of the current step
@@ -59,7 +66,7 @@ struct GpuDescForce {
     AGAMA_DEVICE_INLINE void operator()(T t, const T w[], T dwdt[], T* accFac) const
     {
         T Epot, acc[3];
-        potential::gpu_desc_phi_acc(*desc, w[0], w[1], w[2],
+        potential::gpu_desc_phi_acc_ord<T, ORDER>(*desc, w[0], w[1], w[2],
             accFac ? &Epot : (T*)NULL, acc, T(timeBegin + t));
         // time derivative of position
         dwdt[0] = w[3];
@@ -89,7 +96,7 @@ struct GpuDescForce {
       for Ekin -- see dprkn8_step's contiguous xn|vn scratch layout.
     d3xdt3 (jerk) is never requested here: it needs the potential Hessian, which
     the force descriptor does not carry, and only the Hermite scheme uses it. */
-template<typename T>
+template<typename T, int ORDER>
 struct GpuDescForce2 {
     const potential::GpuPotDesc<T>* desc;
     double timeBegin;   ///< absolute time at the start of the current step
@@ -98,7 +105,7 @@ struct GpuDescForce2 {
         T* /*d3xdt3 (unused: Hermite-only)*/, T* accFac) const
     {
         T Epot, acc[3];
-        potential::gpu_desc_phi_acc(*desc, x[0], x[1], x[2],
+        potential::gpu_desc_phi_acc_ord<T, ORDER>(*desc, x[0], x[1], x[2],
             accFac ? &Epot : (T*)NULL, acc, T(timeBegin + t));
         d2xdt2[0] = acc[0];
         d2xdt2[1] = acc[1];
@@ -127,8 +134,8 @@ struct GpuDescForce2 {
     alike), so an fp64 integration can write directly into an fp32 destination
     with no separate host-side narrowing pass. See orbit_gpu.h for why this is
     only safe when no unit scaling is pending. */
-template<typename T, typename TOut = T>
-AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
+template<typename T, typename TOut, int ORDER>
+AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T, ORDER> force,
     const T ic6[6], double timeStart, double totalTime, T accuracy,
     unsigned long long maxNumSteps, std::size_t trajsize, TOut* traj)
 {
@@ -205,9 +212,9 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit(GpuDescForce<T> force,
     is method-agnostic about that rescaling. force1 is used only for the initial
     timestep estimate (as in dprkn8_init); force2 supplies the acceleration.
     TOut (defaults to T) is the storage precision of `traj` -- see integrate_one_orbit above. */
-template<typename T, typename TOut = T>
-AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
-    GpuDescForce2<T> force2, const T ic6[6], double timeStart, double totalTime,
+template<typename T, typename TOut, int ORDER>
+AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T, ORDER> force1,
+    GpuDescForce2<T, ORDER> force2, const T ic6[6], double timeStart, double totalTime,
     T accuracy, unsigned long long maxNumSteps, std::size_t trajsize, TOut* traj)
 {
     force1.timeBegin = timeStart;
@@ -288,7 +295,7 @@ AGAMA_DEVICE_INLINE void integrate_one_orbit_dprkn8(GpuDescForce<T> force1,
 
     TOut (defaults to T) is the storage precision of `traj`, threaded straight through
     to integrate_one_orbit -- see its doc comment for the narrow-on-store rationale. */
-template<typename T, typename TOut, class Policy>
+template<typename T, typename TOut, int ORDER, class Policy>
 void run_batch_dop853(Policy pol, const potential::GpuPotDesc<T>& desc,
     std::size_t Norb, const T* ic, const double* times, const double* timeStart,
     std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, TOut* traj)
@@ -303,9 +310,9 @@ void run_batch_dop853(Policy pol, const potential::GpuPotDesc<T>& desc,
         for(int k = 0; k < 6; k++)
             ic6[k] = ic[i*6 + k];
         const double t0 = timeStart ? timeStart[i] : 0.0;
-        GpuDescForce<T> force = { &desc, t0 };
-        integrate_one_orbit<T, TOut>(force, ic6, t0, times[i], accuracy, maxNumSteps,
-            trajsize, traj + i * trajsize * 6);
+        GpuDescForce<T, ORDER> force = { &desc, t0 };
+        integrate_one_orbit<T, TOut, ORDER>(force, ic6, t0, times[i], accuracy,
+            maxNumSteps, trajsize, traj + i * trajsize * 6);
     });
 }
 
@@ -314,7 +321,7 @@ void run_batch_dop853(Policy pol, const potential::GpuPotDesc<T>& desc,
     DOP853's state[60]+xt[60] register/spill cost. See run_batch_dop853 above
     for why this is a separate function rather than a runtime branch, and for
     the TOut storage-precision parameter. */
-template<typename T, typename TOut, class Policy>
+template<typename T, typename TOut, int ORDER, class Policy>
 void run_batch_dprkn8(Policy pol, const potential::GpuPotDesc<T>& desc,
     std::size_t Norb, const T* ic, const double* times, const double* timeStart,
     std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, TOut* traj)
@@ -324,10 +331,10 @@ void run_batch_dprkn8(Policy pol, const potential::GpuPotDesc<T>& desc,
         for(int k = 0; k < 6; k++)
             ic6[k] = ic[i*6 + k];
         const double t0 = timeStart ? timeStart[i] : 0.0;
-        GpuDescForce<T>  force  = { &desc, t0 };  // 1st-order r.h.s. (DPRKN8 init)
-        GpuDescForce2<T> force2 = { &desc, t0 };  // 2nd-order r.h.s. (DPRKN8 stages)
-        integrate_one_orbit_dprkn8<T, TOut>(force, force2, ic6, t0, times[i], accuracy,
-            maxNumSteps, trajsize, traj + i * trajsize * 6);
+        GpuDescForce<T, ORDER>  force  = { &desc, t0 };  // 1st-order r.h.s. (DPRKN8 init)
+        GpuDescForce2<T, ORDER> force2 = { &desc, t0 };  // 2nd-order r.h.s. (DPRKN8 stages)
+        integrate_one_orbit_dprkn8<T, TOut, ORDER>(force, force2, ic6, t0, times[i],
+            accuracy, maxNumSteps, trajsize, traj + i * trajsize * 6);
     });
 }
 
@@ -341,11 +348,21 @@ void run_batch(Policy pol, const potential::GpuPotDesc<T>& desc, int method,
     std::size_t Norb, const T* ic, const double* times, const double* timeStart,
     std::size_t trajsize, T accuracy, unsigned long long maxNumSteps, TOut* traj)
 {
+    // Second host-side switch, on the same principle as the method switch: the
+    // Multipole scratch cap is a compile-time template parameter, so choosing it
+    // here means an analytic-only orbit kernel never contains the 580-T local array
+    // and its register/spill profile is untouched. The price is that this TU now
+    // compiles four saturated kernels instead of two.
+    // ORDER is fixed at 0 here: prepareOrbitBatch rejects any descriptor carrying a
+    // Multipole, so these kernels are byte-for-byte the kernels they were before
+    // Tier 2. See MULTIPOLE ON THE ORBIT PATH in prepareOrbitBatch for the measured
+    // compile-time reason, and for what the ORDER template parameter is already
+    // wired up to do once that is solved.
     if(method == orbit::ORBIT_GPU_DPRKN8)
-        run_batch_dprkn8<T, TOut>(pol, desc, Norb, ic, times, timeStart,
+        run_batch_dprkn8<T, TOut, 0>(pol, desc, Norb, ic, times, timeStart,
             trajsize, accuracy, maxNumSteps, traj);
     else
-        run_batch_dop853<T, TOut>(pol, desc, Norb, ic, times, timeStart,
+        run_batch_dop853<T, TOut, 0>(pol, desc, Norb, ic, times, timeStart,
             trajsize, accuracy, maxNumSteps, traj);
 }
 
@@ -375,6 +392,42 @@ int prepareOrbitBatch(const potential::BasePotential& pot, std::size_t trajsize,
     // kernel nothing.
     std::vector<double> splineData0;
     if(!potential::buildGpuPotDesc(pot, desc0, /*time*/ 0, &splineData0))
+        return ORBIT_GPU_EUNSUPP;
+    // ---- MULTIPOLE ON THE ORBIT PATH: FAIL CLOSED, and why -------------------
+    // Batch potential/force/density evaluation DOES run a Multipole on the GPU (see
+    // dispatch_desc in potential_gpu.cpp); orbit integration does not yet, and a
+    // Multipole-bearing potential is rejected here so it integrates on the CPU rather
+    // than against a kernel with no scratch for it.
+    //
+    // The reason is compile time, not correctness or throughput, and it was MEASURED
+    // rather than assumed. The mechanism the batch kernels use -- an ORDER template
+    // parameter selecting a per-thread scratch array, so kernels without a Multipole
+    // pay nothing -- is already threaded through run_batch/GpuDescForce/
+    // integrate_one_orbit here and needs only the two-way host switch restored. What
+    // stops it is that instantiating it doubles the number of REG:255 kernels in this
+    // TU from 4 to 8 AND inlines the whole ~1000-line four-branch Multipole evaluator
+    // into DOP853's body, whose state[60]+xt[60] already saturates the register file:
+    //
+    //   baseline (this TU as it ships)          ~460 s
+    //   + ORDER=32 orbit kernels                 one ptxas invocation still running
+    //                                            after 27 min; abandoned
+    //   + ORDER=8 orbit kernels                  cicc ~1,100 s then ptxas >890 s on a
+    //                                            single kernel; abandoned at 2,192 s
+    //
+    // Lowering the order cap does not help because the cost is the size of the
+    // inlined evaluator, not the array. The two things that plausibly would, in order
+    // of preference:
+    //   1. the "separate translation unit per integrator" item in pending_tasks.md --
+    //      four saturated kernels currently compile serially inside one nvcc
+    //      invocation, and this is exactly the case that would parallelize;
+    //   2. marking the Multipole device evaluator __noinline__ for device
+    //      compilation, so the orbit kernel calls it instead of absorbing it. The
+    //      per-call cost should be negligible against ~1000 flops of physics (this
+    //      code is ALU-bound, see findings.md), but it changes the batch kernels too
+    //      and needs its own measurement.
+    // Neither is a Tier 2 change, so this commit stops here rather than shipping a
+    // build whose compile time is unusable.
+    if(desc0.nmp > 0)
         return ORBIT_GPU_EUNSUPP;
     desc = potential::castGpuPotDesc<T>(desc0);
     // Spline coefficients in the kernel's working precision; `desc.splineData` is

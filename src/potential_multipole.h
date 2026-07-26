@@ -553,6 +553,38 @@ template<typename T>
 bool buildMultipoleDeviceDesc(const Multipole& pot, MultipoleDeviceDesc<T>& desc,
     std::vector<T>& blob);
 
+/** Narrow a descriptor to the kernel's working precision. The counterpart of
+    castGpuPotDesc/castGpuSplineData in potential_descriptor.h and used the same
+    way: the DOUBLE descriptor and blob are built once from the live object (so the
+    host classes' fp64 storage is the single source), and both are cast together
+    just before a kernel is instantiated. Cheaper and, more importantly, safer than
+    calling buildMultipoleDeviceDesc<float> separately -- two independent builds
+    could in principle disagree about which shapes they accept. */
+template<typename T>
+inline void castMultipoleDeviceDesc(const MultipoleDeviceDesc<double>& in,
+    /*out*/ MultipoleDeviceDesc<T>& out)
+{
+    out.ind         = in.ind;
+    out.indInner    = in.indInner;
+    out.indOuter    = in.indOuter;
+    out.rminSq      = static_cast<T>(in.rminSq);
+    out.rmaxSq      = static_cast<T>(in.rmaxSq);
+    out.implKind    = in.implKind;
+    out.logScaling  = in.logScaling;
+    out.invPhi0     = static_cast<T>(in.invPhi0);
+    out.offXval     = in.offXval;
+    out.nx          = in.nx;
+    out.offYval     = in.offYval;
+    out.ny          = in.ny;
+    out.offCoefs    = in.offCoefs;
+    out.r0sqInner   = static_cast<T>(in.r0sqInner);
+    out.r0sqOuter   = static_cast<T>(in.r0sqOuter);
+    out.qInner      = static_cast<T>(in.qInner);
+    out.qOuter      = static_cast<T>(in.qOuter);
+    out.offInnerSUW = in.offInnerSUW;
+    out.offOuterSUW = in.offOuterSUW;
+}
+
 /** Evaluate a Multipole at numPoints points (packed {R,z,phi} triplets) through
     BOTH the virtual CPU path and multipoleEvalDevice<double>, and return both sets
     of numbers for a bit-for-bit comparison by the caller. Each output array holds
@@ -658,6 +690,29 @@ AGAMA_DEVICE_INLINE void multipolePowerLawTermT(const T s, const T u, const T w,
         *p1 = urs*s + wrv*v + (s!=v ? T(0) : u*rs) + qr2*2;
     if(needD2)
         *p2 = urs*s*s + wrv*v*v + (s!=v ? T(0) : 2*s*u*rs) + qr2*4;
+}
+
+/** One {l,m} DENSITY coefficient of a PowerLawMultipole -- the body of the (m,l)
+    loop in PowerLawMultipole::densityCyl, factored out so that the fast track and
+    the fused transform below share one copy of the expression (the same discipline
+    multipolePowerLawTermT above follows for the potential). Only the U term has a
+    nonzero Laplacian, which is why W does not appear.
+
+    \param[in]  s, u    are S[c], U[c] for this harmonic;
+    \param[in]  v       is l for the inward and -l-1 for the outward extrapolation;
+    \param[in]  Q       is the extra r^2 coefficient (contributes only when v==0);
+    \param[in]  dlogr   is ln(r/r0), computed once by the caller;
+    \param[in]  l       is the harmonic's degree (enters as the integer l*(l+1)).
+    \return  rho_lm, still to be multiplied by 0.25/pi/r0^2 by the caller. */
+template<typename T>
+AGAMA_DEVICE_INLINE T multipolePowerLawDensityTermT(const T s, const T u, const T v,
+    const T Q, const T dlogr, const int l)
+{
+    const T ursm2 = s!=2 ? u * std::exp( dlogr * (s-2) ) : u;   // u * (r/r0)^(s-2)
+    if(s!=v)
+        return ursm2 * (s*(s+1) - T(l*(l+1))) + (v==0 ? 6*Q : T(0));
+    else
+        return ursm2 * (s*(s+1) * dlogr - s*(s-1) + 1);
 }
 
 /** Device-callable restatement of sphHarmTransformInverseDeriv2 -- the optimized
@@ -1145,6 +1200,29 @@ AGAMA_DEVICE_INLINE void multipoleInterp2dEvalDeviceT(
     the gradient internally; and asking for neither takes the cheap value-only
     route through every branch.
 */
+/** The `impl` (interpolated) branch of a Multipole ALONE, without the radial
+    dispatch: 1d or 2d splines per implKind. Split out of multipoleEvalDevice
+    below because the density path needs exactly this and not the dispatch --
+    Multipole::densityCyl calls `impl->density(pos)`, which routes through
+    BasePotential::densityCyl's Laplacian and therefore evaluates the INTERPOLATOR
+    at a slightly displaced point when close to the z axis; that displaced point
+    must stay on the interpolator even if it were to cross a branch boundary,
+    exactly as it does on the CPU. Arguments and outputs as in
+    multipoleEvalDevice. */
+template<typename T>
+AGAMA_DEVICE_INLINE void multipoleImplEvalDeviceT(const MultipoleDeviceDesc<T>& d,
+    const T* blob, T R, T z, T phi, T* Phi, T* gradCyl, T* hessCyl, T* scratch)
+{
+    if(d.implKind == MULTIPOLE_IMPL_INTERP1D)
+        multipoleInterp1dEvalDeviceT<T>(d.ind, d.logScaling, d.invPhi0,
+            blob + d.offXval, d.nx, blob + d.offCoefs,
+            R, z, phi, scratch, Phi, gradCyl, hessCyl);
+    else
+        multipoleInterp2dEvalDeviceT<T>(d.ind, d.logScaling, d.invPhi0,
+            blob + d.offXval, d.nx, blob + d.offYval, d.ny, blob + d.offCoefs,
+            R, z, phi, scratch, Phi, gradCyl, hessCyl);
+}
+
 template<typename T>
 AGAMA_DEVICE_INLINE void multipoleEvalDevice(const MultipoleDeviceDesc<T>& d, const T* blob,
     T R, T z, T phi, T* Phi, T* gradCyl, T* hessCyl, T* scratch)
@@ -1160,15 +1238,167 @@ AGAMA_DEVICE_INLINE void multipoleEvalDevice(const MultipoleDeviceDesc<T>& d, co
         const T* SUW = blob + d.offOuterSUW;
         multipolePowerLawEvalDeviceT<T>(d.indOuter, false, d.r0sqOuter, d.qOuter,
             SUW, SUW+n, SUW+n*2, R, z, phi, scratch, Phi, gradCyl, hessCyl);
-    } else if(d.implKind == MULTIPOLE_IMPL_INTERP1D) {
-        multipoleInterp1dEvalDeviceT<T>(d.ind, d.logScaling, d.invPhi0,
-            blob + d.offXval, d.nx, blob + d.offCoefs,
-            R, z, phi, scratch, Phi, gradCyl, hessCyl);
-    } else {
-        multipoleInterp2dEvalDeviceT<T>(d.ind, d.logScaling, d.invPhi0,
-            blob + d.offXval, d.nx, blob + d.offYval, d.ny, blob + d.offCoefs,
-            R, z, phi, scratch, Phi, gradCyl, hessCyl);
+    } else
+        multipoleImplEvalDeviceT<T>(d, blob, R, z, phi, Phi, gradCyl, hessCyl, scratch);
+}
+
+
+// ---------------------------------------------------------------------
+// Device-callable DENSITY of a Multipole. Mirrors Multipole::densityCyl's own
+// three-way dispatch, which is NOT the same thing as the Laplacian of
+// multipoleEvalDevice: outside the radial grid, PowerLawMultipole overrides
+// densityCyl with a closed form built from the U coefficients only, precisely to
+// avoid the cancellation that the Laplacian route suffers there. Reproducing the
+// dispatch is therefore mandatory, not an optimization.
+// ---------------------------------------------------------------------
+
+/** The two fp64-tuned thresholds BasePotential::densityCyl uses, re-derived per
+    value type (CLAUDE.md recipe item 6: a threshold inherited from upstream is
+    fp64-tuned and is wrong in fp32).
+      sqrtEps  -- "close to or exactly on the z axis" test, R <= |z| * sqrtEps,
+                  and the size of the sideways step taken to get d2Phi/dphi2 there;
+      epsRel   -- eps^(2/3), the relative size below which the sum of four
+                  cancelling second derivatives is declared roundoff and the
+                  density is reported as exactly zero.
+    The double values are the SQRT_DBL_EPSILON / DBL_EPSILON/ROOT3_DBL_EPSILON of
+    math_base.h and potential_base.cpp, restated here as literals because those
+    are macros/TU-locals; tests/test_gpu_policy.cpp pins them against the
+    originals so a change upstream cannot silently desynchronize this. */
+template<typename T> struct MultipoleDensityEps;  // no default: unsupported T won't compile
+template<> struct MultipoleDensityEps<double> {
+    /// sqrt(DBL_EPSILON)
+    static AGAMA_DEVICE_INLINE double sqrtEps() { return 1.4901161193847656e-08; }
+    /// DBL_EPSILON / ROOT3_DBL_EPSILON = eps^(2/3) ~ 4e-11
+    static AGAMA_DEVICE_INLINE double epsRel()  { return 2.2204460492503131e-16 /
+                                                         6.0554544523933429e-06; }
+};
+template<> struct MultipoleDensityEps<float> {
+    /// sqrt(FLT_EPSILON)
+    static AGAMA_DEVICE_INLINE float sqrtEps() { return 3.4526698e-04f; }
+    /// FLT_EPSILON / cbrt(FLT_EPSILON) = eps^(2/3) ~ 2.4e-05
+    static AGAMA_DEVICE_INLINE float epsRel()  { return 1.1920929e-07f / 4.9215667e-03f; }
+};
+
+/** Device-callable form of PowerLawMultipole::densityCyl, FUSED: upstream fills
+    rho_lm[ind.size()] in one (m,l) loop and consumes it in the (m,l) loop inside
+    math::sphHarmTransformInverse; both loops visit the harmonics in the same
+    order and each element is read exactly once, so computing it where it is used
+    changes no element's defining expression and no accumulation order -- the same
+    argument (and the same measured outcome: zero bitwise differences) as the
+    fusion already done for the potential in multipolePowerLawEvalDeviceT. What it
+    buys is scratch: the un-fused shape would need 1,089 extra T at order 32,
+    nearly tripling the per-thread scratch of the whole descriptor kernel.
+
+    \param[in]  ind    is the asymptote's own indexing scheme;
+    \param[in]  inner  selects the inward (v=l) vs outward (v=-l-1) convention and
+                       which extreme-regime test drops to the monopole;
+    \param[in]  r0sq, Q  are the squared reference radius and the extra r^2 coefficient;
+    \param[in]  S, U   are ind.size()-long coefficient arrays inside the blob (W is
+                       deliberately not used: it has zero Laplacian);
+    \param[in]  R, z, phi  is the position;
+    \param[in]  scratch  needs 2*ind.mmax + ind.lmax + 1 elements (well inside
+                       multipoleBranchScratch, so the caller's existing block serves).
+    \return the mass density. */
+template<typename T>
+AGAMA_DEVICE_INLINE T multipolePowerLawDensityDeviceT(
+    const math::SphHarmIndicesPod& ind, const bool inner,
+    const T r0sq, const T Q, const T* S, const T* U,
+    const T R, const T z, const T phi, T* scratch)
+{
+    const T rsq   = pow_2(R) + pow_2(z);
+    const T dlogr = std::log(rsq / r0sq) * T(0.5);
+    // simplified treatment in strongly asymptotic regime - retain only l==0 term
+    const int lmax = (inner && rsq < r0sq*T(1e-16)) || (!inner && rsq > r0sq*T(1e16))
+        ? 0 : ind.lmax;
+
+    if(lmax == 0) {   // fast track - just the l=0 coef
+        const T rho0 = multipolePowerLawDensityTermT<T>(S[0], U[0],
+            inner ? T(0) : T(-1), Q, dlogr, 0);
+        return T(0.25/M_PI) / r0sq * rho0;
     }
+
+    // --- fused inverse spherical-harmonic transform (math::sphHarmTransformInverse)
+    T* trig_m = scratch;                  // 2*mmax elements
+    T* P_lm   = scratch + 2*ind.mmax;     // lmax+1 elements
+    const bool useSine = ind.mmin() < 0;
+    if(ind.mmax > 0)
+        math::trigMultiAngle<T>(phi, ind.mmax, useSine, trig_m);
+    const T tau = z == 0 ? T(0) : z / (std::sqrt(pow_2(R) + pow_2(z)) + R);
+    T result = 0;
+    for(int m=ind.mmin(); m<=ind.mmax; m++) {
+        const int lmin = ind.lmin(m);
+        if(lmin > ind.lmax)
+            continue;   // empty m-harmonic
+        const int absm = m<0 ? -m : m;
+        // extra numerical factors from the definition of sph.harm.
+        const T trig = m==0 ? T(2*M_SQRTPI) :
+            m>0 ? trig_m[m-1]            * T(2*M_SQRTPI * M_SQRT2) :
+                  trig_m[ind.mmax-m-1]   * T(2*M_SQRTPI * M_SQRT2);
+        math::sphHarmArray<T>(ind.lmax, absm, tau, P_lm, (T*)NULL, (T*)NULL);
+        for(int l=lmin; l<=ind.lmax; l+=ind.step) {
+            const int c = math::SphHarmIndicesPod::index(l, m);
+            const T rho = multipolePowerLawDensityTermT<T>(S[c], U[c],
+                inner ? T(l) : T(-l-1), Q, dlogr, l);
+            const T leg = P_lm[l-absm];
+            result += rho * leg * trig;
+        }
+    }
+    return T(0.25/M_PI) / r0sq * result;
+}
+
+/** Device-callable form of Multipole::densityCyl: the same three-way radial
+    dispatch, with the interpolated branch going through
+    BasePotential::densityCyl's cylindrical Laplacian of the INTERPOLATOR (which is
+    what `impl->density(pos)` resolves to -- MultipoleInterp1d/2d do not override
+    densityCyl) and the two asymptotes through PowerLawMultipole's closed form.
+
+    \param[in]  d, blob  as in multipoleEvalDevice;
+    \param[in]  R, z, phi  is the position in cylindrical coordinates;
+    \param[in]  scratch  as in multipoleEvalDevice (the Laplacian route needs the
+                full grad+hess scratch, so the same bound applies).
+    \return the mass density. */
+template<typename T>
+AGAMA_DEVICE_INLINE T multipoleDensityDevice(const MultipoleDeviceDesc<T>& d,
+    const T* blob, T R, T z, T phi, T* scratch)
+{
+    const T rsq = pow_2(R) + pow_2(z);
+    if(rsq < d.rminSq) {
+        const int n = d.indInner.size();
+        const T* SUW = blob + d.offInnerSUW;
+        return multipolePowerLawDensityDeviceT<T>(d.indInner, true, d.r0sqInner,
+            d.qInner, SUW, SUW+n, R, z, phi, scratch);
+    }
+    if(rsq > d.rmaxSq) {
+        const int n = d.indOuter.size();
+        const T* SUW = blob + d.offOuterSUW;
+        return multipolePowerLawDensityDeviceT<T>(d.indOuter, false, d.r0sqOuter,
+            d.qOuter, SUW, SUW+n, R, z, phi, scratch);
+    }
+    // --- BasePotential::densityCyl on the interpolator, transcribed
+    T grad[3], hess[6];
+    multipoleImplEvalDeviceT<T>(d, blob, R, z, phi, (T*)NULL, grad, hess, scratch);
+    const T eps = MultipoleDensityEps<T>::sqrtEps();
+    T derivR_over_R     = grad[CYL_DR]    / R;
+    T deriv2phi_over_R2 = hess[CYL_DPHI2] / pow_2(R);
+    if(R <= std::fabs(z) * eps) {   // close to or exactly on the z axis
+        derivR_over_R = hess[CYL_DR2];
+        if(isZRotSymmetric(static_cast<coord::SymmetryType>(d.ind.sym)))
+            deriv2phi_over_R2 = 0;   // d2Phi/dphi2 is always zero in this case
+        else {
+            // to compute d2Phi/dphi2, we need to step out of z axis just a tiny bit
+            T hessoff[6];
+            const T Roff = std::fabs(z) * eps;
+            multipoleImplEvalDeviceT<T>(d, blob, Roff, z, phi,
+                (T*)NULL, (T*)NULL, hessoff, scratch);
+            deriv2phi_over_R2 = hessoff[CYL_DPHI2] / pow_2(Roff);
+        }
+    }
+    const T result = hess[CYL_DR2] + derivR_over_R + hess[CYL_DZ2] + deriv2phi_over_R2;
+    if(!(std::fabs(result) > MultipoleDensityEps<T>::epsRel() *
+        (std::fabs(hess[CYL_DR2]) + std::fabs(derivR_over_R) +
+         std::fabs(hess[CYL_DZ2]) + std::fabs(deriv2phi_over_R2))))
+        return 0;   // dominated by roundoff errors
+    return result / T(4*M_PI);
 }
 
 

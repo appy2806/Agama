@@ -1575,6 +1575,466 @@ int main() {
             "differences -> %s\n", nmodel, tot_c, tot_d, ok_mpdev ? "OK" : "FAIL");
     }
 
+    // =====================================================================
+    // Tier 2 commit 5b: the DESCRIPTOR path for a Multipole -- a
+    // GPU_POT_MULTIPOLE term, its side entry in GpuPotDesc::mp, its blob inside
+    // the shared payload buffer, the Cyl->Car conversion, and the density
+    // dispatch -- gated BIT-FOR-BIT against the virtual path.
+    //
+    // Everything is computed by multipoleDescBothPaths() in
+    // potential_multipole.cpp, NOT here. That is not a style choice: the device
+    // evaluator and coord::toGrad are header-inline, so evaluating them in this
+    // TU while the CPU path stays compiled in the library's compares two
+    // different FMA contractions of one expression tree, and the divergence
+    // count then tracks THIS FILE's compiler flags rather than the code (the
+    // commit that built the evaluator measured 132 / 2,604 / 7,308 differences
+    // out of 50,688 for project defaults / -fno-inline / -ffp-contract=off with
+    // the library binary untouched). Compiled together over there, both sides
+    // move with codegen drift and only real arithmetic changes separate them.
+    //
+    // WHAT THIS GATE ADDS over the multipoleEvalDevice gate above, which already
+    // covers the four branches in CYLINDRICAL coordinates:
+    //   * the Cartesian conversion, which is where the dPhi/dphi trap lives --
+    //     potential_analytic.h's cyl_acc_car() takes only (dPhi/dR, dPhi/dz) and
+    //     drops dPhi/dphi, which is fine for every axisymmetric analytic term
+    //     and WRONG for any Multipole with mmax > 0. The triaxial models below
+    //     have mmax = 2, 8 and 24, and the explicit trap check further down
+    //     measures how large the dropped term actually is, so this cannot pass
+    //     by accident on an axisymmetric-only sweep;
+    //   * DENSITY, which is a different dispatch from the potential's: outside
+    //     the radial grid Multipole::densityCyl uses PowerLawMultipole's closed
+    //     form (U terms only), not the Laplacian, and the device side has to
+    //     reproduce both that and BasePotential::densityCyl's on-axis special
+    //     case;
+    //   * the descriptor plumbing itself: term.aux -> mp[] indexing, the payload
+    //     offset, and the ORDER-templated scratch.
+    // =====================================================================
+    bool ok_mpdesc = true;
+    {
+        auto bitsEq = [](double a, double b) {
+            std::uint64_t ba, bb;
+            std::memcpy(&ba, &a, 8);
+            std::memcpy(&bb, &b, 8);
+            return ba == bb;
+        };
+        // ULP distance between two doubles. THE SIGN MAPPING IS DONE IN UNSIGNED
+        // ARITHMETIC ON PURPOSE: doing it in int64 overflows for negative values
+        // (0x8000000000000000 - ia), which in this project once produced a
+        // "~8.7e18 ULP" reading and a wrong undefined-behaviour diagnosis.
+        auto ulpDist = [](double a, double b) -> unsigned long long {
+            if(a == b) return 0;
+            if(!(a == a) || !(b == b)) return (unsigned long long)-1;  // NaN
+            std::uint64_t ba, bb;
+            std::memcpy(&ba, &a, 8);
+            std::memcpy(&bb, &b, 8);
+            // map to a monotone unsigned ordering
+            ba = (ba & 0x8000000000000000ull) ? (0x8000000000000000ull - (ba & 0x7FFFFFFFFFFFFFFFull)) : (ba + 0x8000000000000000ull);
+            bb = (bb & 0x8000000000000000ull) ? (0x8000000000000000ull - (bb & 0x7FFFFFFFFFFFFFFFull)) : (bb + 0x8000000000000000ull);
+            return ba > bb ? ba - bb : bb - ba;
+        };
+        static const char* BR[4] = { "inner PowerLaw", "outer PowerLaw",
+                                     "MultipoleInterp1d", "MultipoleInterp2d" };
+        static const char* QN[3] = { "Phi", "acc", "rho" };
+        long cmp[4][3] = {{0}}, dif[4][3] = {{0}};
+        long cylcmp[4][3] = {{0}}, cyldif[4][3] = {{0}};
+        // Differences that are ONLY the sign of zero (+0 vs -0) are counted apart:
+        // bit comparison separates them, ULP distance and every numerical use do not,
+        // and a -0 acceleration component on the z axis is not an arithmetic
+        // divergence. Reporting them mixed in would overstate the divergence ~40x.
+        long difzero = 0, cyldifzero = 0;
+        unsigned long long worstUlp = 0;
+        double worstRel = 0;
+        int nmodel = 0;
+        double worst_dphi_frac = 0;   // largest |dropped dphi term| / |acc| seen
+        const char* worst_dphi_model = "(none)";
+
+        // The whole descriptor gate for one Multipole: build the descriptor
+        // through buildGpuPotDesc, sweep Cartesian points spanning all four
+        // radial branches and the singular geometries, compare bit-for-bit.
+        auto checkDesc = [&](const potential::Multipole& mp, const char* name) {
+            ++nmodel;
+            const std::vector<double>& gr = mp.getRadii();
+            const double rin = gr.front(), rout = gr.back();
+            // the same rminSq/rmaxSq the device dispatch tests, for branch labelling
+            potential::MultipoleDeviceDesc<double> dsc;
+            std::vector<double> blob;
+            if(!potential::buildMultipoleDeviceDesc<double>(mp, dsc, blob)) {
+                ok_mpdesc = false;
+                std::printf("[T2B]   descriptor gate: no device desc for %s\n", name);
+                return;
+            }
+            const double radii[] = {
+                rin * 1e-9, rin * 1e-3, rin * 0.5, rin * 0.999,            // inner
+                rin * 1.5, std::sqrt(rin*rout), rout * 0.5, rout * 0.999,  // interpolated
+                rout * 1.001, rout * 2.0, rout * 1e3, rout * 1e9           // outer
+            };
+            const double thetas[] = { 0.0, 0.4, 1.0, M_PI/2, 2.2, M_PI };
+            const double phis[]   = { 0.0, 0.7, 2.5, 4.1 };
+            const int NR = (int)(sizeof(radii)/sizeof(radii[0])),
+                      NT = (int)(sizeof(thetas)/sizeof(thetas[0])),
+                      NPH = (int)(sizeof(phis)/sizeof(phis[0]));
+            std::vector<double> pts;
+            std::vector<int> ptbranch;
+            for(int ir = 0; ir < NR; ++ir) {
+                const double r = radii[ir], rsq = r*r;
+                const int br = rsq < dsc.rminSq ? 0 : rsq > dsc.rmaxSq ? 1 :
+                    (dsc.implKind == potential::MULTIPOLE_IMPL_INTERP1D ? 2 : 3);
+                for(int it = 0; it < NT; ++it) {
+                    // exact zeros on the axis / in the plane, not sin(pi) roundoff
+                    double R = r * std::sin(thetas[it]), z = r * std::cos(thetas[it]);
+                    if(thetas[it] == 0.0)    { R = 0; z =  r; }
+                    if(thetas[it] == M_PI)   { R = 0; z = -r; }
+                    if(thetas[it] == M_PI/2) { R = r; z =  0; }
+                    for(int ip = 0; ip < NPH; ++ip) {
+                        // R==0 must stay EXACTLY on the axis in Cartesian too,
+                        // otherwise cos/sin roundoff moves it off and the R==0
+                        // degenerate branch of the conversion is never reached
+                        const double cx = R == 0 ? 0.0 : R * std::cos(phis[ip]);
+                        const double cy = R == 0 ? 0.0 : R * std::sin(phis[ip]);
+                        pts.push_back(cx);
+                        pts.push_back(cy);
+                        pts.push_back(z);
+                        ptbranch.push_back(br);
+                    }
+                }
+            }
+            const int NPT_D = (int)ptbranch.size();
+            std::vector<double> vc(5*NPT_D), vd(5*NPT_D);
+            int nmp = -1;
+            bool exact = false;
+            long posdif = 0;
+            if(!potential::multipoleDescBothPaths(mp, NPT_D, &pts.front(),
+                    &vc.front(), &vd.front(), &nmp, &exact, &posdif)) {
+                ok_mpdesc = false;
+                std::printf("[T2B]   multipoleDescBothPaths FAILED for %s\n", name);
+                return;
+            }
+            if(nmp != 1 || !exact) {
+                ok_mpdesc = false;
+                std::printf("[T2B]   %s: descriptor took the wrong route (nmp=%d, exactRef=%d) "
+                    "-- the gate would not be testing the Multipole term\n", name, nmp, (int)exact);
+            }
+            // (2) the same sweep with ONE shared position conversion: this half
+            // must be EXACT, and it is what actually covers the evaluator, the
+            // Cyl->Car gradient conversion and the density dispatch
+            std::vector<double> wc(5*NPT_D), wd(5*NPT_D);
+            if(!potential::multipoleDescCylBothPaths(mp, NPT_D, &pts.front(),
+                    &wc.front(), &wd.front())) {
+                ok_mpdesc = false;
+                std::printf("[T2B]   multipoleDescCylBothPaths FAILED for %s\n", name);
+                return;
+            }
+            // q = 0 Phi (slot 0), 1 acc (3 slots at 1), 2 rho (slot 4)
+            const int qlo[3] = { 0, 1, 4 }, qn[3] = { 1, 3, 1 };
+            for(int i = 0; i < NPT_D; ++i) {
+                const int br = ptbranch[i];
+                for(int q = 0; q < 3; ++q)
+                    for(int k = 0; k < qn[q]; ++k) {
+                        const int idx = i*5 + qlo[q] + k;
+                        // --- the exact half
+                        ++cylcmp[br][q];
+                        if(!bitsEq(wc[idx], wd[idx])) {
+                            ++cyldif[br][q];
+                            if(wc[idx] == wd[idx])
+                                ++cyldifzero;
+                            if(cyldif[br][q] == 1)
+                                std::printf("[T2B]   %s %s %s[%d] EXACT-HALF MISMATCH at "
+                                    "x=%.17g y=%.17g z=%.17g: got %.17g want %.17g\n",
+                                    name, BR[br], QN[q], k, pts[i*3], pts[i*3+1],
+                                    pts[i*3+2], wd[idx], wc[idx]);
+                        }
+                        // --- the end-to-end half, bounded in ULP
+                        ++cmp[br][q];
+                        if(!bitsEq(vc[idx], vd[idx])) {
+                            ++dif[br][q];
+                            if(vc[idx] == vd[idx])
+                                ++difzero;
+                        }
+                        const unsigned long long u = ulpDist(vc[idx], vd[idx]);
+                        if(u > worstUlp)
+                            worstUlp = u;
+                        const double sc = std::fabs(vc[idx]);
+                        if(sc > 0)
+                            worstRel = std::max(worstRel, std::fabs(vd[idx] - vc[idx]) / sc);
+                    }
+            }
+            // ---- the dPhi/dphi trap, measured rather than assumed.
+            // Rebuild the acceleration the way the 2-component cyl_acc_car()
+            // would (dropping dPhi/dphi) and report the largest fractional
+            // difference from the correct 3-component answer. For an
+            // axisymmetric model this is ~0 by construction; for a triaxial one
+            // it MUST be large, or the sweep is not exercising the trap.
+            {
+                std::vector<double> scratch(
+                    potential::MultipoleDeviceScratchMax<32>::value, 0.);
+                double worst = 0;
+                for(int i = 0; i < NPT_D; ++i) {
+                    const double x = pts[i*3], y = pts[i*3+1], z = pts[i*3+2];
+                    const double R = std::sqrt(x*x + y*y);
+                    if(R == 0)
+                        continue;   // dphi has no Cartesian direction on the axis
+                    double g[3];
+                    potential::multipoleEvalDevice<double>(dsc, &blob.front(),
+                        R, z, math::atan2(y, x), (double*)NULL, g, (double*)NULL,
+                        &scratch.front());
+                    // magnitude of the term cyl_acc_car would have dropped,
+                    // relative to the full acceleration at this point
+                    const double dropped = std::fabs(g[potential::CYL_DPHI]) / R;
+                    const double full = std::sqrt(vd[i*5+1]*vd[i*5+1] +
+                        vd[i*5+2]*vd[i*5+2] + vd[i*5+3]*vd[i*5+3]);
+                    if(full > 0)
+                        worst = std::max(worst, dropped / full);
+                }
+                if(worst > worst_dphi_frac) {
+                    worst_dphi_frac = worst;
+                    worst_dphi_model = name;
+                }
+                std::printf("[T2B]   %s -> mmax=%2d, %5d pts, dropped-dphi term / |acc| "
+                    "worst = %.3e, Car->Cyl transcription bitdiffs = %ld/%d\n",
+                    name, dsc.ind.mmax, NPT_D, worst, posdif, 6*NPT_D);
+                if(posdif != 0)
+                    ok_mpdesc = false;
+            }
+        };
+
+        struct MpModel { const char* name; double axisY, axisZ; int lmax, mmax; };
+        const MpModel models[] = {
+            { "spherical   lmax=0 ", 1.0, 1.0,  0,  0 },
+            { "axisym      lmax=2 ", 1.0, 0.7,  2,  0 },
+            { "triaxial    lmax=2 ", 0.8, 0.6,  2,  2 },
+            { "axisym      lmax=8 ", 1.0, 0.7,  8,  0 },
+            { "triaxial    lmax=8 ", 0.8, 0.6,  8,  8 },
+            { "triaxial    lmax=24", 0.8, 0.6, 24, 24 }
+        };
+        for(int im = 0; im < (int)(sizeof(models)/sizeof(models[0])); ++im) {
+            const MpModel& M = models[im];
+            potential::Dehnen src(1.0, 1.0, 1.0, M.axisY, M.axisZ);
+            shared_ptr<const potential::Multipole> mp = potential::Multipole::create(
+                static_cast<const potential::BasePotential&>(src), coord::ST_UNKNOWN,
+                M.lmax, M.mmax, /*gridSizeR*/ 25, /*rmin*/ 0, /*rmax*/ 0, /*fixOrder*/ true);
+            checkDesc(*mp, M.name);
+        }
+        // a model with a nonzero m<0 harmonic: the only way to reach the blob
+        // slots below m=0 and the sine half of the azimuthal trig table (every
+        // Dehnen above is y-reflection symmetric, hence mmin()==0)
+        {
+            const int NR2 = 6, L = 4, NC = (L+1)*(L+1);
+            const int cneg = math::SphHarmIndices::index(L, -2);
+            std::vector<double> radii(NR2);
+            std::vector<std::vector<double> > Phi(NC, std::vector<double>(NR2, 0.0)),
+                dPhi(NC, std::vector<double>(NR2, 0.0));
+            for(int k = 0; k < NR2; ++k) {
+                const double r = 0.05 * std::pow(3.0, k);
+                radii[k] = r;
+                Phi [0][k] = -1.0 / (r + 1.0);
+                dPhi[0][k] =  1.0 / pow_2(r + 1.0);
+                Phi [cneg][k] = 0.02 * Phi [0][k];
+                dPhi[cneg][k] = 0.02 * dPhi[0][k];
+            }
+            potential::Multipole mp(radii, Phi, dPhi);
+            checkDesc(mp, "m<0 synth   lmax=4 ");
+        }
+
+        long tot_c = 0, tot_d = 0, tot_cc = 0, tot_cd = 0;
+        for(int b = 0; b < 4; ++b) {
+            long bc = 0, bd = 0, cc = 0, cdd = 0;
+            for(int q = 0; q < 3; ++q) {
+                bc += cmp[b][q];    bd  += dif[b][q];
+                cc += cylcmp[b][q]; cdd += cyldif[b][q];
+            }
+            tot_c += bc; tot_d += bd; tot_cc += cc; tot_cd += cdd;
+            std::printf("[T2B]     branch %-18s: %7ld values, exact-half diffs %ld "
+                "(Phi %ld/%ld, acc %ld/%ld, rho %ld/%ld); end-to-end diffs %ld\n",
+                BR[b], cc, cdd, cyldif[b][0], cylcmp[b][0], cyldif[b][1], cylcmp[b][1],
+                cyldif[b][2], cylcmp[b][2], bd);
+        }
+        for(int b = 0; b < 4; ++b)
+            for(int q = 0; q < 3; ++q)
+                if(cylcmp[b][q] == 0) {
+                    ok_mpdesc = false;
+                    std::printf("[T2B]   NO COVERAGE of branch %s / %s -- this gate is not "
+                        "testing what it claims\n", BR[b], QN[q]);
+                }
+        if(tot_cd != 0)
+            ok_mpdesc = false;
+        std::printf("[T2B]   EXACT HALF (shared position conversion): Multipole term's "
+            "evaluator + Cyl->Car gradient + density dispatch vs virtual path, %d models "
+            "x 4 branches: %ld values compared, %ld bitwise differences -> %s\n",
+            nmodel, tot_cc, tot_cd, tot_cd == 0 ? "OK" : "FAIL");
+        if(tot_cd != 0)
+            std::printf("[T2B]     ... of which %ld are sign-of-zero only (+0 vs -0)\n",
+                cyldifzero);
+        // WHY THIS HALF IS NOT BIT-FOR-BIT, and why that is not a defect.
+        // The end-to-end path reaches multipoleEvalDevice through four levels of
+        // inlining (gpu_desc_phi_acc_ord -> gpu_term_phi_acc -> gpu_term_leaf_phi_acc
+        // -> gpu_multipole_phi_acc), and GCC contracts the multiply-adds inside a
+        // ~1000-line inlined body according to the site it is inlined at. The exact
+        // half above calls the SAME body from a shallow site and matches the CPU path
+        // bit-for-bit; this half calls it from a deep one and lands a few ULP away.
+        // Same expression tree, different fusion -- the mechanism recorded for
+        // `875d7bc` and for the fork-vs-upstream BFE comparison, where
+        // -ffp-contract=off restores exact agreement.
+        //
+        // Making THIS exact would require the CPU Multipole::evalCyl to BE the device
+        // leaf (the "4c" item in pending_tasks.md), which perturbs coord::toGrad's
+        // call context inside the CPU path and has to be gated on
+        // crosscheck_expansions.py as its own commit.
+        //
+        // 64 ULP (~1.4e-14 relative) is the bound: 8x headroom over the measured worst
+        // so ordinary codegen drift does not make the suite flaky, and still ~13 orders
+        // of magnitude tighter than any real defect this gate exists to catch (a
+        // dropped dPhi/dphi term is O(0.1) RELATIVE, i.e. ~1e14 ULP; a wrong payload
+        // offset or mp[] index is garbage).
+        const unsigned long long ULP_TOL = 64;
+        const bool ok_e2e = worstUlp <= ULP_TOL;
+        if(!ok_e2e)
+            ok_mpdesc = false;
+        std::printf("[T2B]   END-TO-END (descriptor's own position conversion): %ld values, "
+            "%ld not bit-identical, worst distance %llu ULP (bound %llu), worst pointwise "
+            "rel err %.3e -> %s\n",
+            tot_c, tot_d, worstUlp, ULP_TOL, worstRel, ok_e2e ? "OK" : "FAIL");
+        std::printf("[T2B]     ... of those %ld non-identical values, %ld are sign-of-zero "
+            "only (+0 vs -0, numerically equal); %ld differ arithmetically\n",
+            tot_d, difzero, tot_d - difzero);
+
+        // The trap check is only meaningful if some model actually has a large
+        // dropped-dphi term. 1e-3 is far above any roundoff and far below the
+        // ~0.1-1 a genuinely triaxial model produces.
+        const double DPHI_MIN = 1e-3;
+        const bool ok_dphi = worst_dphi_frac > DPHI_MIN;
+        if(!ok_dphi)
+            ok_mpdesc = false;
+        std::printf("[T2B]   non-axisymmetric coverage: worst dropped-dphi term / |acc| = %.3e "
+            "on '%s' (must exceed %.0e, else cyl_acc_car's 2-component form would have "
+            "passed this gate) -> %s\n", worst_dphi_frac, worst_dphi_model, DPHI_MIN,
+            ok_dphi ? "OK" : "FAIL");
+
+        // ---- composite and modifier routes, at a tolerance (the descriptor sums
+        // Cartesian accelerations while Composite::eval sums in its own preferred
+        // coordinates, so bit equality is not the right property here)
+        {
+            potential::Dehnen src(1.0, 1.0, 1.0, 0.8, 0.6);
+            shared_ptr<const potential::Multipole> mp = potential::Multipole::create(
+                static_cast<const potential::BasePotential&>(src), coord::ST_UNKNOWN,
+                8, 8, 25, 0, 0, true);
+            std::vector<potential::PtrPotential> comps;
+            comps.push_back(potential::PtrPotential(new potential::NFW(10.0, 5.0)));
+            comps.push_back(potential::PtrPotential(
+                potential::PtrPotential(mp)));
+            potential::Composite comp(comps);
+            // constant splines (single node, zero derivative) -- what
+            // readTimeDependentArray builds from a bare "x,y,z" string
+            const std::vector<double> tnode(1, 0.0);
+            #define AGAMA_T2B_CONST_SPLINE(v) math::CubicSpline(tnode, std::vector<double>(1, (v)))
+            potential::PtrPotential shifted(new potential::Shifted<potential::BasePotential>(
+                potential::PtrPotential(mp), AGAMA_T2B_CONST_SPLINE(0.3),
+                AGAMA_T2B_CONST_SPLINE(-0.2), AGAMA_T2B_CONST_SPLINE(0.1)));
+            #undef AGAMA_T2B_CONST_SPLINE
+
+            struct Case { const char* name; const potential::BasePotential* p; };
+            const Case cases[] = { { "Composite{NFW,Multipole}", &comp },
+                                   { "Shifted(Multipole)", shifted.get() } };
+            const double TOLD = 1e-12;
+            for(int c = 0; c < 2; ++c) {
+                const int NPC = 96;
+                std::vector<double> pts(3*NPC);
+                for(int i = 0; i < NPC; ++i) {
+                    pts[i*3+0] = 0.4 + 0.11 * i;
+                    pts[i*3+1] = -0.7 + 0.037 * (i % 19);
+                    pts[i*3+2] = 0.25 + 0.019 * (i % 13);
+                }
+                std::vector<double> vc(5*NPC), vd(5*NPC);
+                int nmp = -1;
+                bool exact = true;
+                if(!potential::multipoleDescBothPaths(*cases[c].p, NPC, &pts.front(),
+                        &vc.front(), &vd.front(), &nmp, &exact, (long*)NULL)) {
+                    ok_mpdesc = false;
+                    std::printf("[T2B]   %s: descriptor build FAILED\n", cases[c].name);
+                    continue;
+                }
+                double worst = 0;
+                for(int i = 0; i < 5*NPC; ++i) {
+                    const double scale = std::max(1e-300, std::fabs(vc[i]));
+                    worst = std::max(worst, std::fabs(vd[i] - vc[i]) / scale);
+                }
+                const bool okc = nmp == 1 && worst <= TOLD;
+                if(!okc)
+                    ok_mpdesc = false;
+                std::printf("[T2B]   %-24s nmp=%d, %d pts: max pointwise rel err = %.3e, "
+                    "tol = %.1e -> %s\n", cases[c].name, nmp, NPC, worst, TOLD,
+                    okc ? "OK" : "FAIL");
+            }
+        }
+
+        // ---- fail-closed contract
+        {
+            potential::Dehnen src(1.0, 1.0, 1.0, 1.0, 0.8);
+            shared_ptr<const potential::Multipole> mp = potential::Multipole::create(
+                static_cast<const potential::BasePotential&>(src), coord::ST_UNKNOWN,
+                4, 0, 25, 0, 0, true);
+            // (a) no payload buffer -> a Multipole has nowhere to put its coefficients
+            potential::GpuPotDesc<double> d0;
+            const bool rejNoPayload = !potential::buildGpuPotDesc(*mp, d0, 0, NULL);
+            // (b) more Multipoles than GPU_POT_MAX_MULTIPOLE -> reject, never truncate
+            std::vector<potential::PtrPotential> many;
+            for(int i = 0; i < potential::GPU_POT_MAX_MULTIPOLE + 1; ++i)
+                many.push_back(potential::PtrPotential(mp));
+            potential::Composite tooMany(many);
+            potential::GpuPotDesc<double> d1;
+            std::vector<double> pay1;
+            const bool rejTooMany = !potential::buildGpuPotDesc(tooMany, d1, 0, &pay1, true);
+            // (c) exactly GPU_POT_MAX_MULTIPOLE -> accepted
+            std::vector<potential::PtrPotential> justEnough;
+            for(int i = 0; i < potential::GPU_POT_MAX_MULTIPOLE; ++i)
+                justEnough.push_back(potential::PtrPotential(mp));
+            potential::Composite atCap(justEnough);
+            potential::GpuPotDesc<double> d2;
+            std::vector<double> pay2;
+            const bool okAtCap = potential::buildGpuPotDesc(atCap, d2, 0, &pay2, true) &&
+                d2.nmp == potential::GPU_POT_MAX_MULTIPOLE &&
+                d2.nterms == potential::GPU_POT_MAX_MULTIPOLE &&
+                // each Multipole's blob must occupy its OWN slice of the payload
+                d2.mp[0].blobOffset == 0 &&
+                d2.mp[1].blobOffset > 0 &&
+                d2.mp[potential::GPU_POT_MAX_MULTIPOLE-1].blobOffset ==
+                    d2.mp[1].blobOffset * (potential::GPU_POT_MAX_MULTIPOLE-1);
+            const bool okFC = rejNoPayload && rejTooMany && okAtCap;
+            if(!okFC)
+                ok_mpdesc = false;
+            std::printf("[T2B]   fail-closed: no payload buffer rejected %s, %d Multipoles "
+                "(> cap %d) rejected %s, exactly %d accepted with distinct payload slices %s "
+                "-> %s\n", rejNoPayload ? "yes" : "NO",
+                potential::GPU_POT_MAX_MULTIPOLE + 1, (int)potential::GPU_POT_MAX_MULTIPOLE,
+                rejTooMany ? "yes" : "NO", (int)potential::GPU_POT_MAX_MULTIPOLE,
+                okAtCap ? "yes" : "NO", okFC ? "OK" : "FAIL");
+        }
+
+        // ---- the two density thresholds must still equal the CPU constants they
+        // were copied from (they are a macro and a TU-local, hence restated in
+        // potential_multipole.h; this is what keeps the copies honest)
+        {
+            const bool okEps =
+                potential::MultipoleDensityEps<double>::sqrtEps() == SQRT_DBL_EPSILON &&
+                potential::MultipoleDensityEps<double>::epsRel()  ==
+                    DBL_EPSILON / ROOT3_DBL_EPSILON;
+            if(!okEps)
+                ok_mpdesc = false;
+            std::printf("[T2B]   density thresholds: sqrtEps == SQRT_DBL_EPSILON and epsRel == "
+                "DBL_EPSILON/ROOT3_DBL_EPSILON -> %s\n", okEps ? "OK" : "FAIL");
+        }
+
+        // ---- descriptor footprint, reported so the budget is on the record
+        std::printf("[T2B]   sizeof(GpuPotDesc<double>) = %zu B (budget 8192), "
+            "MultipoleDeviceDesc<double> = %zu B x %d slots; per-thread scratch "
+            "ORDER=0 -> %zu B, ORDER=%d -> %zu B\n",
+            sizeof(potential::GpuPotDesc<double>),
+            sizeof(potential::MultipoleDeviceDesc<double>),
+            (int)potential::GPU_POT_MAX_MULTIPOLE,
+            sizeof(potential::GpuDescScratch<double,0>) - 1,
+            (int)potential::GPU_POT_MULTIPOLE_ORDER,
+            sizeof(potential::GpuDescScratch<double,potential::GPU_POT_MULTIPOLE_ORDER>));
+    }
+
     // Tier 2 (Multipole evaluator prerequisite, last spline piece): device-
     // callable 2d CUBIC-spline raw evaluator, evalCubicSpline2dRaw. Multipole
     // stores its interpolator as a math::PtrInterpolator2d that is EITHER a
@@ -3181,7 +3641,7 @@ int main() {
         LEG_LMAX, LEG_LMAX, LEG_NTAU, max_leg_relerr, LEG_TOL, ok_leg ? "OK" : "FAIL");
 
     if (!(ok_cpu && ok_gpu && ok_trig && ok_coord && ok_leg && ok_legtab && ok_powint &&
-          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_mpdev &&
+          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_mpdev && ok_mpdesc &&
           ok_quintic_cuda && ok_cubic_raw && ok_cubic_cuda &&
           ok_sphharm_frozen && ok_eps32 && ok_sphharm_cuda32)) {
         std::fprintf(stderr, "FAIL\n");
