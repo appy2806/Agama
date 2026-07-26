@@ -63,37 +63,38 @@ namespace potential {
 // path stay bit-for-bit identical (CLAUDE.md constraint 5, refereed by
 // crosscheck_expansions.py).
 //
-// DONE so far: fourierTransformAzimuth (below).
-// DEFERRED, and NOT for lack of trying: transformDerivsSphToCyl. Every way of
-// routing it through a shared leaf -- plain-T array boundary, or a shared
-// Jacobian helper with the toGrad/toHess calls left at the call sites --
-// moved 4 of the 57 BFE quantities by ~2 ULP (5.75e-16 normalized, measured;
-// see findings.md). The cause is that toGrad/toHess became header-inline in
-// 5e04db5, so relocating their caller changes their contraction context. The
-// 4 affected quantities are Dehnen-sph Multipole force and density, i.e. the
-// MultipoleInterp1d branch, which is the ONLY branch that calls this helper
-// (MultipoleInterp2d -- every realistic MW potential -- builds its own
-// tau-based Jacobian inline, deliberately, since its "theta" is tau). So the
-// shift lands entirely outside the priority branch, and the accept-or-restate
-// decision is better made when that branch is actually ported than paid for
-// now in exchange for nothing.
+// Moved so far: fourierTransformAzimuth, the MultipoleInterp2d log-scaling
+// un-transform, and both Sph->Cyl / tau->Cyl derivative transforms. All four
+// gate at 0.000e+00 against a baseline recorded before this work.
 //
-// TWO CONVENTIONS THAT DIFFER FROM THE CPU HELPERS, both deliberate:
+// THE RULE THAT MAKES THESE MOVES EXACT -- learned the hard way, measured:
+// relocate a COMPLETE unit, never split one. coord::toGrad/toHess became
+// header-inline in 5e04db5, so anything that perturbs their call context
+// perturbs their FMA contraction. Moving a whole block -- Jacobian
+// construction AND the toGrad/toHess that consumes it, in one function, body
+// character-identical, coord:: structs passed by reference -- is exact.
+// Splitting that same block is NOT: passing grad/hess across a plain-T array
+// boundary, or factoring out just the Jacobian and leaving toGrad/toHess at
+// the call site, each moved 12 of the 57 BFE quantities and took 8 of them
+// from EXACTLY 0.0 vs production agama to ~2e-16, losing the bit-for-bit
+// agreement the axisymmetric Multipole cases had. Both were implemented and
+// measured; see findings.md. Do not re-derive them, and do not "tidy" these
+// functions by splitting them up.
 //
-// (1) Gradients and hessians travel as plain T arrays, not coord::GradSph /
-//     coord::HessSph. Those structs hard-code `double` members
-//     (coord.h:461-489), so routing an fp32 kernel through them would force
-//     the whole angular stage back to fp64 at 1:64 cost on the target
-//     hardware. The CPU wrappers unpack these arrays into the structs, which
-//     is a copy, not arithmetic, so bit-parity is unaffected. Component
-//     order is fixed by the enums below -- do not reorder, several call
-//     sites index these arrays positionally.
+// CONVENTIONS:
 //
-// (2) Scratch space is CALLER-PROVIDED. The CPU wrappers keep passing
+// (1) Scratch space is CALLER-PROVIDED. The CPU wrappers keep passing
 //     alloca'd buffers, so they stay valid for arbitrary lmax/mmax exactly
 //     as upstream; a device caller passes a fixed-size local array bounded
 //     by its own compile-time cap. This is what lets the device path have a
 //     cap without imposing one on the CPU path.
+//
+// (2) Coefficient arrays travel as plain T (fully honest at T=float, since
+//     they touch no coord:: types) and the enums below fix the component
+//     order -- do not reorder, call sites index positionally. The two
+//     derivative TRANSFORMS are the exception: they take coord:: structs and
+//     are fp64-only, because those structs hard-code `double`. That is the
+//     fp64 residue of the Multipole device path; see tauToCylDerivs.
 // =====================================================================
 
 /// component order for the T grad[3] arrays below, in the SCALED spherical
@@ -179,6 +180,192 @@ AGAMA_DEVICE_INLINE void fourierTransformAzimuthT(
             hess[SPH_DTHETADPHI]+= C_m[mm+nm*2] *  dtrig;
             hess[SPH_DPHI2]     += C_m[mm]      * d2trig;
         }
+    }
+}
+
+
+/** Undo MultipoleInterp2d's amplitude log-scaling, in place on the C_m array.
+
+    Device-callable, templated restatement of the `if(logScaling)` block inside
+    MultipoleInterp2d::evalCyl, which is now a thin call to this. Two stages, in this
+    order (which matters -- the second reads the first's output):
+
+      1. invert the log-scaling of the m=0 term, which lives at array index -mmin:
+         Phi = 1 / (invPhi0 - exp(X)) and the chain rule through it;
+      2. multiply every other m term, which is stored as a RATIO to the m=0 term, by
+         the now-unscaled m=0 value, with the product rule for its derivatives.
+
+    Contains no coordinate transforms and no spline lookups -- pure arithmetic over the
+    coefficient array -- so unlike the Sph->Cyl derivative stage it is fully honest at
+    T=float, and unlike that stage relocating it does not disturb any FMA context in
+    coord (measured: gate stays at 0.000e+00).
+
+    \param[in]     ind is the POD indexing scheme; mmin/nm/lmin are read from it.
+    \param[in]     numQuantities is 1, 3 or 6 -- how much of C_m is populated.
+    \param[in]     invPhi0 is the inverse of the potential at origin (may be zero).
+    \param[in,out] C_m is the nm*numQuantities coefficient array, laid out as
+                   {Phi, dlnr, dtau, dlnr2, dlnrdtau, dtau2}, each of length nm.
+
+    NOTE the sub-array pointers for the second-derivative blocks are formed
+    unconditionally, exactly as the original body does, and are simply not dereferenced
+    when numQuantities < 6. Forming a pointer one past the end of the array is what the
+    original does too; do not "fix" it into a conditional, that changes nothing and
+    diverges from the transcribed source.
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void multipoleUnscaleLogT(const math::SphHarmIndicesPod& ind,
+    const int numQuantities, const T invPhi0, T* C_m)
+{
+    const int mmin = ind.mmin(), nm = ind.mmax - mmin + 1;
+    T *Phi   = C_m,
+      *dlnr  = C_m+nm,
+      *dtau  = C_m+nm*2,
+      *dlnr2 = C_m+nm*3,
+      *dlnrdtau = C_m+nm*4,
+      *dtau2 = C_m+nm*5;
+    // transform the amplitude: first perform the inverse log-scaling for the m=0 term,
+    // which resides in the array elements with index mm = 0 - mmin
+    T expX = std::exp(Phi[-mmin]), val = T(1) / (invPhi0 - expX);
+    Phi[-mmin]  = val;
+    if(numQuantities>=3) {
+        T dPhidX = pow_2(val) * expX;
+        if(numQuantities==6) {
+            T d2PhidX2 = dPhidX * val * (invPhi0 + expX);
+            dlnr2   [-mmin] = dPhidX * dlnr2   [-mmin] + d2PhidX2 * dlnr[-mmin] * dlnr[-mmin];
+            dtau2   [-mmin] = dPhidX * dtau2   [-mmin] + d2PhidX2 * dtau[-mmin] * dtau[-mmin];
+            dlnrdtau[-mmin] = dPhidX * dlnrdtau[-mmin] + d2PhidX2 * dlnr[-mmin] * dtau[-mmin];
+        }
+        dlnr[-mmin] *= dPhidX;
+        dtau[-mmin] *= dPhidX;
+    }
+
+    // then multiply other terms by the value of the m=0 term, which resides in the [-mmin] element
+    for(int mm=0; mm<nm; mm++) {
+        int m = mm + mmin;
+        if(m==0 || ind.lmin(m) > ind.lmax)
+            continue;
+        if(numQuantities==6) {
+            dlnr2[mm] = dlnr2[mm] * Phi[-mmin] + Phi[mm] * dlnr2[-mmin] + 2 * dlnr[mm] * dlnr[-mmin];
+            dtau2[mm] = dtau2[mm] * Phi[-mmin] + Phi[mm] * dtau2[-mmin] + 2 * dtau[mm] * dtau[-mmin];
+            dlnrdtau[mm] = dlnrdtau[mm] * Phi[-mmin] + Phi[mm] * dlnrdtau[-mmin] +
+                dlnr[mm] * dtau[-mmin] + dtau[mm] * dlnr[-mmin];
+        }
+        if(numQuantities>=3) {
+            dlnr[mm] = dlnr[mm] * Phi[-mmin] + Phi[mm] * dlnr[-mmin];
+            dtau[mm] = dtau[mm] * Phi[-mmin] + Phi[mm] * dtau[-mmin];
+        }
+        Phi[mm] *= Phi[-mmin];
+    }
+}
+
+
+/** Transform potential derivatives from scaled spherical {ln(r), theta} to cylindrical
+    {R, z}. Device-callable; the whole body moved here VERBATIM from
+    potential_multipole.cpp, and PowerLawMultipole/MultipoleInterp1d call it unchanged.
+
+    Distinct from tauToCylDerivs() below -- there the second scaled coordinate is
+    tau = z/(r+|R|), here it is the polar angle theta. Different Jacobian, different
+    second-derivative block. Do not merge them.
+
+    fp64 only, and the same residue tauToCylDerivs documents: coord::GradT / HessT /
+    PosDerivT hard-code `double`, so this stage cannot be honestly templated on a value
+    type. See tauToCylDerivs for the cost estimate and where the fix belongs.
+*/
+AGAMA_DEVICE_INLINE void sphToCylDerivs(const coord::PosCyl& pos,
+    const coord::GradSph &gradSph, const coord::HessSph &hessSph,
+    coord::GradCyl *gradCyl, coord::HessCyl *hessCyl)
+{
+    // abuse the coordinate transformation framework (Sph -> Cyl), where actually
+    // in the source grad/hess we have derivs w.r.t. ln(r) instead of r
+    const double r2inv = 1 / (pow_2(pos.R) + pow_2(pos.z));
+    coord::PosDerivT<coord::Cyl, coord::Sph> der;
+    der.drdR = pos.R * r2inv;
+    der.drdz = pos.z * r2inv;
+    der.dthetadR =  der.drdz;
+    der.dthetadz = -der.drdR;
+    if(gradCyl)
+        *gradCyl = coord::toGrad(gradSph, der);
+    if(hessCyl) {
+        coord::PosDeriv2T<coord::Cyl, coord::Sph> der2;
+        der2.d2rdR2      = pow_2(der.drdz) - pow_2(der.drdR);
+        der2.d2rdRdz     = -2 * der.drdR * der.drdz;
+        der2.d2rdz2      = -der2.d2rdR2;
+        der2.d2thetadR2  =  der2.d2rdRdz;
+        der2.d2thetadRdz = -der2.d2rdR2;
+        der2.d2thetadz2  = -der2.d2rdRdz;
+        *hessCyl = coord::toHess(gradSph, hessSph, der, der2);
+    }
+}
+
+
+/** Transform MultipoleInterp2d's derivatives from its scaled coordinates {ln r, tau} to
+    cylindrical {R, z}. Device-callable, and the single source of this arithmetic: the tail
+    of MultipoleInterp2d::evalCyl is now one call to this.
+
+    This is NOT the same transform as transformDerivsSphToCyl() in potential_multipole.cpp,
+    and the two must not be merged: there the second scaled coordinate is the polar angle
+    theta, here it is tau = z / (r + |R|), which gives different dthetadR / dthetadz and a
+    completely different second-derivative block. Upstream keeps them separate for the same
+    reason.
+
+    ### WHY THIS TAKES coord:: STRUCTS AND IS NOT TEMPLATED ON A VALUE TYPE
+
+    Both alternatives were tried and both cost bit-for-bit agreement with upstream. Passing
+    grad/hess across a plain-T array boundary, and separately factoring out just the
+    Jacobian while leaving toGrad/toHess at the call site, each moved 12 of the 57 BFE
+    quantities -- and, the number that settled it, took 8 of them from EXACTLY 0.0 vs
+    production agama to ~2e-16, losing the bit-for-bit agreement the axisymmetric Multipole
+    cases had. Cause: coord::toGrad/toHess became header-inline in 5e04db5, so perturbing
+    their call context perturbs their FMA contraction. Keeping the Jacobian construction and
+    its consumption together in one function, body character-identical, structs by
+    reference, avoids that entirely -- 0.000e+00.
+
+    Consequence, which is a real limitation and not an oversight: this stage runs in fp64
+    whatever precision the rest of the kernel uses, because coord::GradT / HessT /
+    PosDerivT hard-code `double`. It is the fp64 residue of the Multipole device path.
+    ~40 fp64 flops against roughly 3400 fp32 flops for the 17 azimuthal 2D-quintic
+    evaluations of an lmax=mmax=8 model -- bounded, and NOT the ~200x an fp64 spline lookup
+    would have cost. The fix belongs in coord (defaulted value-type parameter on the
+    structs; note toGrad/toHess are function templates with explicit specializations, which
+    C++ cannot partially specialize, so they must become overloads or a class template).
+
+    \param[in]  R, z      is the position in cylindrical coordinates.
+    \param[in]  r         is sqrt(R^2+z^2); passed in because the caller already has it,
+                          and recomputing it here could round differently.
+    \param[in]  rplusRinv is 1/(r+|R|), likewise already available in the caller.
+    \param[in]  tau       is the scaled polar coordinate z*rplusRinv (or sign(z) at R==0).
+    \param[in]  trGrad    is the gradient w.r.t. {ln r, tau, phi}.
+    \param[in]  trHess    is the hessian in the same scaled coordinates; read only when
+                          hess != NULL (callers may leave it uninitialized otherwise).
+    \param[out] grad      receives the cylindrical gradient if != NULL.
+    \param[out] hess      receives the cylindrical hessian if != NULL.
+*/
+AGAMA_DEVICE_INLINE void tauToCylDerivs(const double R, const double z, const double r,
+    const double rplusRinv, const double tau,
+    const coord::GradSph& trGrad, const coord::HessSph& trHess,
+    coord::GradCyl* grad, coord::HessCyl* hess)
+{
+    // abuse the coordinate transformation framework (Sph -> Cyl), where actually
+    // our source Sph coords are not (r, theta, phi), but (ln r, tau, phi)
+    const double
+        rinv  = 1/r,
+        r2inv = pow_2(rinv);
+    coord::PosDerivT<coord::Cyl, coord::Sph> der;
+    der.drdR = R * r2inv;
+    der.drdz = z * r2inv;
+    der.dthetadR = -tau * rinv;
+    der.dthetadz = rinv - rplusRinv;
+    if(grad)
+        *grad = coord::toGrad(trGrad, der);
+    if(hess) {
+        coord::PosDeriv2T<coord::Cyl, coord::Sph> der2;
+        der2.d2rdR2  = pow_2(der.drdz) - pow_2(der.drdR);
+        der2.d2rdRdz = -2 * der.drdR * der.drdz;
+        der2.d2rdz2  = -der2.d2rdR2;
+        der2.d2thetadR2  = z * r2inv * rinv;
+        der2.d2thetadRdz = pow_2(der.dthetadR) - pow_2(der.drdR) * r * rplusRinv;
+        der2.d2thetadz2  = -der2.d2thetadR2 - der.dthetadR * rplusRinv;
+        *hess = coord::toHess(trGrad, trHess, der, der2);
     }
 }
 

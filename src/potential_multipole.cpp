@@ -798,32 +798,6 @@ void sphHarmTransformInverseDeriv(
     fourierTransformAzimuth(ind, pos.phi, C_m, val, grad, hess);
 }
 
-// transform potential derivatives from {ln(r), theta} to {R, z}
-void transformDerivsSphToCyl(const coord::PosCyl& pos,
-    const coord::GradSph &gradSph, const coord::HessSph &hessSph,
-    coord::GradCyl *gradCyl, coord::HessCyl *hessCyl)
-{
-    // abuse the coordinate transformation framework (Sph -> Cyl), where actually
-    // in the source grad/hess we have derivs w.r.t. ln(r) instead of r
-    const double r2inv = 1 / (pow_2(pos.R) + pow_2(pos.z));
-    coord::PosDerivT<coord::Cyl, coord::Sph> der;
-    der.drdR = pos.R * r2inv;
-    der.drdz = pos.z * r2inv;
-    der.dthetadR =  der.drdz;
-    der.dthetadz = -der.drdR;
-    if(gradCyl)
-        *gradCyl = toGrad(gradSph, der);
-    if(hessCyl) {
-        coord::PosDeriv2T<coord::Cyl, coord::Sph> der2;
-        der2.d2rdR2      = pow_2(der.drdz) - pow_2(der.drdR);
-        der2.d2rdRdz     = -2 * der.drdR * der.drdz;
-        der2.d2rdz2      = -der2.d2rdR2;
-        der2.d2thetadR2  =  der2.d2rdRdz;
-        der2.d2thetadRdz = -der2.d2rdR2;
-        der2.d2thetadz2  = -der2.d2rdRdz;
-        *hessCyl = toHess(gradSph, hessSph, der, der2);
-    }
-}
 
 }  // end internal namespace
 
@@ -1632,7 +1606,7 @@ void PowerLawMultipole::evalCyl(const coord::PosCyl &pos,
     sphHarmTransformInverseDeriv(ind, pos, Phi_lm, dPhi_lm, d2Phi_lm, potential,
         needGrad ? &gradSph : NULL, needHess ? &hessSph : NULL);
     if(needGrad)
-        transformDerivsSphToCyl(pos, gradSph, hessSph, grad, hess);
+        sphToCylDerivs(pos, gradSph, hessSph, grad, hess);
 }
 
 double PowerLawMultipole::densityCyl(const coord::PosCyl &pos, double /*time*/) const
@@ -1789,7 +1763,7 @@ void MultipoleInterp1d::evalCyl(const coord::PosCyl &pos,
             needGrad ? &gradSph : NULL, needHess ? &hessSph : NULL);
     }
     if(needGrad)
-        transformDerivsSphToCyl(pos, gradSph, hessSph, grad, hess);
+        sphToCylDerivs(pos, gradSph, hessSph, grad, hess);
 }
 
 // ------- Multipole potential with 2d interpolating splines for each azimuthal harmonic ------- //
@@ -1988,41 +1962,11 @@ void MultipoleInterp2d::evalCyl(const coord::PosCyl &pos,
             numQuantities==6 ? &dtau2   [mm] : NULL);
     }
 
-    if(logScaling) {
-        // transform the amplitude: first perform the inverse log-scaling for the m=0 term,
-        // which resides in the array elements with index mm = 0 - mmin
-        double expX = exp(Phi[-mmin]), val = 1 / (invPhi0 - expX);
-        Phi[-mmin]  = val;
-        if(numQuantities>=3) {
-            double dPhidX = pow_2(val) * expX;
-            if(numQuantities==6) {
-                double d2PhidX2 = dPhidX * val * (invPhi0 + expX);
-                dlnr2   [-mmin] = dPhidX * dlnr2   [-mmin] + d2PhidX2 * dlnr[-mmin] * dlnr[-mmin];
-                dtau2   [-mmin] = dPhidX * dtau2   [-mmin] + d2PhidX2 * dtau[-mmin] * dtau[-mmin];
-                dlnrdtau[-mmin] = dPhidX * dlnrdtau[-mmin] + d2PhidX2 * dlnr[-mmin] * dtau[-mmin];
-            }
-            dlnr[-mmin] *= dPhidX;
-            dtau[-mmin] *= dPhidX;
-        }
-
-        // then multiply other terms by the value of the m=0 term, which resides in the [-mmin] element
-        for(int mm=0; mm<nm; mm++) {
-            int m = mm + mmin;
-            if(m==0 || ind.lmin(m) > ind.lmax)
-                continue;
-            if(numQuantities==6) {
-                dlnr2[mm] = dlnr2[mm] * Phi[-mmin] + Phi[mm] * dlnr2[-mmin] + 2 * dlnr[mm] * dlnr[-mmin];
-                dtau2[mm] = dtau2[mm] * Phi[-mmin] + Phi[mm] * dtau2[-mmin] + 2 * dtau[mm] * dtau[-mmin];
-                dlnrdtau[mm] = dlnrdtau[mm] * Phi[-mmin] + Phi[mm] * dlnrdtau[-mmin] +
-                    dlnr[mm] * dtau[-mmin] + dtau[mm] * dlnr[-mmin];
-            }
-            if(numQuantities>=3) {
-                dlnr[mm] = dlnr[mm] * Phi[-mmin] + Phi[mm] * dlnr[-mmin];
-                dtau[mm] = dtau[mm] * Phi[-mmin] + Phi[mm] * dtau[-mmin];
-            }
-            Phi[mm] *= Phi[-mmin];
-        }
-    }
+    if(logScaling)
+        // one source of math with the device path: multipoleUnscaleLogT() in
+        // potential_multipole.h. Operates in place on C_m, from which Phi/dlnr/... above
+        // are just named sub-pointers, so this is the same arithmetic on the same storage.
+        multipoleUnscaleLogT<double>(ind.pod(), numQuantities, invPhi0, C_m);
 
     // Fourier synthesis from azimuthal harmonics to actual quantities, still in scaled coords
     fourierTransformAzimuth(ind, pos.phi, C_m, &trPot,
@@ -2033,28 +1977,10 @@ void MultipoleInterp2d::evalCyl(const coord::PosCyl &pos,
     if(numQuantities==1)
         return;   // nothing else needed
 
-    // abuse the coordinate transformation framework (Sph -> Cyl), where actually
-    // our source Sph coords are not (r, theta, phi), but (ln r, tau, phi)
-    const double
-        rinv  = 1/r,
-        r2inv = pow_2(rinv);
-    coord::PosDerivT<coord::Cyl, coord::Sph> der;
-    der.drdR = pos.R * r2inv;
-    der.drdz = pos.z * r2inv;
-    der.dthetadR = -tau * rinv;
-    der.dthetadz = rinv - rplusRinv;
-    if(grad)
-        *grad = toGrad(trGrad, der);
-    if(hess) {
-        coord::PosDeriv2T<coord::Cyl, coord::Sph> der2;
-        der2.d2rdR2  = pow_2(der.drdz) - pow_2(der.drdR);
-        der2.d2rdRdz = -2 * der.drdR * der.drdz;
-        der2.d2rdz2  = -der2.d2rdR2;
-        der2.d2thetadR2  = pos.z * r2inv * rinv;
-        der2.d2thetadRdz = pow_2(der.dthetadR) - pow_2(der.drdR) * r * rplusRinv;
-        der2.d2thetadz2  = -der2.d2thetadR2 - der.dthetadR * rplusRinv;
-        *hess = toHess(trGrad, trHess, der, der2);
-    }
+    // one source of math with the device path: tauToCylDerivs() in potential_multipole.h.
+    // Deliberately NOT transformDerivsSphToCyl -- that one's second scaled coordinate is
+    // theta, this one's is tau.
+    tauToCylDerivs(pos.R, pos.z, r, rplusRinv, tau, trGrad, trHess, grad, hess);
 }
 
 
