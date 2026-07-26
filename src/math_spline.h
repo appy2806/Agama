@@ -1400,6 +1400,25 @@ private:
     std::vector<double> fx, fy, fxy;
 };
 
+/** TEST-ONLY cross-check helper, defined in math_spline.cpp (never inline, and never in
+    this header) so that BOTH evaluations below are compiled by whatever single compiler
+    builds math_spline.cpp -- always plain g++ in this project, since math_spline.cpp is
+    not in the CUDA_TUS list in Makefile.list -- regardless of what compiler the CALLER is
+    built with (e.g. tests/test_gpu_policy.cpp, which nvcc compiles with `-x cu` under
+    HAVE_CUDA=1). Exists because evalCubicSpline2dRaw() is AGAMA_DEVICE_INLINE: comparing
+    it, instantiated directly in a DIFFERENT translation unit, against
+    CubicSpline2d::evalDeriv() (which calls that same header-inline function, but
+    instantiated inside math_spline.cpp) is only guaranteed bit-for-bit when both
+    instantiations are compiled by the same compiler -- two compilers can make different
+    FMA-contraction/scheduling choices for identical source, which looks like a few ULP of
+    "mismatch" but is a compiler artifact, not a bug (see the analogous toGrad/toHess note
+    in tests/test_gpu_policy.cpp, and the incident that motivated this function: an
+    HAVE_CUDA=1/nvcc build of the direct cross-TU comparison flagged ~30-130 spurious
+    mismatches that vanished once both evaluations were pinned to this one TU). Not part
+    of the public API; only test code calls it. */
+void debugCubicSpline2dCrossCheck(const CubicSpline2d& sp, double x, double y,
+    double viaClass[6], double viaRaw[6]);
+
 
 /** Two-dimensional quintic spline */
 class QuinticSpline2d: public BaseInterpolator2d {

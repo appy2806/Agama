@@ -2111,6 +2111,31 @@ void CubicSpline2d::evalDeriv(const double x, const double y,
         z, z_x, z_y, z_xx, z_xy, z_yy);
 }
 
+void debugCubicSpline2dCrossCheck(const CubicSpline2d& sp, double x, double y,
+    double viaClass[6], double viaRaw[6])
+{
+    // Both calls below are compiled here, in math_spline.cpp, which is NEVER routed through
+    // nvcc (it is not in the CUDA_TUS list in Makefile.list) -- unlike a caller such as
+    // tests/test_gpu_policy.cpp, which nvcc compiles with `-x cu` under HAVE_CUDA=1. That
+    // matters because evalCubicSpline2dRaw() is AGAMA_DEVICE_INLINE: instantiating it
+    // directly from a DIFFERENT translation unit and comparing the result against
+    // CubicSpline2d::evalDeriv() (which calls the very same header-inline function, just
+    // instantiated here) is only guaranteed bit-for-bit when both instantiations are
+    // compiled by the same compiler. Two different compilers (g++ here vs. nvcc's host
+    // pass in the test binary) can make different FMA-contraction/instruction-scheduling
+    // choices for identical source, producing a few ULP of "difference" that is a compiler
+    // artifact, not a correctness bug -- see the analogous toGrad/toHess note in
+    // tests/test_gpu_policy.cpp. This function exists so a caller in ANY translation unit
+    // gets both results computed from HERE, eliminating that cross-TU/cross-compiler
+    // variable entirely. Not part of the public API; only test code calls it.
+    sp.evalDeriv(x, y, &viaClass[0], &viaClass[1], &viaClass[2], &viaClass[3], &viaClass[4], &viaClass[5]);
+    evalCubicSpline2dRaw(x, y,
+        sp.xvalues().data(), sp.yvalues().data(),
+        static_cast<int>(sp.xvalues().size()), static_cast<int>(sp.yvalues().size()),
+        sp.fvalues().data(), sp.dfdx().data(), sp.dfdy().data(), sp.d2fdxdy().data(),
+        &viaRaw[0], &viaRaw[1], &viaRaw[2], &viaRaw[3], &viaRaw[4], &viaRaw[5]);
+}
+
 
 //------------ 2D QUINTIC SPLINE -------------//
 

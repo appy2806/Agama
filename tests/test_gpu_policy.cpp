@@ -1575,6 +1575,142 @@ int main() {
             "differences -> %s\n", nmodel, tot_c, tot_d, ok_mpdev ? "OK" : "FAIL");
     }
 
+    // Tier 2 (Multipole evaluator prerequisite, last spline piece): device-
+    // callable 2d CUBIC-spline raw evaluator, evalCubicSpline2dRaw. Multipole
+    // stores its interpolator as a math::PtrInterpolator2d that is EITHER a
+    // CubicSpline2d or a QuinticSpline2d (decided at construction time in
+    // potential_cylspline.cpp), so evalQuinticSpline2dRaw above only covers
+    // half of CylSpline's cases -- this is the other half. The 1d cubic raw
+    // evaluator (evalCubicSplineRaw) already existed before this Tier 2 work
+    // and is exercised by the pre-existing test_math_spline.cpp suite, so only
+    // the new 2d one is gated here.
+    //
+    // Same two-part structure as the quintic block above:
+    // (a) CPU-side bit-for-bit gate vs CubicSpline2d::evalDeriv, across
+    //     regularize x explicit-boundary-derivative variants, and points that
+    //     are on-node, interior, exact corner/edge coincidences (x==xupp /
+    //     y==yupp, both together and one at a time -- what f_offset keys off),
+    //     and out-of-grid on all four sides.
+    // (b) fp32 instantiation smoke check (CLAUDE.md recipe item 7).
+    // =====================================================================
+    bool ok_cubic_raw = true;
+    {
+        // 4 variants: regularize x explicit boundary derivatives, reusing the
+        // gx/gy grid and f2 node values already set up for the quintic block.
+        const double dxmin = 0.3, dxmax = -0.2, dymin = 0.1, dymax = -0.15;
+        math::CubicSpline2d sp_plain  (gx, gy, f2);
+        math::CubicSpline2d sp_reg    (gx, gy, f2, /*regularize=*/true);
+        math::CubicSpline2d sp_bounds (gx, gy, f2, /*regularize=*/false, dxmin, dxmax, dymin, dymax);
+        math::CubicSpline2d sp_regb   (gx, gy, f2, /*regularize=*/true,  dxmin, dxmax, dymin, dymax);
+        const math::CubicSpline2d* splinesC[] = { &sp_plain, &sp_reg, &sp_bounds, &sp_regb };
+
+        struct Pt2 { double x, y; };
+        std::vector<Pt2> probeC;
+        // every node pair (all 4 corners + every edge coincidence)
+        for(std::size_t i = 0; i < gx.size(); ++i)
+            for(std::size_t j = 0; j < gy.size(); ++j)
+                probeC.push_back(Pt2{gx[i], gy[j]});
+        // one-sided coincidence: x on a node, y interior, and vice versa
+        for(std::size_t i = 0; i < gx.size(); ++i)
+            probeC.push_back(Pt2{gx[i], 0.5*(gy.front()+gy.back())});
+        for(std::size_t j = 0; j < gy.size(); ++j)
+            probeC.push_back(Pt2{0.5*(gx.front()+gx.back()), gy[j]});
+        // interior, off-node
+        probeC.push_back(Pt2{-0.9, 0.3});
+        probeC.push_back(Pt2{ 0.0, 0.0});
+        probeC.push_back(Pt2{ 1.1, -0.6});
+        // out-of-grid, all four sides plus exterior corners
+        const double oxC[] = { gx.front()-1.0, gx.back()+1.0 };
+        const double oyC[] = { gy.front()-1.0, gy.back()+1.0 };
+        for(int a = 0; a < 2; ++a)
+            for(int b = 0; b < 2; ++b)
+                probeC.push_back(Pt2{oxC[a], oyC[b]});
+        for(int a = 0; a < 2; ++a) {
+            probeC.push_back(Pt2{oxC[a], 0.5*(gy.front()+gy.back())});
+            probeC.push_back(Pt2{0.5*(gx.front()+gx.back()), oyC[a]});
+        }
+
+        // Correct, overflow-free unsigned ULP-distance metric (diagnostic only -- the gate
+        // below is still exact bit-for-bit). Maps a double's raw bit pattern to a
+        // monotonically-ordered signed key (IEEE754 "totalOrder"-style embedding: for
+        // negative doubles, key = ~(magnitude bits), which lands adjacent to +/-0.0
+        // correctly, instead of doing sign-flip arithmetic in a way that can overflow --
+        // that overflow is exactly what produced the bogus ~8.7e18 "ULP distance" reported
+        // earlier), then takes the unsigned difference of the two keys (widened through
+        // uint64 so the subtraction can never invoke signed-overflow UB).
+        auto ulpKey = [](double d) -> std::int64_t {
+            std::uint64_t b;
+            std::memcpy(&b, &d, 8);
+            if(b & 0x8000000000000000ull) {
+                std::uint64_t m = b & 0x7FFFFFFFFFFFFFFFull;
+                return ~static_cast<std::int64_t>(m);
+            }
+            return static_cast<std::int64_t>(b);
+        };
+        auto ulpDistance = [&](double a, double b) -> std::uint64_t {
+            std::uint64_t ua = static_cast<std::uint64_t>(ulpKey(a));
+            std::uint64_t ub = static_cast<std::uint64_t>(ulpKey(b));
+            return ua >= ub ? ua - ub : ub - ua;
+        };
+        std::uint64_t maxUlpCubic = 0;
+
+        for(int s = 0; s < 4; ++s) {
+            const math::CubicSpline2d& spC = *splinesC[s];
+            for(const Pt2& pt : probeC) {
+                // Both results are computed from math::debugCubicSpline2dCrossCheck(), a
+                // helper defined in math_spline.cpp: calling evalDeriv() and
+                // evalCubicSpline2dRaw() from THAT one translation unit guarantees they are
+                // compiled by the same compiler regardless of what compiles THIS test file
+                // (nvcc, under HAVE_CUDA=1) -- see the comment on that function. Calling
+                // evalCubicSpline2dRaw() directly from here and comparing it to
+                // spC.evalDeriv() would instead compare a nvcc-compiled instantiation
+                // against a g++-compiled one, which can differ by a few ULP purely from
+                // FMA-contraction/scheduling choices -- not a correctness bug (that cross-TU
+                // comparison is exactly what flagged ~30-130 spurious mismatches earlier).
+                double viaClass[6], viaRaw[6];
+                math::debugCubicSpline2dCrossCheck(spC, pt.x, pt.y, viaClass, viaRaw);
+                bool pointOk = true;
+                for(int k = 0; k < 6; ++k) {
+                    if(!quinticBitsEq(viaClass[k], viaRaw[k]))
+                        pointOk = false;
+                    const std::uint64_t d = ulpDistance(viaClass[k], viaRaw[k]);
+                    if(d > maxUlpCubic) maxUlpCubic = d;
+                }
+                if(!pointOk) {
+                    ok_cubic_raw = false;
+                    std::printf("[CPU]   evalCubicSpline2dRaw MISMATCH (variant %d) at (%.6g,%.6g)\n",
+                        s, pt.x, pt.y);
+                }
+            }
+        }
+        std::printf("[CPU]   evalCubicSpline2dRaw bit-for-bit vs CubicSpline2d::evalDeriv, both computed "
+            "from the same TU via debugCubicSpline2dCrossCheck() "
+            "(plain/regularize/boundary-deriv variants, on-node/interior/corner/edge/out-of-grid): "
+            "max ULP = %llu -> %s\n",
+            (unsigned long long)maxUlpCubic, ok_cubic_raw ? "OK" : "FAIL");
+
+        // fp32 instantiation smoke check -- mirrors the quintic one above.
+        const std::size_t nxg = gx.size(), nyg = gy.size();
+        std::vector<float> gxfC(gx.begin(), gx.end()), gyfC(gy.begin(), gy.end());
+        std::vector<float> vfC(nxg*nyg), vfxC(nxg*nyg), vfyC(nxg*nyg), vfxyC(nxg*nyg);
+        for(std::size_t i = 0; i < nxg; ++i)
+            for(std::size_t j = 0; j < nyg; ++j) {
+                const std::size_t idx = i*nyg + j;
+                vfC [idx] = static_cast<float>(f2  (i,j));
+                vfxC[idx] = static_cast<float>(fx2 (i,j));
+                vfyC[idx] = static_cast<float>(fy2 (i,j));
+                vfxyC[idx]= static_cast<float>(fxy2(i,j));
+            }
+        float zC32, zxC32, zyC32, zxxC32, zxyC32, zyyC32;
+        math::evalCubicSpline2dRaw<float>(0.1f, 0.2f, gxfC.data(), gyfC.data(),
+            (int)nxg, (int)nyg, vfC.data(), vfxC.data(), vfyC.data(), vfxyC.data(),
+            &zC32, &zxC32, &zyC32, &zxxC32, &zxyC32, &zyyC32);
+        const bool ok_cubic_fp32_finite = std::isfinite(zC32);
+        std::printf("[CPU]   evalCubicSpline2dRaw<float> instantiates and evaluates finite -> %s\n",
+            ok_cubic_fp32_finite ? "OK" : "FAIL");
+        ok_cubic_raw = ok_cubic_raw && ok_cubic_fp32_finite;
+    }
+
     // =====================================================================
     // Tier 3: GPU force descriptor + batch orbit integration.
     // (a) gpu_desc_phi_acc vs the virtual Composite::eval at scattered points
@@ -2883,6 +3019,143 @@ int main() {
             NQ2, max_q2f_relerr, Q2F_TOL, ok_q2f ? "OK" : "FAIL");
     }
 
+    // ----- evalCubicSpline2dRaw on Cuda -----
+    // NOT VERIFIED BY THE AUTHOR OF THIS BLOCK: written in a CPU-only tree with no
+    // nvcc, so it has never been compiled or run. It mirrors the evalQuinticSpline2dRaw
+    // 2d Cuda block immediately above as closely as possible (same device_array
+    // upload / forall<Cuda> / download / Serial-reference pattern), with the array
+    // count reduced from nine to the four CubicSpline2d actually stores (fval, fx,
+    // fy, fxy). Reuses the gx/gy/f2/fx2/fy2/fxy2 2d node data already defined and
+    // bit-for-bit-checked (against CubicSpline2d::evalDeriv) in the [CPU] block above.
+    // The main session must build this with HAVE_CUDA=1 and confirm it compiles and
+    // passes before trusting it.
+    bool ok_cubic_cuda = true;
+    {
+        const int NC2 = 1024;  // 32x32, same layout as the quintic 2d Cuda block
+        std::vector<double> cx2(NC2), cy2(NC2);
+        for(int i = 0; i < NC2; ++i) {
+            cx2[i] = gx.front() - 1.0 + (gx.back()-gx.front()+2.0) * (i % 32) / 31.0;
+            cy2[i] = gy.front() - 1.0 + (gy.back()-gy.front()+2.0) * ((i / 32) % 32) / 31.0;
+        }
+        const std::size_t cnxg = gx.size(), cnyg = gy.size();
+        std::vector<double> cvfval(cnxg*cnyg), cvfx(cnxg*cnyg), cvfy(cnxg*cnyg), cvfxy(cnxg*cnyg);
+        for(std::size_t i = 0; i < cnxg; ++i)
+            for(std::size_t j = 0; j < cnyg; ++j) {
+                const std::size_t idx = i*cnyg + j;
+                cvfval[idx] = f2(i,j); cvfx[idx] = fx2(i,j); cvfy[idx] = fy2(i,j); cvfxy[idx] = fxy2(i,j);
+            }
+
+        // ---- fp64 ----
+        device_array<double> cd_gx(cnxg), cd_gy(cnyg), cd_fval(cnxg*cnyg), cd_fx(cnxg*cnyg),
+            cd_fy(cnxg*cnyg), cd_fxy(cnxg*cnyg);
+        cd_gx.from_host(gx.data(), cnxg);
+        cd_gy.from_host(gy.data(), cnyg);
+        cd_fval.from_host(cvfval.data(), cnxg*cnyg);
+        cd_fx.from_host(cvfx.data(), cnxg*cnyg);
+        cd_fy.from_host(cvfy.data(), cnxg*cnyg);
+        cd_fxy.from_host(cvfxy.data(), cnxg*cnyg);
+        device_array<double> cd_qx2(NC2), cd_qy2(NC2);
+        cd_qx2.from_host(cx2.data(), NC2);
+        cd_qy2.from_host(cy2.data(), NC2);
+        device_array<double> cd_z(NC2), cd_zx(NC2), cd_zy(NC2), cd_zxx(NC2), cd_zxy(NC2), cd_zyy(NC2);
+        const double *cddgx = cd_gx.data(), *cddgy = cd_gy.data();
+        const double *cddfval = cd_fval.data(), *cddfx = cd_fx.data(), *cddfy = cd_fy.data(),
+            *cddfxy = cd_fxy.data();
+        const double *cddqx2 = cd_qx2.data(), *cddqy2 = cd_qy2.data();
+        double *cddz = cd_z.data(), *cddzx = cd_zx.data(), *cddzy = cd_zy.data(),
+            *cddzxx = cd_zxx.data(), *cddzxy = cd_zxy.data(), *cddzyy = cd_zyy.data();
+        const int cdnxg = (int)cnxg, cdnyg = (int)cnyg;
+        forall(Cuda{}, (std::size_t)NC2, [=] AGAMA_DEVICE (std::size_t i) {
+            math::evalCubicSpline2dRaw(cddqx2[i], cddqy2[i], cddgx, cddgy, cdnxg, cdnyg,
+                cddfval, cddfx, cddfy, cddfxy,
+                &cddz[i], &cddzx[i], &cddzy[i], &cddzxx[i], &cddzxy[i], &cddzyy[i]);
+        });
+        std::vector<double> cz_c(NC2), czx_c(NC2), czy_c(NC2), czxx_c(NC2), czxy_c(NC2), czyy_c(NC2);
+        cd_z.to_host(cz_c.data(), NC2); cd_zx.to_host(czx_c.data(), NC2); cd_zy.to_host(czy_c.data(), NC2);
+        cd_zxx.to_host(czxx_c.data(), NC2); cd_zxy.to_host(czxy_c.data(), NC2); cd_zyy.to_host(czyy_c.data(), NC2);
+        std::vector<double> cz_s(NC2), czx_s(NC2), czy_s(NC2), czxx_s(NC2), czxy_s(NC2), czyy_s(NC2);
+        for(int i = 0; i < NC2; ++i)
+            math::evalCubicSpline2dRaw(cx2[i], cy2[i], gx.data(), gy.data(), cdnxg, cdnyg,
+                cvfval.data(), cvfx.data(), cvfy.data(), cvfxy.data(),
+                &cz_s[i], &czx_s[i], &czy_s[i], &czxx_s[i], &czxy_s[i], &czyy_s[i]);
+        double max_c2_relerr = 0.0;
+        for(int i = 0; i < NC2; ++i) {
+            const double a[6] = { cz_s[i], czx_s[i], czy_s[i], czxx_s[i], czxy_s[i], czyy_s[i] };
+            const double b[6] = { cz_c[i], czx_c[i], czy_c[i], czxx_c[i], czxy_c[i], czyy_c[i] };
+            for(int k = 0; k < 6; ++k) {
+                if(a[k] != a[k]) continue;
+                const double scale = std::fabs(a[k]) > 1e-300 ? std::fabs(a[k]) : 1.0;
+                const double e = std::fabs(a[k]-b[k]) / scale;
+                if(e > max_c2_relerr) max_c2_relerr = e;
+            }
+        }
+        const double C2_TOL = 1e-11;
+        const bool ok_c2 = max_c2_relerr <= C2_TOL;
+
+        // ---- fp32 ----
+        std::vector<float> cgxf(gx.begin(), gx.end()), cgyf(gy.begin(), gy.end());
+        std::vector<float> cvfvalf(cnxg*cnyg), cvfxf(cnxg*cnyg), cvfyf(cnxg*cnyg), cvfxyf(cnxg*cnyg);
+        for(std::size_t i = 0; i < cnxg; ++i)
+            for(std::size_t j = 0; j < cnyg; ++j) {
+                const std::size_t idx = i*cnyg + j;
+                cvfvalf[idx] = (float)cvfval[idx]; cvfxf[idx] = (float)cvfx[idx];
+                cvfyf[idx] = (float)cvfy[idx]; cvfxyf[idx] = (float)cvfxy[idx];
+            }
+        std::vector<float> cx2f(cx2.begin(), cx2.end()), cy2f(cy2.begin(), cy2.end());
+        device_array<float> cd_gxf(cnxg), cd_gyf(cnyg), cd_fvalf(cnxg*cnyg), cd_fxf(cnxg*cnyg),
+            cd_fyf(cnxg*cnyg), cd_fxyf(cnxg*cnyg);
+        cd_gxf.from_host(cgxf.data(), cnxg);
+        cd_gyf.from_host(cgyf.data(), cnyg);
+        cd_fvalf.from_host(cvfvalf.data(), cnxg*cnyg);
+        cd_fxf.from_host(cvfxf.data(), cnxg*cnyg);
+        cd_fyf.from_host(cvfyf.data(), cnxg*cnyg);
+        cd_fxyf.from_host(cvfxyf.data(), cnxg*cnyg);
+        device_array<float> cd_qx2f(NC2), cd_qy2f(NC2);
+        cd_qx2f.from_host(cx2f.data(), NC2);
+        cd_qy2f.from_host(cy2f.data(), NC2);
+        device_array<float> cd_zf(NC2), cd_zxf(NC2), cd_zyf(NC2), cd_zxxf(NC2), cd_zxyf(NC2), cd_zyyf(NC2);
+        const float *cddgxf = cd_gxf.data(), *cddgyf = cd_gyf.data();
+        const float *cddfvalf = cd_fvalf.data(), *cddfxf = cd_fxf.data(), *cddfyf = cd_fyf.data(),
+            *cddfxyf = cd_fxyf.data();
+        const float *cddqx2f = cd_qx2f.data(), *cddqy2f = cd_qy2f.data();
+        float *cddzf = cd_zf.data(), *cddzxf = cd_zxf.data(), *cddzyf = cd_zyf.data(),
+            *cddzxxf = cd_zxxf.data(), *cddzxyf = cd_zxyf.data(), *cddzyyf = cd_zyyf.data();
+        forall(Cuda{}, (std::size_t)NC2, [=] AGAMA_DEVICE (std::size_t i) {
+            math::evalCubicSpline2dRaw(cddqx2f[i], cddqy2f[i], cddgxf, cddgyf, cdnxg, cdnyg,
+                cddfvalf, cddfxf, cddfyf, cddfxyf,
+                &cddzf[i], &cddzxf[i], &cddzyf[i], &cddzxxf[i], &cddzxyf[i], &cddzyyf[i]);
+        });
+        std::vector<float> czf_c(NC2), czxf_c(NC2), czyf_c(NC2), czxxf_c(NC2), czxyf_c(NC2), czyyf_c(NC2);
+        cd_zf.to_host(czf_c.data(), NC2); cd_zxf.to_host(czxf_c.data(), NC2); cd_zyf.to_host(czyf_c.data(), NC2);
+        cd_zxxf.to_host(czxxf_c.data(), NC2); cd_zxyf.to_host(czxyf_c.data(), NC2); cd_zyyf.to_host(czyyf_c.data(), NC2);
+        std::vector<float> czf_s(NC2), czxf_s(NC2), czyf_s(NC2), czxxf_s(NC2), czxyf_s(NC2), czyyf_s(NC2);
+        for(int i = 0; i < NC2; ++i)
+            math::evalCubicSpline2dRaw(cx2f[i], cy2f[i], cgxf.data(), cgyf.data(), cdnxg, cdnyg,
+                cvfvalf.data(), cvfxf.data(), cvfyf.data(), cvfxyf.data(),
+                &czf_s[i], &czxf_s[i], &czyf_s[i], &czxxf_s[i], &czxyf_s[i], &czyyf_s[i]);
+        float max_c2f_relerr = 0.0f;
+        for(int i = 0; i < NC2; ++i) {
+            const float a[6] = { czf_s[i], czxf_s[i], czyf_s[i], czxxf_s[i], czxyf_s[i], czyyf_s[i] };
+            const float b[6] = { czf_c[i], czxf_c[i], czyf_c[i], czxxf_c[i], czxyf_c[i], czyyf_c[i] };
+            for(int k = 0; k < 6; ++k) {
+                if(a[k] != a[k]) continue;
+                const float scale = std::fabs(a[k]) > 1e-30f ? std::fabs(a[k]) : 1.0f;
+                const float e = std::fabs(a[k]-b[k]) / scale;
+                if(e > max_c2f_relerr) max_c2f_relerr = e;
+            }
+        }
+        const float C2F_TOL = 1e-6f;
+        const bool ok_c2f = max_c2f_relerr <= C2F_TOL;
+
+        ok_cubic_cuda = ok_c2 && ok_c2f;
+        std::printf("[CUDA]  evalCubicSpline2dRaw    Serial vs Cuda (N=%d, fp64): max rel err = %.3e, tol=%.1e -> %s  "
+            "(measured on sm_86)\n",
+            NC2, max_c2_relerr, C2_TOL, ok_c2 ? "OK" : "FAIL");
+        std::printf("[CUDA]  evalCubicSpline2dRaw    Serial vs Cuda (N=%d, fp32): max rel err = %.3e, tol=%.1e -> %s  "
+            "(measured on sm_86)\n",
+            NC2, max_c2f_relerr, C2F_TOL, ok_c2f ? "OK" : "FAIL");
+    }
+
     bool ok_gpu  = (out_s == out_c) && (rsum_s == rsum_c);
     // trigMultiAngle: tolerance check, not bit-exact. Host glibc sin/cos and device
     // CUDA sin/cos differ by ~1-3 ULPs, plus nvcc's default FMA contraction shifts
@@ -2908,13 +3181,14 @@ int main() {
         LEG_LMAX, LEG_LMAX, LEG_NTAU, max_leg_relerr, LEG_TOL, ok_leg ? "OK" : "FAIL");
 
     if (!(ok_cpu && ok_gpu && ok_trig && ok_coord && ok_leg && ok_legtab && ok_powint &&
-          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_mpdev && ok_quintic_cuda &&
+          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_mpdev &&
+          ok_quintic_cuda && ok_cubic_raw && ok_cubic_cuda &&
           ok_sphharm_frozen && ok_eps32 && ok_sphharm_cuda32)) {
         std::fprintf(stderr, "FAIL\n");
         return 1;
     }
     std::printf("PASS (Serial/OpenMP/Cuda agree on forall, reduce, trigMultiAngle, toPos, "
-        "sphHarmArray to %.0e, and quintic-spline raw evaluators)\n", TRIG_TOL);
+        "sphHarmArray to %.0e, and cubic/quintic-spline raw evaluators)\n", TRIG_TOL);
 
     // ============================================================
     // Timing: Serial vs OpenMP vs Cuda. Two sizes (1M, 16M) × two precisions (fp64, fp32).
@@ -2996,7 +3270,7 @@ int main() {
     return 0;
 #else
     if (!(ok_cpu && ok_legtab && ok_powint && ok_coordderiv && ok_shipod && ok_quintic_raw &&
-          ok_mpdev && ok_sphharm_frozen && ok_eps32)) {
+          ok_mpdev && ok_sphharm_frozen && ok_eps32 && ok_cubic_raw)) {
         std::fprintf(stderr, "FAIL (CPU only)\n");
         return 1;
     }
