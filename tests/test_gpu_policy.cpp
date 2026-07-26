@@ -384,6 +384,156 @@ coord::HessSph ref_toHess_Sph_from_Cyl(const coord::GradCyl& srcGrad, const coor
     return dest;
 }
 
+// =============================================================================
+// Templating-of-math_sphharm.h FROZEN REFERENCE: verbatim (double-only) copies
+// of legendrePmm/sphHarmArray/trigMultiAngle exactly as they read at the base
+// commit, before NumT-templating. Same rationale as the toGrad/toHess frozen
+// reference above: pinning literal doubles from a separate TU was tried first
+// for coord.h and rejected there because FMA-contraction context inside a huge
+// TU can flip a last bit even under byte-identical flags, which a
+// cross-TU-pinned literal cannot distinguish from a real regression. These
+// ref_* bodies are compiled in THIS TU alongside math::legendrePmm<double> /
+// math::sphHarmArray<double> / math::trigMultiAngle<double>, so both sides
+// move together under any codegen shuffle and the comparison isolates actual
+// edits to math_sphharm.h.
+//
+// ref_sphHarmArray calls ref_legendrePmm (NOT math::legendrePmm) so this whole
+// reference chain is an untouched restatement of the pre-templating code, not
+// contaminated by the templated version it is meant to check.
+// DO NOT "clean up" or refactor these bodies.
+// =============================================================================
+void ref_legendrePmm(int m, double costheta, double sintheta,
+    double& prefact, double* value, double* der, double* der2)
+{
+    const int MMAX = math::LEGENDRE_MMAX;
+    static const double PREFACT[33] = { 0.2820947917738782,
+        0.3454941494713355,    0.1287580673410632,    0.02781492157551894,   0.004214597070904597,
+        0.0004911451888263050, 4.647273819914057e-05, 3.700296470718545e-06, 2.542785532478802e-07,
+        1.536743406172476e-08, 8.287860012085477e-10, 4.035298721198747e-11, 1.790656309174350e-12,
+        7.299068453727266e-14, 2.751209457796109e-15, 9.643748535232993e-17, 3.159120301003413e-18,
+        9.7128523792757242e-20, 2.8133797388083946e-21, 7.7031283932527599e-23, 1.9996982303404461e-24,
+        4.9350344437027061e-26, 1.1606510034403698e-27, 2.607108770058365e-29,  5.6045237507440517e-31,
+        1.155161536689941e-32,  2.2866979724449814e-34, 4.3542905194887195e-36, 7.9872656096230965e-38,
+        1.4133029977144382e-39, 2.4153082278063579e-41, 3.991325582870159e-43,  6.3847411917613422e-45 };
+    static const double COEF[33] =  { 0.2820947917738782,
+        -0.3454941494713355, 0.3862742020231896, -0.4172238236327841, 0.4425326924449826,
+        -0.4641322034408582, 0.4830841135800662, -0.5000395635705506, 0.5154289843972843,
+        -0.5295529414924496, 0.5426302919442215, -0.5548257538066191, 0.5662666637421912,
+        -0.5770536647012670, 0.5872677968601020, -0.5969753602424046, 0.6062313441538353,
+        -0.61508190492882853, 0.62356619406092162, -0.63171773211594939, 0.63956545825776223,
+        -0.64713454371390633, 0.65444703055069287, -0.66152233920742165, 0.66837767607862275,
+        -0.6750283640247019,  0.68148811277807653, -0.68776924198859157, 0.69388286659278342,
+        -0.69983905194657747, 0.70564694449371002, -0.71131488249010422, 0.71685049035448933 };
+
+    if(m<=MMAX)
+        prefact = PREFACT[m];
+    else
+        prefact = 0.5/M_SQRTPI * std::sqrt( (2*m+1) / math::factorial(2*m) );
+    if(m == 0) {
+        if(der) *der = 0;
+        if(der2) *der2 = 0;
+        *value = prefact;
+        return;
+    }
+    if(m == 1) {
+        if(der) *der = -costheta * prefact;
+        if(der2) *der2 = sintheta * prefact;
+        *value = -sintheta * prefact;
+        return;
+    }
+    double coef;
+    if(m<=MMAX)
+        coef = COEF[m];
+    else
+        coef = prefact * math::dfactorial(2*m-1) * (m%2 == 1 ? -1 : 1);
+    double sinm2 = math::powT(sintheta, m-2);
+    if(der)
+        *der = m * coef * sinm2 * sintheta * costheta;
+    if(der2)
+        *der2= m * coef * sinm2 * (m * pow_2(costheta) - 1);
+    *value   =     coef * sinm2 * pow_2(sintheta);
+}
+
+void ref_sphHarmArray(const unsigned int lmax, const unsigned int m, const double tau,
+    double* resultArray, double* derivArray, double* deriv2Array)
+{
+    if(lmax==0) {
+        resultArray[0] = 0.5/M_SQRTPI;
+        if(derivArray) derivArray[0] = 0;
+        if(deriv2Array) deriv2Array[0] = 0;
+        return;
+    }
+    const double ct =      2 * tau  / (1 + tau*tau);
+    const double st = (1 - tau*tau) / (1 + tau*tau);
+    double prefact;
+    ref_legendrePmm(m, ct, st, prefact, resultArray, derivArray, deriv2Array);
+    if(lmax == m)
+        return;
+
+    double Plm1 = resultArray[0] / prefact, Plm = ct * (2*m+1) * Plm1, Plm2 = 0;
+    double d2Plm1 = st, d2Plm2 = 0, d2Plm = 12 * ct * st;
+    const double EPS = 1e-8;
+
+    for(int l=m+1; l<=(int)lmax; l++) {
+        unsigned int ind = l-m;
+        if(l>(int)m+1)
+            Plm = (ct * (2*l-1) * Plm1 - (l+m-1) * Plm2) / (l-m);
+        prefact *= std::sqrt( (2*l+1.) / (2*l-1.) * (l-m) / (l+m) );
+        resultArray[ind] = Plm * prefact;
+        if(derivArray) {
+            double dPlm = 0;
+            if(st >= EPS || (m>2 && st>0))
+                dPlm = (l * ct * Plm - (l+m) * Plm1) / st;
+            else if(m==0)
+                dPlm = -l*(l+1)/2 * st * (ct>0 || l%2==1 ? 1 : -1);
+            else if(m==1)
+                dPlm = -l*(l+1)/2 * (ct>0 || l%2==0 ? 1 : -1);
+            else if(m==2)
+                dPlm = l*(l+1)*(l+2)*(l-1)/4 * st * (ct>0 || l%2==1 ? 1 : -1);
+            derivArray[ind] = prefact * dPlm;
+        }
+        if(deriv2Array!=NULL) {
+            if(st >= EPS || (m>2 && st>0))
+                deriv2Array[ind] = ct * derivArray[ind] / (-st) - (l*(l+1)-pow_2(m/st)) * resultArray[ind];
+            else if(m==0)
+                deriv2Array[ind] = -l*(l+1)/2 * prefact * (ct>0 || l%2==0 ? 1 : -1);
+            else if(m==1) {
+                if(l>(int)m+1) {
+                    double twodPlm1 = -l*(l-1) * (ct>0 || l%2==1 ? 1 : -1);
+                    d2Plm = ( (2*l-1) * (ct * (d2Plm1 - Plm1) - st * twodPlm1) - l * d2Plm2) / (l-1);
+                }
+                deriv2Array[ind] = prefact * d2Plm;
+                d2Plm2 = d2Plm1;
+                d2Plm1 = d2Plm;
+            }
+            else if(m==2)
+                deriv2Array[ind] = l*(l+1)*(l+2)*(l-1)/4 * prefact * (ct>0 || l%2==0 ? 1 : -1);
+            else
+                deriv2Array[ind] = 0;
+        }
+        Plm2 = Plm1;
+        Plm1 = Plm;
+    }
+}
+
+void ref_trigMultiAngle(const double phi, const unsigned int m, const bool needSine, double* outputArray)
+{
+    if(m < 1) return;
+    const double sinphi  = std::sin(phi);
+    const double sinphi2 = std::sin(phi * 0.5);
+    const double alpha   = 2.0 * sinphi2 * sinphi2;
+    const double beta    = sinphi;
+    double cosphi1 = 1.0, sinphi1 = 0.0;
+    for(unsigned int k = 0; k < m; ++k) {
+        const double cosphi = cosphi1 - (alpha * cosphi1 + beta * sinphi1);
+        const double sinphi_k = sinphi1 - (alpha * sinphi1 - beta * cosphi1);
+        outputArray[k] = cosphi;
+        if(needSine) outputArray[k + m] = sinphi_k;
+        cosphi1 = cosphi;
+        sinphi1 = sinphi_k;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -547,6 +697,186 @@ int main() {
             math::sphHarmArray(LEG_LMAX, LEG_MS[im], tau,
                 base, base + LEG_STRIDE, base + 2 * LEG_STRIDE);
         }
+    }
+
+    // =====================================================================
+    // Tier 2 (Multipole evaluator prerequisite, 4th): legendrePmm/sphHarmArray/
+    // trigMultiAngle in math_sphharm.h templated on NumT, mirroring
+    // evalQuinticSplines<K>/evalCubicSplines<K> in math_spline.h (NumT deduced
+    // from INPUT arguments only; output pointers go through nondeduced<>).
+    //
+    // (a) THE CPU-INVARIANCE GATE, NumT=double: same-TU frozen-reference sweep
+    //     against ref_legendrePmm/ref_sphHarmArray/ref_trigMultiAngle (verbatim
+    //     pre-templating bodies defined above main(), see the CAVEAT there
+    //     about why a cross-TU-pinned literal was rejected for the analogous
+    //     coord.h gate -- same reasoning applies here). Any edit to
+    //     math_sphharm.h's arithmetic (or a diverging edit to the frozen
+    //     ref_* bodies, which must never happen) is what can make these
+    //     disagree; a harmless FMA-contraction shuffle moves both sides
+    //     together.
+    //
+    //     Sweep: m = 0..(LEGENDRE_MMAX+8) (crosses the tabulated/closed-form
+    //     boundary at LEGENDRE_MMAX=32 for legendrePmm), tau spanning (-1,1)
+    //     including within 1e-12 of +-1 (exercises the m<=2 asymptotic
+    //     derivative branches), and phi over several periods for
+    //     trigMultiAngle.
+    // =====================================================================
+    bool ok_sphharm_frozen = true;
+    long sphharm_frozen_compared = 0, sphharm_frozen_mismatches = 0;
+    {
+        auto bitEqualD = [](double a, double b) {
+            uint64_t ia, ib;
+            std::memcpy(&ia, &a, 8);
+            std::memcpy(&ib, &b, 8);
+            return ia == ib;
+        };
+        auto chkD = [&](double got, double want, const char* name) {
+            ++sphharm_frozen_compared;
+            if (!bitEqualD(got, want)) {
+                ++sphharm_frozen_mismatches;
+                ok_sphharm_frozen = false;
+                std::printf("[T2]    %s MISMATCH: got %.17g want %.17g\n", name, got, want);
+            }
+        };
+
+        // --- legendrePmm: m = 0..LEGENDRE_MMAX+8, several (costheta,sintheta) pairs ---
+        const int LP_MMAX = math::LEGENDRE_MMAX + 8;  // cross the tabulated/closed-form boundary
+        const double LP_THETAS[] = { 0.1, 0.7, 1.2, 1.5707963267948966, 2.0, 2.9, 3.04 };
+        for(double theta : LP_THETAS) {
+            const double ct = std::cos(theta), st = std::sin(theta);
+            for(int m = 0; m <= LP_MMAX; ++m) {
+                double prefact_g = 0, value_g = 0, der_g = 0, der2_g = 0;
+                double prefact_r = 0, value_r = 0, der_r = 0, der2_r = 0;
+                math::legendrePmm(m, ct, st, prefact_g, &value_g, &der_g, &der2_g);
+                ref_legendrePmm       (m, ct, st, prefact_r, &value_r, &der_r, &der2_r);
+                chkD(prefact_g, prefact_r, "legendrePmm prefact");
+                chkD(value_g,   value_r,   "legendrePmm value");
+                chkD(der_g,     der_r,     "legendrePmm der");
+                chkD(der2_g,    der2_r,    "legendrePmm der2");
+            }
+        }
+
+        // --- sphHarmArray: lmax = 0..32, every m = 0..lmax, tau densely incl. |tau|->1 ---
+        std::vector<double> SH_TAUS;
+        for(int i = -100; i <= 100; ++i) SH_TAUS.push_back(i * 0.01);
+        for(int e = 1; e <= 12; ++e) {
+            const double delta = std::pow(10.0, -(double)e);
+            SH_TAUS.push_back(1.0 - delta);
+            SH_TAUS.push_back(-(1.0 - delta));
+        }
+        for(unsigned int lmax = 0; lmax <= 32; ++lmax) {
+            for(unsigned int m = 0; m <= lmax; ++m) {
+                const int n = lmax - m + 1;
+                std::vector<double> res_g(n), der_g(n), der2_g(n);
+                std::vector<double> res_r(n), der_r(n), der2_r(n);
+                for(double tau : SH_TAUS) {
+                    math::sphHarmArray(lmax, m, tau, res_g.data(), der_g.data(), der2_g.data());
+                    ref_sphHarmArray       (lmax, m, tau, res_r.data(), der_r.data(), der2_r.data());
+                    for(int i = 0; i < n; ++i) {
+                        chkD(res_g[i],  res_r[i],  "sphHarmArray result");
+                        chkD(der_g[i],  der_r[i],  "sphHarmArray deriv");
+                        chkD(der2_g[i], der2_r[i], "sphHarmArray deriv2");
+                    }
+                }
+            }
+        }
+
+        // --- trigMultiAngle: phi over several periods, m up to 40 ---
+        for(int i = -30; i <= 30; ++i) {
+            const double phi = i * 0.27 * M_PI;
+            for(unsigned int m = 1; m <= 40; ++m) {
+                std::vector<double> out_g(2*m), out_r(2*m);
+                math::trigMultiAngle(phi, m, true, out_g.data());
+                ref_trigMultiAngle       (phi, m, true, out_r.data());
+                for(unsigned int k = 0; k < 2*m; ++k)
+                    chkD(out_g[k], out_r[k], "trigMultiAngle");
+            }
+        }
+
+        std::printf("[T2]    legendrePmm/sphHarmArray/trigMultiAngle<double> vs frozen "
+            "pre-templating ref_* bodies, same-TU: %ld values compared, %ld mismatches -> %s\n",
+            sphharm_frozen_compared, sphharm_frozen_mismatches, ok_sphharm_frozen ? "OK" : "FAIL");
+    }
+
+    // =====================================================================
+    // (b) fp32 EPS-threshold REGRESSION. sphHarmArray's derivative recurrence
+    //     (m<=2 only -- see sphharm_deriv_eps<NumT> in math_sphharm.h) switches
+    //     to an asymptotic formula below a precision-dependent threshold EPS in
+    //     sin(theta); the fp64 value (1e-8) is upstream's literal and must not
+    //     change, but the fp32 value was empirically re-derived to 3e-3 (NOT
+    //     sqrt(FLT_EPSILON)=3.45e-4, which measured 50-90% worst-case error --
+    //     see the sweep table in math_sphharm.h and in this commit's message).
+    //
+    //     This test pins that choice two ways:
+    //       (i)  at a tau just inside the danger zone (st ~ 6e-8, deep enough
+    //            that the naive 1e-8/3.45e-4 thresholds would still select the
+    //            CANCELLATION-PRONE direct float formula there), the fp32
+    //            result must be within the sweep-justified 3e-2 relative
+    //            tolerance of an fp64 reference fed the SAME float-rounded tau
+    //            (matching the sweep harness's own methodology: comparing
+    //            against a double reference derived from a *different*,
+    //            unrounded tau would conflate input-precision loss with
+    //            algorithmic error -- see the sweep script's own comment on
+    //            exactly this pitfall).
+    //       (ii) a hard-coded regression: if a future edit reverts
+    //            sphharm_deriv_eps<float>::value() back to something at or
+    //            below 1e-4 (e.g. "simplifying" it to match fp64, or to
+    //            sqrt(FLT_EPSILON)), this test fails loudly, because at
+    //            EPS<=1e-4 the m=0,1 worst-case error measured 3.8-300x, far
+    //            outside any plausible tolerance.
+    // =====================================================================
+    bool ok_eps32 = true;
+    {
+        const int LMAX32 = 24;
+        const double EPS32 = math::sphharm_deriv_eps<float>::value();
+        // pin (ii): the chosen threshold must sit in the empirically-safe window,
+        // not have regressed to the naive sqrt(FLT_EPSILON) guess or smaller.
+        if(!(EPS32 >= 1e-3f && EPS32 <= 1e-2f)) {
+            ok_eps32 = false;
+            std::printf("[T2]    sphharm_deriv_eps<float> = %.3e has drifted outside the "
+                "empirically-justified [1e-3, 1e-2] window (see math_sphharm.h sweep table) "
+                "-> FAIL\n", (double)EPS32);
+        }
+        // pin (i): worst-case error near the crossover for m=0,1,2 stays within
+        // the tolerance the sweep in math_sphharm.h justified for THIS EPS32.
+        const double SWEEP_TOL = 3e-2;  // matches the ~2e-2 measured worst case, with headroom
+        double worst = 0;
+        for(int m : {0, 1, 2}) {
+            const int n = LMAX32 - m + 1;
+            std::vector<double> res_d(n), der_d(n), der2_d(n);
+            std::vector<float>  res_f(n), der_f(n), der2_f(n);
+            // dense tau ladder straddling the fp32 threshold, rounded to float
+            // FIRST so both the fp64 reference and the fp32 candidate see the
+            // identical represented input (see the sweep-script comment on why
+            // this matters -- otherwise a discrepancy purely from the INPUT's
+            // float rounding gets misattributed to the threshold choice).
+            for(int e = 2; e <= 10; ++e) {
+                const double delta = std::pow(10.0, -(double)e);
+                for(int sign : {-1, 1}) {
+                    const float  tauf = (float)(sign * (1.0 - delta));
+                    const double taud = (double)tauf;
+                    math::sphHarmArray(LMAX32, m, taud, res_d.data(), der_d.data(), der2_d.data());
+                    math::sphHarmArray<float>(LMAX32, m, tauf, res_f.data(), der_f.data(), der2_f.data());
+                    for(int i = 0; i < n; ++i) {
+                        const double scale = std::max(std::fabs(res_d[i]), 1e-300);
+                        const double denom  = std::max(std::fabs(der_d[i]),  scale*1e-6);
+                        const double denom2 = std::max(std::fabs(der2_d[i]), scale*1e-6);
+                        const double e1 = std::fabs((double)der_f[i]  - der_d[i])  / denom;
+                        const double e2 = std::fabs((double)der2_f[i] - der2_d[i]) / denom2;
+                        if(std::isfinite(e1)) worst = std::max(worst, e1);
+                        if(std::isfinite(e2)) worst = std::max(worst, e2);
+                    }
+                }
+            }
+        }
+        if(worst > SWEEP_TOL) {
+            ok_eps32 = false;
+            std::printf("[T2]    sphHarmArray<float> near-pole derivative error %.3e exceeds "
+                "sweep-justified tolerance %.3e -> FAIL\n", worst, SWEEP_TOL);
+        }
+        std::printf("[T2]    sphHarmArray<float> EPS=%.3e (window-check) + near-pole m=0,1,2 "
+            "worst rel err = %.3e (tol %.3e) -> %s\n", (double)EPS32, worst, SWEEP_TOL,
+            ok_eps32 ? "OK" : "FAIL");
     }
 
     // =====================================================================
@@ -1850,6 +2180,102 @@ int main() {
     const bool ok_leg = (max_leg_relerr <= LEG_TOL);
 
     // -------------------------------------------------------------------
+    // Measured on sm_86: sphHarmArray<float> max rel err 1.115e-03,
+    // trigMultiAngle<float> max |err| 1.848e-06. Unlike the raw spline
+    // evaluators (exact Serial-vs-Cuda in both precisions), these are NOT
+    // exact -- see the tolerance note below.
+    //
+    // Tolerance: fp32 sphHarmArray derivatives are not exact Serial-vs-Cuda
+    // the way the raw spline evaluators are (those are pure straight-line
+    // arithmetic over caller-supplied arrays with no transcendentals) --
+    // sphHarmArray calls sqrt/sin/cos, whose host libm and device libm can
+    // differ by a few ULPs, on top of nvcc's FMA contraction. Near the m<=2
+    // asymptotic-vs-direct crossover, the empirical sweep in math_sphharm.h
+    // found ~2e-2 worst-case error is inherent to fp32 at that threshold
+    // (independent of host-vs-device), so SPH32_TOL is set well above the
+    // expected ULP-level Serial-vs-Cuda gap AWAY from the crossover, but not
+    // so tight that legitimate near-pole disagreement (already ~2e-2 in the
+    // CPU-only fp32 regression test above) trips it. m>2 uses the direct
+    // formula unconditionally once st>0 (see math_sphharm.h), so it carries
+    // whatever residual fp32 cancellation error that formula has at both ends.
+    // -------------------------------------------------------------------
+    bool ok_sphharm_cuda32 = true;
+    double max_leg32_relerr = 0.0, max_trig32_err = 0.0;
+    {
+        // ----- legendrePmm/sphHarmArray<float> Serial vs Cuda -----
+        // same (tau, m) layout as the fp64 LEG_N block above, cast to float.
+        std::vector<float> leg_sf(LEG_N, 0.0f);
+        for(int it = 0; it < LEG_NTAU; ++it) {
+            const float tauf = (float)(-1.0 + 1e-12 + (2.0 - 2e-12) * (it + 0.5) / LEG_NTAU);
+            for(int im = 0; im < LEG_NM; ++im) {
+                float* base = &leg_sf[(((std::size_t)it * LEG_NM + im) * 3) * LEG_STRIDE];
+                math::sphHarmArray<float>(LEG_LMAX, LEG_MS[im], tauf,
+                    base, base + LEG_STRIDE, base + 2 * LEG_STRIDE);
+            }
+        }
+        device_array<float> d_legf(LEG_N);
+        float* dlegf = d_legf.data();
+        forall(Cuda{}, (std::size_t)LEG_NTAU * LEG_NM, [=] AGAMA_DEVICE (std::size_t k) {
+            const int it = (int)(k / dNM), im = (int)(k % dNM);
+            const float tauf = (float)(-1.0 + 1e-12 + (2.0 - 2e-12) * (it + 0.5) / dNTAU);
+            float* base = dlegf + (((std::size_t)it * dNM + im) * 3) * dSTRIDE;
+            math::sphHarmArray<float>(dLMAX, dms[im], tauf,
+                base, base + dSTRIDE, base + 2 * dSTRIDE);
+        });
+        std::vector<float> leg_cf(LEG_N);
+        d_legf.to_host(leg_cf.data(), LEG_N);
+        for(int it = 0; it < LEG_NTAU; ++it)
+            for(int im = 0; im < LEG_NM; ++im) {
+                const std::size_t base = (((std::size_t)it * LEG_NM + im) * 3) * LEG_STRIDE;
+                const int nvalid = LEG_LMAX - LEG_MS[im] + 1;
+                for(int q = 0; q < 3; ++q)
+                    for(int j = 0; j < nvalid; ++j) {
+                        const std::size_t i = base + (std::size_t)q * LEG_STRIDE + j;
+                        const float a = leg_sf[i], b = leg_cf[i];
+                        if(a != a) continue; // NaN (asymptotic-branch edge cases): skip
+                        const float scale = std::fabs(a) > 1e-30f ? std::fabs(a) : 1.0f;
+                        const float e = std::fabs(a - b) / scale;
+                        if(e > max_leg32_relerr) max_leg32_relerr = e;
+                    }
+            }
+        const double LEG32_TOL = 5e-2;  // headroom above the ~2e-2 CPU-only fp32 floor measured above
+        const bool ok_leg32 = (max_leg32_relerr <= LEG32_TOL);
+
+        // ----- trigMultiAngle<float> Serial vs Cuda -----
+        std::vector<float> trig_sf(NP * 2 * MM);
+        for(std::size_t p = 0; p < NP; ++p) {
+            const float phif = (float)((p + 0.5) * (2.0 * 3.14159265358979323846 / NP));
+            math::trigMultiAngle<float>(phif, MM, /*needSine=*/true, &trig_sf[p * 2 * MM]);
+        }
+        device_array<float> d_trigf(NP * 2 * MM);
+        float* dtrigf = d_trigf.data();
+        forall(Cuda{}, NP, [=] AGAMA_DEVICE (std::size_t p) {
+            const float phif = (float)((p + 0.5) * (2.0 * 3.14159265358979323846 / NP));
+            math::trigMultiAngle<float>(phif, MM, /*needSine=*/true, &dtrigf[p * 2 * MM]);
+        });
+        std::vector<float> trig_cf(NP * 2 * MM);
+        d_trigf.to_host(trig_cf.data(), NP * 2 * MM);
+        for(std::size_t i = 0; i < trig_sf.size(); ++i) {
+            const float e = std::fabs(trig_sf[i] - trig_cf[i]);
+            if(e > max_trig32_err) max_trig32_err = e;
+        }
+        // trigMultiAngle has no cancellation guard at all (see math_sphharm.h:
+        // "no comparable fp64-tuned constant"), so this should be a tight,
+        // ULP-level host-vs-device tolerance, same order as TRIG_TOL but
+        // widened for fp32's ~7 decimal digits instead of fp64's ~16.
+        const double TRIG32_TOL = 1e-5;
+        const bool ok_trig32 = (max_trig32_err <= TRIG32_TOL);
+
+        ok_sphharm_cuda32 = ok_leg32 && ok_trig32;
+        std::printf("[CUDA]  sphHarmArray<float> Serial vs Cuda (lmax=%d, m=0/1/2/3/%d, %d tau incl. "
+            "|tau|->1): max rel err = %.3e, tol = %.1e -> %s\n",
+            LEG_LMAX, LEG_LMAX, LEG_NTAU, max_leg32_relerr, LEG32_TOL, ok_leg32 ? "OK" : "FAIL");
+        std::printf("[CUDA]  trigMultiAngle<float> Serial vs Cuda (NP=%zu, mmax=%u): max |err| = %.3e, "
+            "tol = %.1e -> %s\n",
+            NP, MM, max_trig32_err, TRIG32_TOL, ok_trig32 ? "OK" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------
     // Tier 2 commit 1, GPU parity: toGrad<Sph,Cyl> / toHess<Sph,Cyl> Serial
     // vs Cuda over CD_N random inputs, compared at 1e-11 relative -- same
     // structure as the sphHarmArray Serial-vs-Cuda block just above, and the
@@ -2201,8 +2627,9 @@ int main() {
         "W+dW+d2W): max rel err = %.3e, tol = %.1e -> %s\n",
         LEG_LMAX, LEG_LMAX, LEG_NTAU, max_leg_relerr, LEG_TOL, ok_leg ? "OK" : "FAIL");
 
-    if (!(ok_cpu && ok_gpu && ok_trig && ok_coord && ok_leg && ok_legtab && ok_powint && 
-          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_quintic_cuda)) {
+    if (!(ok_cpu && ok_gpu && ok_trig && ok_coord && ok_leg && ok_legtab && ok_powint &&
+          ok_coordderiv && ok_coordderiv_gpu && ok_shipod && ok_quintic_raw && ok_quintic_cuda &&
+          ok_sphharm_frozen && ok_eps32 && ok_sphharm_cuda32)) {
         std::fprintf(stderr, "FAIL\n");
         return 1;
     }
@@ -2288,7 +2715,8 @@ int main() {
 
     return 0;
 #else
-    if (!(ok_cpu && ok_legtab && ok_powint && ok_coordderiv && ok_shipod && ok_quintic_raw)) {
+    if (!(ok_cpu && ok_legtab && ok_powint && ok_coordderiv && ok_shipod && ok_quintic_raw &&
+          ok_sphharm_frozen && ok_eps32)) {
         std::fprintf(stderr, "FAIL (CPU only)\n");
         return 1;
     }

@@ -103,14 +103,12 @@ namespace math{
 /// nvcc emits both host and __device__ versions of the same body, and the CPU build sees plain
 /// `inline` (see gpu_device.h) -- bit-for-bit identical machine code path to before this move.
 
-/** Blocks template-argument deduction for the parameter it wraps.
-
-    `typename nondeduced<NumT>::type*` is spelled out rather than `NumT*` for the OUTPUT
-    pointers of the polynomial leaves below. Those functions deduce NumT from their input
-    arguments; if the outputs were also deducible, a call site passing a literal NULL
-    would try to deduce NumT from `long int` and fail to compile. Several call sites in
-    math_spline.cpp do exactly that. */
-template<typename U> struct nondeduced { typedef U type; };
+// math::nondeduced<> -- the deduction-blocking trait used by the output pointers of every
+// templated leaf below -- now lives in math_core.h, which this header already includes.
+// It moved there when math_sphharm.h's leaves were templated too: that header would
+// otherwise have had to include THIS one (and transitively math_linalg.h) for a one-line
+// trait, and duplicating the definition in two headers would be an ODR violation for any
+// TU including both.
 
 /** compute the value and up to 3 derivatives of (possibly several, K>=1) cubic spline(s);
     input arguments contain the value(s) and 1st derivative(s) of these splines

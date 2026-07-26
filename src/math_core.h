@@ -12,7 +12,22 @@ namespace math{
 /// \name  ---- Miscellaneous utility functions -----
 ///@{
 
-/** compare two numbers with a relative accuracy eps: 
+/** Blocks template-argument deduction for the parameter it wraps.
+
+    `typename nondeduced<NumT>::type*` is spelled out rather than `NumT*` for the OUTPUT
+    pointers of the value-type-templated leaves in math_spline.h and math_sphharm.h.
+    Those functions deduce NumT from their INPUT arguments only; if the outputs were
+    also deducible, a call site passing a literal NULL would try to deduce NumT from
+    `long int` and fail to compile. Several call sites in math_spline.cpp and in the
+    Multipole/CylSpline evaluators do exactly that.
+
+    Lives here, in the lowest-level header both of those include, rather than in either
+    of them: math_sphharm.h would otherwise have to include math_spline.h (and
+    transitively math_linalg.h) for a one-line trait, and defining it in both headers
+    would be an ODR violation in any TU that includes both. */
+template<typename U> struct nondeduced { typedef U type; };
+
+/** compare two numbers with a relative accuracy eps:
     \return -1 if x<y, +1 if x>y, -2 if x==NAN, +2 if y==NAN, or 0 if x and y are approximately equal
 */
 int fcmp(double x, double y, double eps=1e-15);
