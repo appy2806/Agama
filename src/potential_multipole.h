@@ -52,6 +52,136 @@
 
 namespace potential {
 
+// =====================================================================
+// Tier 2 leaf math for the Multipole evaluator: AGAMA_DEVICE_INLINE and
+// templated on the value type T, single-source with the CPU path.
+//
+// The internal helpers in potential_multipole.cpp that Multipole::evalCyl
+// funnels through are being moved here one at a time as templated
+// device-callable free functions, with the .cpp version reduced to a thin
+// wrapper, so the virtual single-point path and any templated batch/device
+// path stay bit-for-bit identical (CLAUDE.md constraint 5, refereed by
+// crosscheck_expansions.py).
+//
+// DONE so far: fourierTransformAzimuth (below).
+// DEFERRED, and NOT for lack of trying: transformDerivsSphToCyl. Every way of
+// routing it through a shared leaf -- plain-T array boundary, or a shared
+// Jacobian helper with the toGrad/toHess calls left at the call sites --
+// moved 4 of the 57 BFE quantities by ~2 ULP (5.75e-16 normalized, measured;
+// see findings.md). The cause is that toGrad/toHess became header-inline in
+// 5e04db5, so relocating their caller changes their contraction context. The
+// 4 affected quantities are Dehnen-sph Multipole force and density, i.e. the
+// MultipoleInterp1d branch, which is the ONLY branch that calls this helper
+// (MultipoleInterp2d -- every realistic MW potential -- builds its own
+// tau-based Jacobian inline, deliberately, since its "theta" is tau). So the
+// shift lands entirely outside the priority branch, and the accept-or-restate
+// decision is better made when that branch is actually ported than paid for
+// now in exchange for nothing.
+//
+// TWO CONVENTIONS THAT DIFFER FROM THE CPU HELPERS, both deliberate:
+//
+// (1) Gradients and hessians travel as plain T arrays, not coord::GradSph /
+//     coord::HessSph. Those structs hard-code `double` members
+//     (coord.h:461-489), so routing an fp32 kernel through them would force
+//     the whole angular stage back to fp64 at 1:64 cost on the target
+//     hardware. The CPU wrappers unpack these arrays into the structs, which
+//     is a copy, not arithmetic, so bit-parity is unaffected. Component
+//     order is fixed by the enums below -- do not reorder, several call
+//     sites index these arrays positionally.
+//
+// (2) Scratch space is CALLER-PROVIDED. The CPU wrappers keep passing
+//     alloca'd buffers, so they stay valid for arbitrary lmax/mmax exactly
+//     as upstream; a device caller passes a fixed-size local array bounded
+//     by its own compile-time cap. This is what lets the device path have a
+//     cap without imposing one on the CPU path.
+// =====================================================================
+
+/// component order for the T grad[3] arrays below, in the SCALED spherical
+/// coordinates the Multipole interpolators work in (for MultipoleInterp2d,
+/// "r" means ln(r) and "theta" means tau -- see its evalCyl)
+enum SphGradIndex { SPH_DR = 0, SPH_DTHETA = 1, SPH_DPHI = 2 };
+
+/// component order for the T hess[6] arrays below
+enum SphHessIndex {
+    SPH_DR2 = 0, SPH_DRDTHETA = 1, SPH_DTHETA2 = 2,
+    SPH_DRDPHI = 3, SPH_DTHETADPHI = 4, SPH_DPHI2 = 5
+};
+
+/** Fourier synthesis in the azimuthal angle: given the per-m harmonic
+    coefficients C_m, produce the value and (optionally) the first and second
+    derivatives in (r, theta, phi). Device-callable, templated restatement of
+    fourierTransformAzimuth() in potential_multipole.cpp, which is now a thin
+    wrapper over this.
+
+    C_m holds nq * nm entries, nm = ind.mmax - ind.mmin() + 1, laid out as
+    nm potential harmonics, then nm for dPhi/dr, and so on -- upstream's
+    layout, unchanged. nq is implied by which outputs are requested: 6 if
+    hess, else 3 if grad, else 1.
+
+    \param[in]  ind   is the POD indexing scheme (see SphHarmIndices::pod()).
+    \param[in]  phi   is the azimuthal angle.
+    \param[in]  C_m   is the coefficient array described above.
+    \param[in]  trig_m is caller-provided scratch of at least
+                ind.mmax * (1 + useSine) entries, where useSine is
+                (ind.mmin() < 0 || nq > 1). Unused when ind.mmax == 0, and
+                may then be NULL.
+    \param[out] val   receives the value      if != NULL.
+    \param[out] grad  receives 3 components   if != NULL (SphGradIndex order).
+    \param[out] hess  receives 6 components   if != NULL (SphHessIndex order).
+*/
+template<typename T>
+AGAMA_DEVICE_INLINE void fourierTransformAzimuthT(
+    const math::SphHarmIndicesPod& ind, const T phi, const T* C_m, T* trig_m,
+    T* val, T* grad, T* hess)
+{
+    const int numQuantities = hess!=NULL ? 6 : grad!=NULL ? 3 : 1;
+    const int mmin = ind.mmin();
+    const int nm = ind.mmax - mmin + 1;   // number of azimuthal harmonics in C_m
+    // first assign the m=0 harmonic, which is the only one in the axisymmetric case
+    if(val)
+        *val = C_m[-mmin];
+    if(grad) {
+        grad[SPH_DR]     = C_m[-mmin+nm];
+        grad[SPH_DTHETA] = C_m[-mmin+nm*2];
+        grad[SPH_DPHI]   = 0;
+    }
+    if(hess) {
+        hess[SPH_DR2]      = C_m[-mmin+nm*3];
+        hess[SPH_DRDTHETA] = C_m[-mmin+nm*4];
+        hess[SPH_DTHETA2]  = C_m[-mmin+nm*5];
+        hess[SPH_DRDPHI]   = hess[SPH_DTHETADPHI] = hess[SPH_DPHI2] = 0;
+    }
+    if(ind.mmax == 0)
+        return;
+    const bool useSine = mmin<0 || numQuantities>1;
+    math::trigMultiAngle(phi, ind.mmax, useSine, trig_m);
+    for(int mm=0; mm<nm; mm++) {
+        int m = mm + mmin;
+        if(m==0)
+            continue;  // the m=0 terms were set at the beginning
+        if(ind.lmin(m)>ind.lmax)
+            continue;  // empty harmonic
+        T trig  = m>0 ? trig_m[m-1] : trig_m[ind.mmax-m-1];  // cos or sin
+        T dtrig = m>0 ? -m*trig_m[ind.mmax+m-1] : -m*trig_m[-m-1];
+        T d2trig = -m*m*trig;
+        if(val)
+            *val += C_m[mm] * trig;
+        if(grad) {
+            grad[SPH_DR]     += C_m[mm+nm  ] *  trig;
+            grad[SPH_DTHETA] += C_m[mm+nm*2] *  trig;
+            grad[SPH_DPHI]   += C_m[mm]      * dtrig;
+        }
+        if(hess) {
+            hess[SPH_DR2]       += C_m[mm+nm*3] *   trig;
+            hess[SPH_DRDTHETA]  += C_m[mm+nm*4] *   trig;
+            hess[SPH_DTHETA2]   += C_m[mm+nm*5] *   trig;
+            hess[SPH_DRDPHI]    += C_m[mm+nm  ] *  dtrig;
+            hess[SPH_DTHETADPHI]+= C_m[mm+nm*2] *  dtrig;
+            hess[SPH_DPHI2]     += C_m[mm]      * d2trig;
+        }
+    }
+}
+
 
 /** Spherical-harmonic expansion of density with coefficients being spline functions of radius */
 class DensitySphericalHarmonic: public BaseDensity {

@@ -663,56 +663,34 @@ PtrPotential initAsympt(const std::vector<double>& radii,
     first come the nm potential harmonics, then nm harmonics for dPhi/dr, and so on.
     How many quantities are processed is determined by grad and hess being NULL or non-NULL.
 */
+// Thin wrapper over the device-callable leaf fourierTransformAzimuthT() in
+// potential_multipole.h -- one source of math (CLAUDE.md constraint 5). The only
+// work done here is allocating the trig scratch on the stack (so the CPU path
+// stays uncapped in mmax, as upstream) and unpacking the leaf's plain-array
+// outputs into coord::GradSph / coord::HessSph. Both are copies, not arithmetic,
+// so the result is bit-for-bit what the pre-refactor body produced.
 void fourierTransformAzimuth(const math::SphHarmIndices& ind, const double phi,
     const double C_m[], double *val, coord::GradSph *grad, coord::HessSph *hess)
 {
-    const int numQuantities = hess!=NULL ? 6 : grad!=NULL ? 3 : 1;  // number of quantities in C_m
-    const int mmin = ind.mmin();
-    const int nm = ind.mmax - mmin + 1;  // number of azimuthal harmonics in C_m array
-    // first assign the m=0 harmonic, which is the only one in the axisymmetric case
-    if(val)
-        *val = C_m[-mmin];
+    const int numQuantities = hess!=NULL ? 6 : grad!=NULL ? 3 : 1;
+    const bool useSine = ind.mmin()<0 || numQuantities>1;
+    double* trig_m = ind.mmax > 0
+        ? static_cast<double*>(alloca(ind.mmax*(1+useSine) * sizeof(double))) : NULL;
+    double g[3], h[6];
+    fourierTransformAzimuthT<double>(ind.pod(), phi, C_m, trig_m,
+        val, grad ? g : NULL, hess ? h : NULL);
     if(grad) {
-        grad->dr      = C_m[-mmin+nm];
-        grad->dtheta  = C_m[-mmin+nm*2];
-        grad->dphi    = 0;
+        grad->dr       = g[SPH_DR];
+        grad->dtheta   = g[SPH_DTHETA];
+        grad->dphi     = g[SPH_DPHI];
     }
     if(hess) {
-        hess->dr2     = C_m[-mmin+nm*3];
-        hess->drdtheta= C_m[-mmin+nm*4];
-        hess->dtheta2 = C_m[-mmin+nm*5];
-        hess->drdphi  = hess->dthetadphi = hess->dphi2 = 0;
-    }
-    if(ind.mmax == 0)
-        return;
-    const bool useSine = mmin<0 || numQuantities>1;
-    // temporary storage for trigonometric functions - allocated on the stack, automatically freed
-    double* trig_m = static_cast<double*>(alloca(ind.mmax*(1+useSine) * sizeof(double)));
-    math::trigMultiAngle(phi, ind.mmax, useSine, trig_m);
-    for(int mm=0; mm<nm; mm++) {
-        int m = mm + mmin;
-        if(m==0)
-            continue;  // the m=0 terms were set at the beginning
-        if(ind.lmin(m)>ind.lmax)
-            continue;  // empty harmonic
-        double trig  = m>0 ? trig_m[m-1] : trig_m[ind.mmax-m-1];  // cos or sin
-        double dtrig = m>0 ? -m*trig_m[ind.mmax+m-1] : -m*trig_m[-m-1];
-        double d2trig = -m*m*trig;
-        if(val)
-            *val += C_m[mm] * trig;
-        if(grad) {
-            grad->dr     += C_m[mm+nm  ] *  trig;
-            grad->dtheta += C_m[mm+nm*2] *  trig;
-            grad->dphi   += C_m[mm]      * dtrig;
-        }
-        if(hess) {
-            hess->dr2       += C_m[mm+nm*3] *   trig;
-            hess->drdtheta  += C_m[mm+nm*4] *   trig;
-            hess->dtheta2   += C_m[mm+nm*5] *   trig;
-            hess->drdphi    += C_m[mm+nm  ] *  dtrig;
-            hess->dthetadphi+= C_m[mm+nm*2] *  dtrig;
-            hess->dphi2     += C_m[mm]      * d2trig;
-        }
+        hess->dr2      = h[SPH_DR2];
+        hess->drdtheta = h[SPH_DRDTHETA];
+        hess->dtheta2  = h[SPH_DTHETA2];
+        hess->drdphi   = h[SPH_DRDPHI];
+        hess->dthetadphi = h[SPH_DTHETADPHI];
+        hess->dphi2    = h[SPH_DPHI2];
     }
 }
 
