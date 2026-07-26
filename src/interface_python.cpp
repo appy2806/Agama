@@ -1674,11 +1674,20 @@ PyObject* allocateOutput(npy_intp numPoints, double* buffer[3]=NULL, int C=0)
 /// backend, and which users would otherwise have to discover by measurement.
 #define DOCSTRING_DEVICE_PARAMS \
     "  device=...  (optional, default 'cpu') which backend evaluates the batch:\n" \
-    "    'cpu'    the ordinary OpenMP-parallel path -- identical to omitting the " \
-    "argument, bit for bit.\n" \
+    "    'cpu'    the batch path, OpenMP-parallel across all cores.\n" \
     "    'openmp' explicit alias of 'cpu'.\n" \
-    "    'serial' single-threaded loop, for debugging and baselining.\n" \
+    "    'serial' the batch path, single-threaded, for debugging and baselining.\n" \
     "    'cuda'   NVIDIA GPU. Requires a build with HAVE_CUDA=1, else RuntimeError.\n" \
+    "    Passing device= selects the batch code path for ALL four values, including " \
+    "'cpu' -- it is not merely a threading switch. Two consequences worth knowing. " \
+    "First, results can differ from the no-kwarg call in the last bits: identical for " \
+    "the analytic potentials' potential values, but measured up to ~2 ULP for forces and " \
+    "for Multipole, because the batch path is a separate transcription of the same " \
+    "formulas (they will converge once the single-point bodies are reduced to wrappers " \
+    "over the shared leaves). Second, a potential the batch path cannot represent raises " \
+    "NotImplementedError for device='cpu' just as it does for 'cuda', even though " \
+    "omitting the argument entirely would have worked -- e.g. a Multipole of order above " \
+    "32. Omit device= to get the unrestricted legacy path.\n" \
     "    Not every potential type can run on the GPU, and for Multipole, Dehnen and " \
     "DiskAnsatz the answer depends on the particular instance rather than the type " \
     "(Multipole: expansion order at most 32; Dehnen: spherical only; DiskAnsatz: not " \
