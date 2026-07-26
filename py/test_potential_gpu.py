@@ -808,7 +808,69 @@ def multipole_fail_closed_test():
         except Exception as e:
             print(f"  FAIL above-cap Multipole CPU path: {type(e).__name__}: {e}")
             all_ok = False
-    # (c) the OTHER Tier 2 expansion, CylSpline, must still be refused by name --
+    # (c) THE DESCRIPTOR-CAPACITY CAPS, and the only shape that can reach them.
+    #     A bare Composite of Multipoles is unlimited on the GPU (see (a)), so the
+    #     caps bind only where ONE descriptor must hold the whole potential: a
+    #     modifier wrapping a composite. That is reachable from Python only through
+    #     the `potential=<Potential object>` keyword form -- passing dicts
+    #     positionally alongside center= is a constructor TypeError, which is easy
+    #     to mistake for the code path being unreachable. Both caps must produce an
+    #     ACTIONABLE reason, since every member is individually GPU-capable and the
+    #     bare type name explains nothing.
+    for count, limit_name, ok_count in ((5, 'GPU_POT_MAX_MULTIPOLE', 4),
+                                        (17, 'GPU_POT_DESC_MAX_TERMS', 16)):
+        if limit_name == 'GPU_POT_MAX_MULTIPOLE':
+            members = [agama.Potential(type='Multipole', density='Spheroid', gamma=1,
+                                       beta=4, scaleRadius=1 + 0.1 * i, axisRatioY=0.8,
+                                       axisRatioZ=0.6, lmax=4, mmax=4, gridSizeR=20)
+                       for i in range(count)]
+        else:
+            members = [agama.Potential(type='NFW', mass=10.0 + i, scaleRadius=5.0 + i)
+                       for i in range(count)]
+        try:
+            over_cap = agama.Potential(potential=agama.Potential(*members),
+                                       center=[0.1, 0.2, 0.3])
+            under_cap = agama.Potential(potential=agama.Potential(*members[:ok_count]),
+                                        center=[0.1, 0.2, 0.3])
+        except Exception as e:
+            print(f"  FAIL modifier-over-composite construction ({limit_name}): "
+                  f"{type(e).__name__}: {e}")
+            all_ok = False
+            continue
+        try:
+            under_cap.potential(xyz, device='cuda')
+            print(f"  OK   modifier over composite of {ok_count} runs on the GPU "
+                  f"(at the {limit_name} limit, not over it)")
+        except NotImplementedError as e:
+            print(f"  FAIL modifier over composite of {ok_count} was REFUSED, but it is "
+                  f"within {limit_name}: {e}")
+            all_ok = False
+        except RuntimeError as e:
+            if "without CUDA support" in str(e):
+                print(f"  SKIP {limit_name}: library built with HAVE_CUDA=0")
+                continue
+            print(f"  FAIL {limit_name} under-cap case: RuntimeError: {e}")
+            all_ok = False
+            continue
+        try:
+            over_cap.potential(xyz, device='cuda')
+            print(f"  FAIL modifier over composite of {count} was ACCEPTED, exceeding "
+                  f"{limit_name}")
+            all_ok = False
+        except NotImplementedError as e:
+            msg = str(e)
+            # The reason must reach THROUGH the modifier wrapper. It previously did
+            # not: unsupportedGPUPotentialReason recursed into Composite but not
+            # into the four modifier wrappers, so this -- the one shape that can
+            # actually exhaust the descriptor -- got no explanation at all.
+            informative = limit_name in msg and str(count) in msg
+            print(f"  {'OK  ' if informative else 'FAIL'} modifier over composite of "
+                  f"{count} -> reason names {limit_name}: {msg[-150:]}")
+            all_ok = all_ok and informative
+        except Exception as e:
+            print(f"  FAIL {limit_name} over-cap case: {type(e).__name__}: {e}")
+            all_ok = False
+    # (d) the OTHER Tier 2 expansion, CylSpline, must still be refused by name --
     #     adding GPU_POT_MULTIPOLE must not have widened capability to BFEs in general
     cs = agama.Potential(type='CylSpline', density='Disk', surfaceDensity=1.0,
                          scaleRadius=2.0, scaleHeight=0.3, mmax=0,

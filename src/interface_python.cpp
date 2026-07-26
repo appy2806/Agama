@@ -1693,8 +1693,15 @@ PyObject* allocateOutput(npy_intp numPoints, double* buffer[3]=NULL, int C=0)
     "throughput is 1/64 of fp32 (measured 9-10x faster than fp64 for Multipole on an " \
     "RTX 3080 Laptop). Coefficient tables are always stored in double and narrowed on " \
     "upload.\n" \
+    "    DENSITY OF AN EXPANSION ON OR NEAR THE z AXIS is inaccurate in EVERY precision " \
+    "and on every backend, including float64 and device='cpu'. Measured on an exactly " \
+    "z-symmetric Multipole, the CPU path disagrees with ITSELF by ~2e-4 relative between " \
+    "+z and -z at R=0, which is the algorithm's own noise floor there rather than a " \
+    "backend difference; float32 on the axis can lose all significance for mmax>0 models. " \
+    "Treat on-axis expansion densities as approximate, or evaluate slightly off-axis.\n" \
     "    ACCURACY IN float32, measured against the float64 path on a realistic MW-like " \
-    "Multipole: potential ~1e-6, force ~1e-3, but IN-GRID DENSITY ONLY ~2e-3 to 5e-2. " \
+    "Multipole away from the axis: potential ~1e-6, force ~1e-3, but IN-GRID DENSITY ONLY " \
+    "~2e-3 to 5e-2. " \
     "The density figure is not a GPU defect and is not improved by using device='cpu': " \
     "inside the radial grid the density of an expansion is recovered as the cylindrical " \
     "Laplacian of the potential, i.e. four cancelling second derivatives, and the " \

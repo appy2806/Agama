@@ -531,12 +531,57 @@ std::string unsupportedGPUPotentialName(const BasePotential& pot)
     return pot.name();
 }
 
+/** Count the leaf terms and the Multipole terms a descriptor would need for `pot`,
+    walking composites and modifier wrappers exactly as buildGpuPotDesc does. Used
+    only to explain a rejection, so it counts shape and does not judge capability. */
+void countDescTerms(const BasePotential& pot, int& nterms, int& nmp)
+{
+    if(const BaseComposite<BasePotential>* c =
+        dynamic_cast<const BaseComposite<BasePotential>*>(&pot))
+    {
+        for(unsigned int i = 0; i < c->size(); i++)
+            countDescTerms(*c->component(i), nterms, nmp);
+        return;
+    }
+    nterms++;
+    if(dynamic_cast<const Multipole*>(&pot) != NULL)
+        nmp++;
+}
+
 std::string unsupportedGPUPotentialReason(const BasePotential& pot)
 {
-    if(const Composite* comp = dynamic_cast<const Composite*>(&pot)) {
+    // Composites AND the four modifier wrappers all derive from
+    // BaseComposite<BasePotential>, so one recursion covers both. Recursing through
+    // the modifiers matters: without it a Shifted(Composite of N Multipoles) -- the
+    // only shape that can actually exhaust the descriptor's side table -- produced
+    // no reason at all, because the wrapper is not a Composite.
+    if(const BaseComposite<BasePotential>* comp =
+        dynamic_cast<const BaseComposite<BasePotential>*>(&pot))
+    {
         for(unsigned int c = 0; c < comp->size(); c++)
             if(!can_dispatch(*comp->component(c)))
                 return unsupportedGPUPotentialReason(*comp->component(c));
+        // Every member is individually dispatchable, yet the whole thing is not.
+        // For a modifier chain that is the interesting case: the chain plus
+        // everything it wraps must collapse into ONE descriptor, so the per-member
+        // dispatch that makes a bare Composite unlimited does not apply here.
+        int nterms = 0, nmp = 0;
+        countDescTerms(pot, nterms, nmp);
+        if(nmp > GPU_POT_MAX_MULTIPOLE)
+            return "every member is individually GPU-capable, but a modifier chain "
+                "must collapse into a single descriptor, and this one needs " +
+                std::to_string(nmp) + " Multipole slots against a limit of " +
+                std::to_string(int(GPU_POT_MAX_MULTIPOLE)) +
+                " (GPU_POT_MAX_MULTIPOLE). Applying the modifier to each component "
+                "separately, rather than to the composite as a whole, avoids this";
+        if(nterms > GPU_POT_DESC_MAX_TERMS)
+            return "every member is individually GPU-capable, but a modifier chain "
+                "must collapse into a single descriptor, and this one needs " +
+                std::to_string(nterms) + " terms against a limit of " +
+                std::to_string(int(GPU_POT_DESC_MAX_TERMS)) +
+                " (GPU_POT_DESC_MAX_TERMS)";
+        // Neither count is the cause -- say nothing rather than guess.
+        return std::string();
     }
     // The three types below are GPU-capable per INSTANCE, not per type -- they are
     // deliberately absent from AGAMA_GPU_POT_LIST for exactly that reason (see
