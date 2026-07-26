@@ -1666,6 +1666,45 @@ PyObject* allocateOutput(npy_intp numPoints, double* buffer[3]=NULL, int C=0)
     "  scale=...  modification of mass and size scales of the model, " \
     "given either as two numbers or an array / file with time-dependent scaling factors.\n"
 
+/// Common fragment documenting the GPU-unification fork's `device=` / `dtype=`
+/// kwargs, shared by Potential.{potential,force,density} and Density.density.
+/// Kept as one macro so the accuracy guidance cannot drift between the three
+/// methods that offer it -- in particular the fp32 density caveat, which is a
+/// property of the CPU algorithm and therefore applies identically on every
+/// backend, and which users would otherwise have to discover by measurement.
+#define DOCSTRING_DEVICE_PARAMS \
+    "  device=...  (optional, default 'cpu') which backend evaluates the batch:\n" \
+    "    'cpu'    the ordinary OpenMP-parallel path -- identical to omitting the " \
+    "argument, bit for bit.\n" \
+    "    'openmp' explicit alias of 'cpu'.\n" \
+    "    'serial' single-threaded loop, for debugging and baselining.\n" \
+    "    'cuda'   NVIDIA GPU. Requires a build with HAVE_CUDA=1, else RuntimeError.\n" \
+    "    Not every potential type can run on the GPU, and for Multipole, Dehnen and " \
+    "DiskAnsatz the answer depends on the particular instance rather than the type " \
+    "(Multipole: expansion order at most 32; Dehnen: spherical only; DiskAnsatz: not " \
+    "with user-supplied profile functions). An unsupported case raises " \
+    "NotImplementedError naming the type and, where applicable, the specific reason " \
+    "-- it never silently falls back, so a passing call is proof the GPU ran it.\n" \
+    "  dtype=...  (optional, default numpy.float64) working precision of the device " \
+    "computation, numpy.float64 or numpy.float32. Only meaningful alongside device=...; " \
+    "on its own it raises TypeError. Honoured for single-point input too, which then " \
+    "returns a float32 scalar.\n" \
+    "    float32 is worth using on consumer and Ada-generation cards, whose fp64 " \
+    "throughput is 1/64 of fp32 (measured 9-10x faster than fp64 for Multipole on an " \
+    "RTX 3080 Laptop). Coefficient tables are always stored in double and narrowed on " \
+    "upload.\n" \
+    "    ACCURACY IN float32, measured against the float64 path on a realistic MW-like " \
+    "Multipole: potential ~1e-6, force ~1e-3, but IN-GRID DENSITY ONLY ~2e-3 to 5e-2. " \
+    "The density figure is not a GPU defect and is not improved by using device='cpu': " \
+    "inside the radial grid the density of an expansion is recovered as the cylindrical " \
+    "Laplacian of the potential, i.e. four cancelling second derivatives, and the " \
+    "algorithm's own cutoff scales as eps^(2/3) -- 2.4e-5 in float32 against 4e-11 in " \
+    "float64. Outside the grid the closed-form power-law density is used instead and the " \
+    "error falls to ~1e-6. If you need in-grid densities, use float64.\n" \
+    "  Passing a CuPy array (or anything exposing __cuda_array_interface__ -- PyTorch, " \
+    "Numba, JAX) as the input skips the host-to-device copy and returns a CuPy array, " \
+    "keeping the whole computation device-resident.\n"
+
 /// description of Density class
 static const char* docstringDensity =
     "Density is a class representing a variety of density profiles "
@@ -2465,7 +2504,12 @@ static PyMethodDef Density_methods[] = {
     { "density", (PyCFunction)Density_density, METH_VARARGS | METH_KEYWORDS,
       "Compute density at a given point or array of points\n"
       "Arguments: a triplet of floats (x,y,z) or a 2d Nx3 array; optionally t=... (time)\n"
-      "Returns: float or array of floats" },
+      "Returns: float or array of floats\n"
+      "Backend selection (GPU-unification fork). Note that device= needs the underlying "
+      "object to be a GPU-migrated Potential; a density-only model raises "
+      "NotImplementedError, since the GPU batch path evaluates densities through the "
+      "potential classes:\n"
+      DOCSTRING_DEVICE_PARAMS },
     { "projectedDensity", (PyCFunction)Density_projectedDensity, METH_VARARGS | METH_KEYWORDS,
       "Compute surface density at a given point or array of points\n"
       "Positional arguments:\n"
@@ -4326,12 +4370,16 @@ static PyMethodDef Potential_methods[] = {
     { "potential", (PyCFunction)Potential_potential, METH_VARARGS | METH_KEYWORDS,
       "Compute potential at a given point or array of points\n"
       "Arguments: a triplet of floats (x,y,z) or array of such triplets; optionally t=... (time)\n"
-      "Returns: float or array of floats" },
+      "Returns: float or array of floats\n"
+      "Backend selection (GPU-unification fork):\n"
+      DOCSTRING_DEVICE_PARAMS },
     { "force", (PyCFunction)Potential_force, METH_VARARGS | METH_KEYWORDS,
       "Compute force per unit mass (i.e. acceleration, -dPhi/dx) "
       "at a given point or array of points\n"
       "Arguments: a triplet of floats (x,y,z) or array of such triplets; optionally t=... (time)\n"
-      "Returns: float[3] - x,y,z components of force, or array of such triplets" },
+      "Returns: float[3] - x,y,z components of force, or array of such triplets\n"
+      "Backend selection (GPU-unification fork):\n"
+      DOCSTRING_DEVICE_PARAMS },
     { "forceDeriv", (PyCFunction)Potential_forceDeriv, METH_VARARGS | METH_KEYWORDS,
       "Compute force per unit mass and its derivatives at a given point or array of points.\n"
       "Deprecated - use the more general method Potential.eval(..., acc=True, der=True).\n"
