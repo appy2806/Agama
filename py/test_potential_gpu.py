@@ -656,44 +656,85 @@ def multipole_orbit_test():
     ic[:, 5] = rng.uniform(-0.1, 0.1, N) * vc
     T, NS = 40.0, 33
     all_ok = True
+
+    def energy(w, dt):
+        # Reference Phi always in fp64: we are measuring the integrator's drift,
+        # not the potential evaluation's precision.
+        w64 = np.asarray(w, dtype=np.float64)
+        return pot.potential(w64[:, :3]) + 0.5 * np.sum(w64[:, 3:] ** 2, axis=1)
+
     try:
         tc, wc = agama.orbit(potential=pot, ic=ic, time=T, trajsize=NS,
                              separateTime=True)
+        wc = np.asarray(wc)
+    except Exception as e:
+        print(f"  FAIL CPU reference orbit: {type(e).__name__}: {e}")
+        return False
+
+    # All four combinations, because the compile-time problem that gates this is
+    # per-KERNEL: method is a host-side switch (DOP853 vs DPRKN8) and dtype selects
+    # another instantiation, so c658992 already has four REG:255 kernels in
+    # orbit_gpu.cpp. A fix that opens the gate for one of them has not opened it.
+    # Trajectory tolerances are loose for fp32 on purpose: these are ADAPTIVE
+    # integrators, so the two backends take different step sequences and the
+    # trajectory comparison is a smoke test. Energy conservation is the invariant
+    # that has to hold regardless, and it is the tighter gate here.
+    cases = [
+        ('dop853', np.float64, 1e-4, 1e-6),
+        ('dop853', np.float32, 5e-2, 5e-3),
+        ('dprkn8', np.float64, 1e-4, 1e-6),
+        ('dprkn8', np.float32, 5e-2, 5e-3),
+    ]
+    ran_any = False
+    for method, dtype, tol_traj, tol_E in cases:
+        label = f"{method} {dtype.__name__}"
         try:
             tg, wg = agama.orbit(potential=pot, ic=ic, time=T, trajsize=NS,
-                                 separateTime=True, device='cuda')
+                                 separateTime=True, device='cuda',
+                                 method=method, dtype=dtype)
         except NotImplementedError as e:
-            print(f"  OK   orbit device='cuda' on a Multipole falls back cleanly: "
-                  f"NotImplementedError: {str(e)[:110]}")
-            return True
+            # The documented fail-closed state. Acceptable, but say so per case so
+            # that a PARTIAL fix (one kernel opened, others not) is visible rather
+            # than looking like a uniform pass.
+            print(f"  OK   orbit {label:16s} falls back cleanly: "
+                  f"NotImplementedError: {str(e)[:78]}")
+            continue
         except RuntimeError as e:
             if "without CUDA support" in str(e):
                 print("  SKIP orbit device='cuda': library built with HAVE_CUDA=0")
                 return True
-            print(f"  FAIL orbit device='cuda': RuntimeError: {e}")
-            return False
+            print(f"  FAIL orbit {label}: RuntimeError: {e}")
+            all_ok = False
+            continue
         except Exception as e:
-            print(f"  FAIL orbit device='cuda': {type(e).__name__}: {e}")
-            return False
-        wc = np.asarray(wc)
-        wg = np.asarray(wg)
+            print(f"  FAIL orbit {label}: {type(e).__name__}: {e}")
+            all_ok = False
+            continue
+        ran_any = True
+        wg = np.asarray(wg, dtype=np.float64)
+        if wg.shape != wc.shape:
+            print(f"  FAIL orbit {label}: shape {wg.shape} != CPU {wc.shape}")
+            all_ok = False
+            continue
+        finite = bool(np.all(np.isfinite(wg)))
         scale = np.max(np.abs(wc), axis=2, keepdims=True)
         rel = float(np.max(np.abs(wg - wc) / np.maximum(scale, 1e-300)))
-        ok = rel <= 1e-4
-        print(f"  {'OK  ' if ok else 'FAIL'} cuda vs cpu trajectories (N={N}, T={T}, "
-              f"{NS} samples): max rel = {rel:.3e}  tol = 1.0e-04")
-        all_ok = all_ok and ok
-        # energy conservation of the GPU trajectories (absolute quality gate)
-        def energy(w):
-            return pot.potential(w[:, :3]) + 0.5 * np.sum(w[:, 3:] ** 2, axis=1)
-        dE = np.abs((energy(wg[:, -1, :]) - energy(wg[:, 0, :])) / energy(wg[:, 0, :]))
-        okE = float(np.max(dE)) <= 1e-6 and not np.any(np.isnan(wg))
-        print(f"  {'OK  ' if okE else 'FAIL'} cuda energy conservation: max |dE/E| = "
-              f"{float(np.max(dE)):.3e}  tol = 1.0e-06, NaN: {bool(np.any(np.isnan(wg)))}")
+        okT = finite and rel <= tol_traj
+        print(f"  {'OK  ' if okT else 'FAIL'} orbit {label:16s} vs cpu trajectories "
+              f"(N={N}, T={T}, {NS} samples): max rel = {rel:.3e}  tol = {tol_traj:.1e}"
+              + ("" if finite else "   NON-FINITE VALUES PRESENT"))
+        all_ok = all_ok and okT
+        e0 = energy(wg[:, 0, :], dtype)
+        dE = np.abs((energy(wg[:, -1, :], dtype) - e0) / e0)
+        okE = float(np.max(dE)) <= tol_E and finite
+        print(f"  {'OK  ' if okE else 'FAIL'} orbit {label:16s} energy conservation: "
+              f"max |dE/E| = {float(np.max(dE)):.3e}  tol = {tol_E:.1e}")
         all_ok = all_ok and okE
-    except Exception as e:
-        print(f"  FAIL orbit test: {type(e).__name__}: {e}")
-        all_ok = False
+
+    if not ran_any:
+        print("  INFO no Multipole orbit case runs on the GPU yet -- the fail-closed "
+              "gate in prepareOrbitBatch is still in place (compile time, see "
+              "orbit_gpu.cpp). This test becomes the acceptance gate when it opens.")
     return all_ok
 
 
