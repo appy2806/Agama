@@ -311,6 +311,109 @@ AGAMA_DEVICE_INLINE void evalCubicSplineRaw(const NumT x,
         value, deriv, deriv2, deriv3);
 }
 
+/** Device-callable 2d cubic-spline evaluation from RAW coefficient pointers -- the
+    stateless core of CubicSpline2d::evalDeriv (which is now a thin wrapper over
+    this, keeping its host-side throw on an empty spline), mirroring
+    evalQuinticSpline2dRaw below (but with FOUR node arrays, not nine, and a
+    different intermediate-spline structure -- the cubic case only ever needs
+    value + first derivative at each corner, never a second derivative input).
+
+    `xval[nx]`/`yval[ny]` are the two 1d grids; the remaining four arrays are the
+    flattened row-major nx*ny node data exactly as BaseInterpolator2d/CubicSpline2d
+    store them: fval (function value), fx/fy (1st derivatives) and fxy (mixed 2nd
+    derivative). Any of the six output pointers may be NULL.
+
+    Preserves two details verbatim from CubicSpline2d::evalDeriv:
+    - the f_offset corner-value subtraction (picks whichever of the 4 corners the query
+      point coincides with via the exact x==xupp / y==yupp comparisons) that avoids
+      roundoff in the intermediate spline evaluations -- added back via `*z += f_offset`
+      at exactly the same point in the control flow;
+    - the exact 4-element flow/fupp/dflow/dfupp packing order, and the der/der2 flags
+      that skip computing dF/d2F when the caller didn't ask for any derivative that needs
+      them.
+
+    Out-of-grid behaviour: NaN, matching what CubicSpline2d::evalDeriv gets from its own
+    fillVals(...) calls (both default to NAN). An empty spline (nx==0 or ny==0) also
+    yields NaN here -- a device kernel cannot throw, so this replaces the class version's
+    `throw std::length_error("Empty 2d spline")`, exactly as evalCubicSplineRaw does for
+    its own empty case (and as evalQuinticSplineRaw/evalQuinticSpline2dRaw do below). */
+template<typename NumT>
+AGAMA_DEVICE_INLINE void evalCubicSpline2dRaw(const NumT x, const NumT y,
+    const NumT* xval, const NumT* yval, const int nx, const int ny,
+    const NumT* fval, const NumT* fx, const NumT* fy, const NumT* fxy,
+    typename nondeduced<NumT>::type* z,
+    typename nondeduced<NumT>::type* z_x  = NULL,
+    typename nondeduced<NumT>::type* z_y  = NULL,
+    typename nondeduced<NumT>::type* z_xx = NULL,
+    typename nondeduced<NumT>::type* z_xy = NULL,
+    typename nondeduced<NumT>::type* z_yy = NULL)
+{
+    if(nx == 0 || ny == 0) {            // empty spline: NaN instead of throwing (device-safe)
+        if(z)    *z    = NAN;
+        if(z_x)  *z_x  = NAN;
+        if(z_y)  *z_y  = NAN;
+        if(z_xx) *z_xx = NAN;
+        if(z_xy) *z_xy = NAN;
+        if(z_yy) *z_yy = NAN;
+        return;
+    }
+    const ptrdiff_t
+        // indices of grid cell in x and y
+        xi = binSearch(x, xval, static_cast<size_t>(nx)),
+        yi = binSearch(y, yval, static_cast<size_t>(ny)),
+        // indices in flattened 2d arrays:
+        ill = xi * ny + yi, // xlow,ylow
+        ilu = ill + 1,      // xlow,yupp
+        iul = ill + ny,     // xupp,ylow
+        iuu = iul + 1;      // xupp,yupp
+    if(xi<0 || xi>=nx-1 || yi<0 || yi>=ny-1) {
+        if(z)    *z    = NAN;
+        if(z_x)  *z_x  = NAN;
+        if(z_y)  *z_y  = NAN;
+        if(z_xx) *z_xx = NAN;
+        if(z_xy) *z_xy = NAN;
+        if(z_yy) *z_yy = NAN;
+        return;
+    }
+    bool der  = z_y!=NULL || z_xy!=NULL;
+    bool der2 = z_yy!=NULL;
+    const NumT
+        // coordinates of corner points
+        xlow = xval[xi],
+        xupp = xval[xi+1],
+        ylow = yval[yi],
+        yupp = yval[yi+1],
+        // shift the four corner points by the same offset (pick up one of the four corner values),
+        // to avoid roundoff errors in intermediate calculations; add it back to final output
+        f_offset = x==xupp ? (y==yupp ? fval[iuu] : fval[iul]) : (y==yupp ? fval[ilu] : fval[ill]),
+        fval_ill = fval[ill] - f_offset,
+        fval_iul = fval[iul] - f_offset,
+        fval_ilu = fval[ilu] - f_offset,
+        fval_iuu = fval[iuu] - f_offset,
+        // values and derivatives for the intermediate Hermite splines
+        flow [4] = { fval_ill , fval_iul , fx [ill], fx [iul] },
+        fupp [4] = { fval_ilu , fval_iuu , fx [ilu], fx [iuu] },
+        dflow[4] = { fy  [ill], fy  [iul], fxy[ill], fxy[iul] },
+        dfupp[4] = { fy  [ilu], fy  [iuu], fxy[ilu], fxy[iuu] };
+    NumT F  [4];  // {   f    (xlow, y),   f    (xupp, y),  df/dx   (xlow, y),  df/dx   (xupp, y) }
+    NumT dF [4];  // {  df/dy (xlow, y),  df/dy (xupp, y), d2f/dxdy (xlow, y), d2f/dxdy (xupp, y) }
+    NumT d2F[4];  // { d2f/dy2(xlow, y), d2f/dy2(xupp, y), d3f/dxdy2(xlow, y), d3f/dxdy2(xupp, y) }
+    // intermediate interpolation along y direction
+    evalCubicSplines<4> (y, ylow, yupp, flow, fupp, dflow, dfupp,
+        /*output*/ F, der? dF : NULL, der2? d2F : NULL);
+    // final interpolation along x direction
+    evalCubicSplines<1> (x, xlow, xupp, &F[0], &F[1], &F[2], &F[3],
+        /*output*/ z, z_x, z_xx);
+    if(z)
+        *z += f_offset;
+    if(der)
+        evalCubicSplines<1> (x, xlow, xupp, &dF[0], &dF[1], &dF[2], &dF[3],
+            /*output*/ z_y, z_xy, NULL);
+    if(der2)
+        evalCubicSplines<1> (x, xlow, xupp, &d2F[0], &d2F[1], &d2F[2], &d2F[3],
+            /*output*/ z_yy, NULL, NULL);
+}
+
 /** Device-callable quintic-spline evaluation from RAW coefficient pointers -- the
     stateless core of QuinticSpline::evalDeriv (which is now a one-line wrapper over
     this), mirroring evalCubicSplineRaw above. The knots `xval[size]`, node values
@@ -1281,6 +1384,16 @@ public:
     virtual void evalDeriv(double x, double y,
         double* value=NULL, double* deriv_x=NULL, double* deriv_y=NULL,
         double* deriv_xx=NULL, double* deriv_xy=NULL, double* deriv_yy=NULL) const;
+
+    /** Raw flattened-array accessors, one per argument (after x/y grids, which are
+        already exposed by the inherited xvalues()/yvalues()) of evalCubicSpline2dRaw().
+        Exposed so a device-resident evaluator can be handed the four coefficient
+        arrays directly, without going through the object -- mirroring QuinticSpline2d::
+        fvalues()/dfdx()/dfdy()/d2fdxdy() and CubicSpline::fvalues()/fderivs(). */
+    const std::vector<double>& fvalues() const { return fval; }   ///< f(x,y)
+    const std::vector<double>& dfdx()    const { return fx; }     ///< df/dx
+    const std::vector<double>& dfdy()    const { return fy; }     ///< df/dy
+    const std::vector<double>& d2fdxdy() const { return fxy; }    ///< d2f/dxdy
 
 private:
     /// flattened 2d arrays of derivatives in x and y directions, and mixed 2nd derivatives

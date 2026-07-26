@@ -2098,61 +2098,17 @@ CubicSpline2d::CubicSpline2d(
 void CubicSpline2d::evalDeriv(const double x, const double y,
     double *z, double *z_x, double *z_y, double *z_xx, double *z_xy, double *z_yy) const
 {
+    // host-side behaviour is preserved bit-for-bit, including the throw on an empty
+    // spline: the raw evaluator (device-callable, so it cannot throw) returns NaN for
+    // this case instead, but the host wrapper still throws before ever calling it.
     if(fval.empty())
         throw std::length_error("Empty 2d spline");
-    const int
-        nx = xval.size(),
-        ny = yval.size(),
-        // indices of grid cell in x and y
-        xi = binSearch(x, &xval.front(), nx),
-        yi = binSearch(y, &yval.front(), ny),
-        // indices in flattened 2d arrays:
-        ill = xi * ny + yi, // xlow,ylow
-        ilu = ill + 1,      // xlow,yupp
-        iul = ill + ny,     // xupp,ylow
-        iuu = iul + 1;      // xupp,yupp
-    if(xi<0 || xi>=nx-1 || yi<0 || yi>=ny-1) {
-        fillVals(z, z_x, z_y);
-        fillVals(z_xx, z_xy, z_yy);
-        return;
-    }
-    const double
-        // coordinates of corner points
-        xlow = xval[xi],
-        xupp = xval[xi+1],
-        ylow = yval[yi],
-        yupp = yval[yi+1],
-        // shift the four corner points by the same offset (pick up one of the four corner values),
-        // to avoid roundoff errors in intermediate calculations; add it back to final output
-        f_offset = x==xupp ? (y==yupp ? fval[iuu] : fval[iul]) : (y==yupp ? fval[ilu] : fval[ill]),
-        fval_ill = fval[ill] - f_offset,
-        fval_iul = fval[iul] - f_offset,
-        fval_ilu = fval[ilu] - f_offset,
-        fval_iuu = fval[iuu] - f_offset,
-        // values and derivatives for the intermediate Hermite splines
-        flow  [4] = { fval_ill , fval_iul , fx [ill], fx [iul] },
-        fupp  [4] = { fval_ilu , fval_iuu , fx [ilu], fx [iuu] },
-        dflow [4] = { fy  [ill], fy  [iul], fxy[ill], fxy[iul] },
-        dfupp [4] = { fy  [ilu], fy  [iuu], fxy[ilu], fxy[iuu] };
-    double F  [4];  // {   f    (xlow, y),   f    (xupp, y),  df/dx   (xlow, y),  df/dx   (xupp, y) }
-    double dF [4];  // {  df/dy (xlow, y),  df/dy (xupp, y), d2f/dxdy (xlow, y), d2f/dxdy (xupp, y) }
-    double d2F[4];  // { d2f/dy2(xlow, y), d2f/dy2(xupp, y), d3f/dxdy2(xlow, y), d3f/dxdy2(xupp, y) }
-    bool der  = z_y!=NULL || z_xy!=NULL;
-    bool der2 = z_yy!=NULL;
-    // intermediate interpolation along y direction
-    evalCubicSplines<4> (y, ylow, yupp, flow, fupp, dflow, dfupp,
-        /*output*/ F, der? dF : NULL, der2? d2F : NULL);
-    // final interpolation along x direction
-    evalCubicSplines<1> (x, xlow, xupp, &F[0], &F[1], &F[2], &F[3],
-        /*output*/ z, z_x, z_xx);
-    if(z)
-        *z += f_offset;
-    if(der)
-        evalCubicSplines<1> (x, xlow, xupp, &dF[0], &dF[1], &dF[2], &dF[3],
-            /*output*/ z_y, z_xy, NULL);
-    if(der2)
-        evalCubicSplines<1> (x, xlow, xupp, &d2F[0], &d2F[1], &d2F[2], &d2F[3],
-            /*output*/ z_yy, NULL, NULL);
+    // single source of math: the stateless raw-pointer core lives in math_spline.h
+    // (device-callable); this method is the thin std::vector-backed wrapper.
+    evalCubicSpline2dRaw(x, y,
+        xval.data(), yval.data(), static_cast<int>(xval.size()), static_cast<int>(yval.size()),
+        fval.data(), fx.data(), fy.data(), fxy.data(),
+        z, z_x, z_y, z_xx, z_xy, z_yy);
 }
 
 
