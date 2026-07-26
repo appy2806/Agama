@@ -697,6 +697,57 @@ def multipole_orbit_test():
     return all_ok
 
 
+def multipole_near_axis_test():
+    """The near-axis regime, where CPU-vs-GPU parity is EXACT in one branch and
+    unachievable-by-construction in the other. Pins the first and documents the
+    second, so that neither gets silently traded away.
+
+    IN-GRID (MultipoleInterp2d): GPU must equal CPU BIT FOR BIT on and near the z
+    axis, at every R/z. That branch never calls sphHarmArray -- the l-dependence
+    lives in the tau grid of the 2D spline -- so there is nothing ill-conditioned
+    in it and any drift here is a real regression. Asserted at 0.0, not at a
+    tolerance.
+
+    ON THE POWERLAW ASYMPTOTES (r outside the radial grid), F_R near the axis is
+    NOT parity-testable and must not be added to any sweep:
+      * math_sphharm.h:292 forms dPlm = (l*ct*Plm - (l+m)*Plm1)/st, which for m=0
+        subtracts two O(1) quantities to get a result of order st^2 -- a ~13-digit
+        cancellation at st=1e-6. One ULP of host-vs-device codegen difference
+        becomes ~2e-4 relative, and sphToCylDerivs carries it into F_R undiluted.
+      * The CPU is wrong there too, by MORE than the GPU-CPU gap over most of the
+        window: F_R/R must tend to a constant as R->0, and the CPU's own value
+        drifts 1.65e-4 at R/z=1e-6, 1.04e-3 at 3e-7, and 59% at 1.778e-8, where
+        the GPU agrees with the CPU to ~1e-10.
+      * Absolute error stays <=3.4e-9 of |F| throughout, because F_R -> 0 on the
+        axis: a blowing-up relative error is a vanishing absolute one.
+    So a tolerance widened to accommodate it would be accommodating the CPU's
+    error, and "fixing" the GPU to match the CPU there fixes nothing physical.
+    Full measured record and the upstream EPS discussion in findings.md.
+    """
+    print("== Multipole near the z axis: exact in-grid, excluded on the asymptotes ==")
+    all_ok = True
+    pot = agama.Potential(type='Multipole', density='Dehnen', mass=1, scaleRadius=1,
+                          gamma=1, axisRatioY=0.5, axisRatioZ=0.2, gridSizeR=40,
+                          lmax=8, mmax=8)
+    z_in = 1e-2      # comfortably inside the radial grid for this model
+    for q in (1e-2, 1e-4, 1e-6, 1e-8, 0.0):
+        xyz = np.array([[q * z_in, 0.0, z_in]])
+        ref = pot.force(xyz, device='cpu', dtype=np.float64)
+        try:
+            got = pot.force(xyz, device='cuda', dtype=np.float64)
+        except RuntimeError as e:
+            if "without CUDA support" in str(e):
+                print("  SKIP near-axis in-grid: library built with HAVE_CUDA=0")
+                return True
+            raise
+        exact = bool(np.all(got == ref))
+        print(f"  {'OK  ' if exact else 'FAIL'} in-grid R/z={q:<8.1e} force GPU==CPU "
+              f"bitwise: {exact}"
+              + ("" if exact else f"  maxdiff={float(np.max(np.abs(got-ref))):.3e}"))
+        all_ok = all_ok and exact
+    return all_ok
+
+
 def multipole_fail_closed_test():
     """A Multipole shape the device path cannot represent must raise
     NotImplementedError (and leave the CPU path working), never produce a guessed
@@ -1307,6 +1358,9 @@ def main():
         all_ok = False
     print()
     if not multipole_fp32_budget():
+        all_ok = False
+    print()
+    if not multipole_near_axis_test():
         all_ok = False
     print()
     if not multipole_fail_closed_test():
