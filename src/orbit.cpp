@@ -222,27 +222,20 @@ void OrbitIntegrator<coord::Car>::eval2(const double timeOffset, const double xv
         math::sincos(Omega * (timeBegin + timeOffset), sa, ca);
     double Epot;
     coord::GradCar grad;
-    coord::HessCar hess;
     potential.eval(coord::PosCar(xv[0]*ca + xv[1]*sa, xv[1]*ca - xv[0]*sa, xv[2]),
         accFac ? &Epot : NULL,
         &grad,
-        /*only for Hermite integrator*/ d3xdt3 ? &hess : NULL,
+        /*hessian: no remaining integrator needs it*/ NULL,
         timeBegin + timeOffset);
     // time derivative of velocity
     d2xdt2[0] = -grad.dx*ca + grad.dy*sa;
     d2xdt2[1] = -grad.dy*ca - grad.dx*sa;
     d2xdt2[2] = -grad.dz;
-    if(d3xdt3) {
-        if(Omega)
-            throw std::runtime_error("Hermite integration in the rotating frame is not implemented");
-        // time derivative of acceleration;
-        // NB: although tedious, it can be (but is not) implemented for a rotating potential;
-        // however, for a time-dependent potential it cannot be implemented without knowing dPhi/dt
-        // (there is no way to check whether the potential is time-dependent!)
-        d3xdt3[0] = -hess.dx2  * xv[3] - hess.dxdy * xv[4] - hess.dxdz * xv[5];
-        d3xdt3[1] = -hess.dxdy * xv[3] - hess.dy2  * xv[4] - hess.dydz * xv[5];
-        d3xdt3[2] = -hess.dxdz * xv[3] - hess.dydz * xv[4] - hess.dz2  * xv[5];
-    }
+    // The jerk output is never requested: the Hermite integrator was the only consumer
+    // and has been removed, and every force2() call in DPRKN8 passes NULL. The parameter
+    // survives only because it is part of the Force2 concept that math_ode.h's
+    // device-callable cores and the GPU path share (math_ode.h:540).
+    (void)d3xdt3;
     if(accFac) {
         double Ekin = 0.5 * (pow_2(xv[3]) + pow_2(xv[4]) + pow_2(xv[5]));
         *accFac = fmin(1, fabs(Epot + Ekin) / fmax(fabs(Epot), Ekin));

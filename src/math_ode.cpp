@@ -43,7 +43,7 @@ struct OdeRhs {
 };
 
 /// adapter presenting IOdeSystem2ndOrder::eval2 as the Force2 callable expected by the
-/// header-only cores (dprkn8_step, hermite_step):
+/// header-only core (dprkn8_step):
 ///   void force2(T t, const T x[], T d2xdt2[], T* d3xdt3, T* af)
 struct OdeRhs2 {
     const IOdeSystem2ndOrder& sys;
@@ -134,49 +134,6 @@ double OdeStepperDPRKN8::getSol(double timeOffset, unsigned int ind) const
     if(ind >= (unsigned int)NDIM)
         throw std::out_of_range("OdeStepperDPRKN8: element index out of range");
     return dprkn8_dense(&state[0], NDIM, prevTimeStep, timeOffset, (int)ind);
-}
-
-
-/** --- 4th order Hermite scheme --- **/
-// The actual math lives in the header-only cores hermite_init / hermite_step / hermite_dense
-// (math_ode.h), shared with the GPU persistent orbit kernel; the class methods below are
-// thin wrappers providing the storage and the IOdeSystem2ndOrder-based force callables.
-
-OdeStepperHermite::OdeStepperHermite(const IOdeSystem2ndOrder& _odeSystem, double _accRel) :
-    odeSystem(_odeSystem),
-    NDIM(odeSystem.size()),
-    accRel(1.5 * pow(_accRel, 0.2)),  // empirical approximate match to dop853's accuracy parameter
-    prevTimeStep(0),
-    nextTimeStep(0),
-    state(NDIM * 5)
-{}
-
-void OdeStepperHermite::init(const double stateNew[])
-{
-    double *scratch = static_cast<double*>(alloca(NDIM*4 * sizeof(double)));
-    hermite_init(OdeRhs(odeSystem), NDIM, stateNew, accRel,
-        &state[0], nextTimeStep, scratch);
-}
-
-double OdeStepperHermite::doStep(double maxTimeStep)
-{
-    double timeStep = hermite_step(OdeRhs2(odeSystem), NDIM, accRel,
-        &state[0], nextTimeStep, maxTimeStep);
-    if(timeStep != 0)
-        prevTimeStep = timeStep;
-    return timeStep;
-}
-
-double OdeStepperHermite::getSol(double timeOffset, unsigned int ind) const
-{
-    unsigned int numVar = NDIM/2;  // dimension of either coordinate or momentum vector
-    int i = ind % numVar;
-    if(i >= NDIM)
-        throw std::out_of_range("OdeStepperHermite: element index out of range");
-    double h = timeOffset / prevTimeStep;
-    if(h<0 || h>1 || (prevTimeStep==0 && h!=0))
-        throw std::out_of_range("OdeStepperHermite: requested time is outside the last completed timestep");
-    return hermite_dense(&state[0], NDIM, prevTimeStep, timeOffset, (int)ind);
 }
 
 

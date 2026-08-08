@@ -8496,9 +8496,8 @@ static const char* docstringOrbit =
     "  dtype (optional, default 'float32'):  storage data type for trajectories and deviation vectors "
     "(available variants: 'float32', 'float64', 'complex64', 'complex128' or 'object', see below).\n"
     "  method (optional, string):  choice of the ODE integrator, available variants are "
-    "'dop853' (default; 8th order Runge-Kutta), 'dprkn8' (8th order Runge-Kutta-Nystrom method, "
-    "usually somewhat more efficient than dop853), or 'hermite' (4th order, might be more efficient "
-    "in the regime of low accuracy, but only works in static potentials).\n"
+    "'dop853' (default; 8th order Runge-Kutta) or 'dprkn8' (8th order Runge-Kutta-Nystrom method, "
+    "usually somewhat more efficient than dop853).\n"
     "  verbose (optional, default True):  whether to display progress when integrating multiple orbits.\n"
     "  separateTime (optional, default False, but in a future version will be changed to True): "
     "controls how the trajectories are returned, see below.\n"
@@ -8507,7 +8506,7 @@ static const char* docstringOrbit =
     "(GPU, one thread per orbit; requires a HAVE_CUDA=1 build). When given, all orbits are "
     "integrated in a single batch call sharing the same DOP853 core as the default path; "
     "only plain trajectory output is supported (trajsize >= 1, identical for all orbits; "
-    "no targets/der/lyapunov/Omega/method='hermite'). The potential must be GPU-capable "
+    "no targets/der/lyapunov/Omega). The potential must be GPU-capable "
     "(analytic types or a Composite of them), otherwise NotImplementedError is raised. "
     "Integration precision is float64 by default; passing dtype=float32 (or complex64) "
     "explicitly opts the integration itself into fp32 (useful on consumer GPUs with "
@@ -9068,8 +9067,13 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
     orbit::OrbitIntParams params;
     if(method_obj) {
         const char* method_str = PyString_AsString(method_obj);  // NULL if it's not a string
-        if(utils::stringsEqual(method_str, "hermite"))
-            params.method = orbit::OrbitIntParams::HERMITE;
+        if(utils::stringsEqual(method_str, "hermite")) {
+            PyErr_SetString(PyExc_ValueError,
+                "method='hermite' has been removed: it never outperformed 'dop853' or 'dprkn8' "
+                "in practice, and was incorrect for time-dependent or rotating potentials. "
+                "Use 'dop853' (default) or 'dprkn8'.");
+            return NULL;
+        }
         else if(utils::stringsEqual(method_str, "dprkn8"))
             params.method = orbit::OrbitIntParams::DPRKN8;
         else if(utils::stringsEqual(method_str, "dop853"))
@@ -9077,7 +9081,7 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
         else {
             if(!PyErr_Occurred())
                 PyErr_SetString(PyExc_ValueError,
-                    "Unknown ODE integation method (valid values are 'dop853', 'dprkn8' or 'hermite')");
+                    "Unknown ODE integation method (valid values are 'dop853' or 'dprkn8')");
             return NULL;
         }
     }
@@ -9108,8 +9112,6 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
             haveDer          ? "der=True" :
             haveLyapunov     ? "lyapunov=True" :
             Omega != 0       ? "a rotating frame (Omega != 0)" :
-            params.method == orbit::OrbitIntParams::HERMITE ?
-                "method='hermite' (needs the potential Hessian; use 'dop853' or 'dprkn8')" :
             dtype == NPY_OBJECT ? "dtype=object" :
             !haveTraj        ? "output without trajsize" :
             deviceOutput && !separateTime ?
@@ -9435,9 +9437,9 @@ PyObject* orbit(PyObject* /*self*/, PyObject* args, PyObject* namedArgs)
         // guaranteed to be overwritten by the kernel (real sample or NAN).
         std::unique_ptr<double[]> trajFlatD;
         std::unique_ptr<float[]>  trajFlatF;
-        // map the validated integrator choice onto the batch method enum (Hermite is
-        // rejected above; only DOP853 / DPRKN8 reach here). Needed by both the
-        // deviceOutput and the ordinary destination branches below.
+        // map the validated integrator choice onto the batch method enum (DOP853 /
+        // DPRKN8 are the only integrators). Needed by both the deviceOutput and the
+        // ordinary destination branches below.
         const int gpuMethod = params.method == orbit::OrbitIntParams::DPRKN8
             ? orbit::ORBIT_GPU_DPRKN8 : orbit::ORBIT_GPU_DOP853;
 

@@ -52,9 +52,7 @@ enum OrbitGPUResult {
 
 /** ODE integrator selectable on the batch path. Kept as a plain int on this
     boundary header (no dependency on orbit.h's OrbitIntParams::Method); the
-    Python binding maps the method string to one of these. Only the two
-    force-only schemes are exposed: Hermite needs the potential Hessian (jerk =
-    -d(grad)/dx . v) which the GPU force descriptor does not provide. */
+    Python binding maps the method string to one of these. */
 enum OrbitGPUMethod {
     ORBIT_GPU_DOP853 = 0,  ///< 8th-order Runge-Kutta (1st-order ODE, 6D state)
     ORBIT_GPU_DPRKN8 = 1   ///< 8th-order Runge-Kutta-Nystrom (2nd-order ODE)

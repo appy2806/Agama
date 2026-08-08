@@ -516,10 +516,14 @@ def test_error_cases(pot, ic, T, trajsize, cuda_available, all_ok):
             lambda: agama.orbit(potential=pot, ic=ic1, time=T1, trajsize=trajsize,
                                 device='cpu', Omega=1.0, verbose=False))
 
-    # method!='dop853' + device -> NotImplementedError.
-    _expect(NotImplementedError, "device + method='hermite'",
+    # method='hermite' was removed outright -- it must now fail with an actionable
+    # ValueError from the argument parser, on EVERY path, not just the device one.
+    _expect(ValueError, "method='hermite' (removed)",
             lambda: agama.orbit(potential=pot, ic=ic1, time=T1, trajsize=trajsize,
                                 device='cpu', method='hermite', verbose=False))
+    _expect(ValueError, "method='hermite' (removed, CPU path)",
+            lambda: agama.orbit(potential=pot, ic=ic1, time=T1, trajsize=trajsize,
+                                method='hermite', verbose=False))
 
     # dtype=object + device -> NotImplementedError.
     _expect(NotImplementedError, "device + dtype=object",

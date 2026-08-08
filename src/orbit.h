@@ -117,7 +117,6 @@ struct OrbitIntParams {
     enum Method {
         DOP853,
         DPRKN8,
-        HERMITE
     };
     double accuracy;     ///< accuracy parameter for the ODE integrator
     size_t maxNumSteps;  ///< upper limit on the number of steps of the ODE integrator
@@ -188,8 +187,6 @@ public:
                 stepper.reset(new math::OdeStepperDOP853 (*this, params.accuracy)); break;
             case OrbitIntParams::DPRKN8:
                 stepper.reset(new math::OdeStepperDPRKN8 (*this, params.accuracy)); break;
-            case OrbitIntParams::HERMITE:
-                stepper.reset(new math::OdeStepperHermite(*this, params.accuracy)); break;
         }
     }
 
@@ -257,7 +254,7 @@ public:
     /// optional output argument accFac will request tighter accuracy when |Epot| >> |Epot+Ekin|
     virtual void eval(const double t, const double x[], double dxdt[], double* accFac=NULL) const;
 
-    /// IOdeSystem2ndOrder interface: equations of motion for the Hermite and DPRKN8 integrators
+    /// IOdeSystem2ndOrder interface: equations of motion for the DPRKN8 integrator
     /// (implemented only in Cartesian coordinates)
     virtual void eval2(const double t, const double x[], double d2xdt2[], double d3xdt3[]=NULL,
         double* accFac=NULL) const;

@@ -103,24 +103,6 @@ class Check(object):
     def __bool__(self):     # Python 3
         return self.ok
 
-def testHermite(pot, ic, time_in_periods, accuracy):
-    check = Check()
-    inttime = pot.Tcirc(ic) * time_in_periods
-    t0 = time.time()
-    orb_dop = agama.orbit(potential=pot, ic=ic, time=inttime, trajsize=0, dtype=float, accuracy=accuracy, method='dop853')[1]
-    t1 = time.time()
-    orb_her = agama.orbit(potential=pot, ic=ic, time=inttime, trajsize=0, dtype=float, accuracy=accuracy, method='hermite')[1]
-    t2 = time.time()
-    E_dop = pot.potential(orb_dop[:,0:3]) + 0.5 * numpy.sum(orb_dop[:,3:6]**2, axis=1)
-    E_her = pot.potential(orb_her[:,0:3]) + 0.5 * numpy.sum(orb_her[:,3:6]**2, axis=1)
-    errE_dop = max(abs(E_dop/E_dop[0]-1))
-    errE_her = max(abs(E_her/E_her[0]-1))
-    print("Orbit integration with dop853,  accuracy %g: %6i steps, time=%.3f s, energy error=%s" %
-        (accuracy, len(orb_dop), t1-t0, check(errE_dop, accuracy**0.5)))
-    print("Orbit integration with hermite, accuracy %g: %6i steps, time=%.3f s, energy error=%s" %
-        (accuracy, len(orb_her), t2-t1, check(errE_her, accuracy**0.5)))
-    return bool(check)
-
 def testAccuracy(pot, ic, time_in_periods, accuracy, Omega=0, ax=None):
     check = Check()
     time = pot.Tcirc(ic) * time_in_periods
@@ -322,8 +304,6 @@ if __name__ == '__main__':
     ok &= testAccuracy(pot, ic, -100, 1e-8,  50., ax[0])  # default accuracy
     ok &= testAccuracy(pot, ic, -100, 1e-10, 50., ax[1])  # higher  accuracy
     ok &= testDerivatives(pot, ic, 100, 1e-8, 50., ax[2])
-    ok &= testHermite(pot, ic, 1000, 1e-4)
-    ok &= testHermite(pot, ic, 1000, 1e-6)
     if plot:
         print('The numerically computed orbit accumulates energy error (green curve) and '
               'gradually deviates from the true orbit due to phase drift(blue curve).\n'

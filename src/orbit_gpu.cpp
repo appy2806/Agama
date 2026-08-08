@@ -94,15 +94,16 @@ struct GpuDescForce {
       OdeRhs2 path) is handed a buffer whose positions are immediately followed
       in memory by the step's velocities, so x[3..5] are the velocities used
       for Ekin -- see dprkn8_step's contiguous xn|vn scratch layout.
-    d3xdt3 (jerk) is never requested here: it needs the potential Hessian, which
-    the force descriptor does not carry, and only the Hermite scheme uses it. */
+    d3xdt3 (jerk) is never requested by any integrator; it would need the Hessian,
+    which the force descriptor does not carry. The parameter survives only because it
+    is part of the shared Force2 concept (math_ode.h). */
 template<typename T, int ORDER>
 struct GpuDescForce2 {
     const potential::GpuPotDesc<T>* desc;
     double timeBegin;   ///< absolute time at the start of the current step
 
     AGAMA_DEVICE_INLINE void operator()(T t, const T x[], T d2xdt2[],
-        T* /*d3xdt3 (unused: Hermite-only)*/, T* accFac) const
+        T* /*d3xdt3 (never requested; see the Force2 concept note above)*/, T* accFac) const
     {
         T Epot, acc[3];
         potential::gpu_desc_phi_acc_ord<T, ORDER>(*desc, x[0], x[1], x[2],
