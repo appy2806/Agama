@@ -1276,144 +1276,57 @@ void CylSpline::evalCyl(const coord::PosCyl &pos,
         asymptOuter->eval(pos, val, der, der2);
         return;
     }
-    double dRscaleddR   = 1 / sqrt(pow_2(pos.R) + pow_2(Rscale));
-    double dzscaleddz   = 1 / sqrt(pow_2(pos.z) + pow_2(Rscale));
-    double d2RscaleddR2 = -pos.R * pow_3(dRscaleddR);
-    double d2zscaleddz2 = -pos.z * pow_3(dzscaleddz);
 
     // only compute those quantities that will be needed in output
     const bool needPhi  = true;
     const bool needGrad = der !=NULL || der2!=NULL;
     const bool needHess = der2!=NULL;
 
+    // Everything below the spline lookups lives in cylsplineEvalInGrid(), as ONE unit --
+    // see the note in potential_cylspline.h. This function keeps only what cannot be
+    // device code: the bounds test above and the virtual/container spline lookups here.
+    int nslot = 2*mmax+1;
+    double* m0   = static_cast<double*>(alloca(CYLSPL_NHARM * sizeof(double)));
+    double* harm = static_cast<double*>(alloca(nslot * CYLSPL_NHARM * sizeof(double)));
+    // scratch for trigMultiAngle: 2*mmax unconditionally, see cylsplineEvalInGrid's note
+    double* trig_arr = mmax>0 ?
+        static_cast<double*>(alloca(2*mmax * sizeof(double))) : NULL;
+    unsigned int* present = static_cast<unsigned int*>(
+        alloca(((nslot+31)/32) * sizeof(unsigned int)));
+    for(int w=0; w<(nslot+31)/32; w++)
+        present[w] = 0;
+
     // value and derivatives (in scaled coords) of the m=0 term, which are later used
     // to scale the other terms after we have performed the Fourier transform on all of them
-    double Phi0, dPhi0dR, dPhi0dz, d2Phi0dR2, d2Phi0dRdz, d2Phi0dz2;
     spl[mmax]->evalDeriv(Rscaled, zscaled,
-        needPhi  ?   &Phi0     : NULL,
-        needGrad ?  &dPhi0dR   : NULL,
-        needGrad ?  &dPhi0dz   : NULL,
-        needHess ? &d2Phi0dR2  : NULL,
-        needHess ? &d2Phi0dRdz : NULL,
-        needHess ? &d2Phi0dz2  : NULL);
-    if(logScaling) {
-        Phi0 = -exp(Phi0);
-        if(needHess) {
-            d2Phi0dR2  = Phi0 * (d2Phi0dR2  + pow_2(dPhi0dR));
-            d2Phi0dRdz = Phi0 * (d2Phi0dRdz + dPhi0dR * dPhi0dz);
-            d2Phi0dz2  = Phi0 * (d2Phi0dz2  + pow_2(dPhi0dz));
-        }
-        if(needGrad) {
-            dPhi0dR *= Phi0;
-            dPhi0dz *= Phi0;
+        needPhi  ? &m0[CYLSPL_PHI]  : NULL,
+        needGrad ? &m0[CYLSPL_DR]   : NULL,
+        needGrad ? &m0[CYLSPL_DZ]   : NULL,
+        needHess ? &m0[CYLSPL_DR2]  : NULL,
+        needHess ? &m0[CYLSPL_DRDZ] : NULL,
+        needHess ? &m0[CYLSPL_DZ2]  : NULL);
+
+    if(mmax>0) {
+        bool needSine = needGrad || !isYReflSymmetric(sym);
+        math::trigMultiAngle(pos.phi, mmax, needSine, trig_arr);
+        for(int mm=0; mm<=2*mmax; mm++) {
+            if(!spl[mm] || mm-mmax==0)  // empty harmonic or the already computed m=0 one
+                continue;
+            present[mm>>5] |= 1u << (mm&31);
+            double* h = harm + mm*CYLSPL_NHARM;
+            spl[mm]->evalDeriv(Rscaled, zscaled,
+                needPhi  ? &h[CYLSPL_PHI]  : NULL,
+                needGrad ? &h[CYLSPL_DR]   : NULL,
+                needGrad ? &h[CYLSPL_DZ]   : NULL,
+                needHess ? &h[CYLSPL_DR2]  : NULL,
+                needHess ? &h[CYLSPL_DRDZ] : NULL,
+                needHess ? &h[CYLSPL_DZ2]  : NULL);
         }
     }
 
-    // if the potential is axisymmetric, skip the Fourier transform and amplitude scaling
-    if(mmax==0) {
-        if(val)
-            *val = Phi0;
-        if(der) {
-            der->dR   = dPhi0dR * dRscaleddR;
-            der->dz   = dPhi0dz * dzscaleddz;
-            der->dphi = 0;
-        }
-        if(der2) {
-            der2->dR2 = d2Phi0dR2 * pow_2(dRscaleddR) + dPhi0dR * d2RscaleddR2;
-            der2->dz2 = d2Phi0dz2 * pow_2(dzscaleddz) + dPhi0dz * d2zscaleddz2;
-            der2->dRdz= d2Phi0dRdz * dRscaleddR * dzscaleddz;
-            der2->dRdphi = der2->dzdphi = der2->dphi2 = 0;
-        }
-        return;
-    }
-
-    // total scaled potential, gradient and hessian in scaled coordinates:
-    // if using log-scaling, the values of m!=0 coefs are multiplied by the value of the m=0 term,
-    // which we do at the very end, so initialize the sum with the value of the m=0 term
-    // scaled by itself, i.e. unity; otherwise we simply sum up all m terms without any scaling
-    double Phi = logScaling ? 1 : Phi0;
-    coord::GradCyl grad;
-    coord::HessCyl hess;
-    grad.dR  = grad.dz  = grad.dphi  = 0;
-    hess.dR2 = hess.dz2 = hess.dphi2 = hess.dRdz = hess.dRdphi = hess.dzdphi = 0;
-
-    bool needSine = needGrad || !isYReflSymmetric(sym);
-    double* trig_arr = static_cast<double*>(alloca(mmax*(1+needSine) * sizeof(double)));
-    math::trigMultiAngle(pos.phi, mmax, needSine, trig_arr);
-
-    // loop over other (m!=0) azimuthal harmonics and compute the temporary (scaled) values
-    for(int mm=0; mm<=2*mmax; mm++) {
-        int m = mm-mmax;
-        if(!spl[mm] || m==0)  // empty harmonic or the already computed m=0 one
-            continue;
-        // scaled value, gradient and hessian of m-th harmonic in scaled coordinates
-        double Phi_m;
-        coord::GradCyl dPhi_m;
-        coord::HessCyl d2Phi_m;
-        spl[mm]->evalDeriv(Rscaled, zscaled,
-            needPhi  ?   &Phi_m      : NULL,
-            needGrad ?  &dPhi_m.dR   : NULL,
-            needGrad ?  &dPhi_m.dz   : NULL,
-            needHess ? &d2Phi_m.dR2  : NULL,
-            needHess ? &d2Phi_m.dRdz : NULL,
-            needHess ? &d2Phi_m.dz2  : NULL);
-        double trig  = m>0 ? trig_arr[m-1] : trig_arr[mmax-1-m];  // cos or sin
-        double dtrig = m>0 ? -m*trig_arr[mmax+m-1] : -m*trig_arr[-m-1];
-        double d2trig = -m*m*trig;
-        Phi += Phi_m * trig;
-        if(needGrad) {
-            grad.dR   += dPhi_m.dR *  trig;
-            grad.dz   += dPhi_m.dz *  trig;
-            grad.dphi +=  Phi_m    * dtrig;
-        }
-        if(needHess) {
-            hess.dR2    += d2Phi_m.dR2  *   trig;
-            hess.dz2    += d2Phi_m.dz2  *   trig;
-            hess.dRdz   += d2Phi_m.dRdz *   trig;
-            hess.dRdphi +=  dPhi_m.dR   *  dtrig;
-            hess.dzdphi +=  dPhi_m.dz   *  dtrig;
-            hess.dphi2  +=   Phi_m      * d2trig;
-        }
-    }
-
-    if(logScaling) {
-        // unscale both amplitude of all quantities and their coordinate derivatives
-        if(val)
-            *val = Phi0 * Phi;
-        if(der) {
-            der->dR   = (Phi0 * grad.dR + dPhi0dR * Phi) * dRscaleddR;
-            der->dz   = (Phi0 * grad.dz + dPhi0dz * Phi) * dzscaleddz;
-            der->dphi =  Phi0 * grad.dphi;
-        }
-        if(der2) {
-            der2->dR2 = (Phi0 * hess.dR2 + 2 * dPhi0dR * grad.dR + d2Phi0dR2 * Phi) *
-                pow_2(dRscaleddR)  +  (Phi0 * grad.dR + dPhi0dR * Phi) * d2RscaleddR2;
-            der2->dz2 = (Phi0 * hess.dz2 + 2 * dPhi0dz * grad.dz + d2Phi0dz2 * Phi) *
-                pow_2(dzscaleddz)  +  (Phi0 * grad.dz + dPhi0dz * Phi) * d2zscaleddz2;
-            der2->dRdz = (Phi0 * hess.dRdz + dPhi0dR * grad.dz + dPhi0dz * grad.dR + d2Phi0dRdz * Phi) *
-                dRscaleddR * dzscaleddz;
-            der2->dRdphi = (Phi0 * hess.dRdphi + dPhi0dR * grad.dphi) * dRscaleddR;
-            der2->dzdphi = (Phi0 * hess.dzdphi + dPhi0dz * grad.dphi) * dzscaleddz;
-            der2->dphi2  =  Phi0 * hess.dphi2;
-        }
-    } else {
-        // unscale just the derivatives according to the coordinate transformation
-        if(val)
-            *val = Phi;
-        if(der) {
-            der->dR   = (grad.dR + dPhi0dR) * dRscaleddR;
-            der->dz   = (grad.dz + dPhi0dz) * dzscaleddz;
-            der->dphi = grad.dphi;
-        }
-        if(der2) {
-            der2->dR2 = (hess.dR2 + d2Phi0dR2) * pow_2(dRscaleddR) + (grad.dR + dPhi0dR) * d2RscaleddR2;
-            der2->dz2 = (hess.dz2 + d2Phi0dz2) * pow_2(dzscaleddz) + (grad.dz + dPhi0dz) * d2zscaleddz2;
-            der2->dRdz = (hess.dRdz + d2Phi0dRdz) * dRscaleddR * dzscaleddz;
-            der2->dRdphi = hess.dRdphi * dRscaleddR;
-            der2->dzdphi = hess.dzdphi * dzscaleddz;
-            der2->dphi2  = hess.dphi2;
-        }
-    }
+    cylsplineEvalInGrid(pos.R, pos.z, Rscale, mmax, logScaling,
+        present, m0, harm, trig_arr,
+        val, der, der2);
 }
 
 void CylSpline::getGridExtent(double &Rmin, double &Rmax, double &zmin, double &zmax) const

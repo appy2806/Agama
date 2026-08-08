@@ -28,10 +28,247 @@
 #pragma once
 #include "potential_base.h"
 #include "particles_base.h"
+#include "math_base.h"     // pow_2 / pow_3, and AGAMA_DEVICE_INLINE via gpu_device.h
 #include "math_linalg.h"
 #include "smart.h"
+#include <cmath>
 
 namespace potential {
+
+/** \name  Device-callable leaf math for CylSpline evaluation
+    \{
+    The arithmetic half of CylSpline::evalCyl(), extracted so that the CPU virtual method
+    and (later) the GPU device path call ONE transcription of the formulas -- CLAUDE.md
+    constraint 5, refereed by crosscheck_expansions.py.
+
+    THE SHAPE IS DICTATED BY potential_multipole.h:71-83 -- relocate a COMPLETE unit,
+    never split one -- so ONE leaf holds the whole chain from the Jacobian to the final
+    store, grad/hess never leave its frame, and the caller supplies the per-harmonic
+    spline results through scratch (convention (1) there).
+
+    MEASURED CAVEAT, and it is a real deviation from this project's usual standard: this
+    extraction does NOT reach bit-for-bit parity on the CPU path. crosscheck_expansions.py's
+    fork-to-fork arm moves from 0.000e+00 to 2.715e-16 -- CylSpline density on every model,
+    plus force on the triaxial one, at ~1 ULP (worst absolute 1.1e-13 on a density of order
+    1e+2). The fork-vs-production arm is unchanged at 1.113e-07.
+
+    It is FMA re-association, confirmed in the assembly: same 27 fused multiply-adds before
+    and after, with one vmulsd+vfmadd231sd becoming a vfmadd213sd. It is not fixable by
+    arranging the leaves differently -- three structures were built and measured (six small
+    leaves; leaves templated on the output struct so the host writes its coord:: structs
+    directly; and this single complete unit) and all three give the SAME differing arrays at
+    the SAME magnitudes. Forcing inlining does not change it either.
+
+    The reason it is unavoidable here, and the reason Multipole's equivalent moves WERE
+    exact: Multipole's leaves were relocations of helpers that were already separate
+    functions in potential_multipole.cpp, so the frame boundary existed before the move and
+    the move preserved it. CylSpline::evalCyl is monolithic -- there is no internal boundary
+    to preserve -- so any extraction at all introduces one, and gcc then contracts one
+    hessian expression differently. The alternative is two transcriptions of the formulas,
+    which CLAUDE.md constraint 5 forbids outright.
+
+    What stays with the caller is exactly what cannot be device code: the asinh bounds
+    test and the container/virtual spline lookups.
+
+    Precision note: these leaves carry no fp64 residue -- the in-grid arithmetic touches
+    no coord:: conversion machinery, only plain scalars. The surrounding path still does,
+    twice over, and both must be dealt with before T=float is meaningful for CylSpline:
+    the 2d interpolator lookups are fp64 (math::Interpolator2d), and the OUT-OF-GRID
+    branch delegates to PowerLawMultipole, whose sphToCylDerivs is fp64 by construction
+    (potential_multipole.h:271-273). The raw templated 2d evaluators needed to fix the
+    first are already in place -- evalCubicSpline2dRaw (math_spline.h:341) and
+    evalQuinticSpline2dRaw (math_spline.h:488), cubic and quintic respectively, since
+    CylSpline picks between them by the object-wide `haveDerivs` flag.
+*/
+
+/// grad of a scalar field in cylindrical coordinates, templated on the value type.
+/// Member ORDER deliberately matches coord::GradCyl so the two are interchangeable.
+template<typename T> struct CylSplineGrad { T dR, dz, dphi; };
+
+/// hessian of a scalar field in cylindrical coordinates, templated on the value type.
+/// Member ORDER deliberately matches coord::HessCyl (dRdz, dzdphi, dRdphi -- note the
+/// last two, which are easy to transpose) so the two are interchangeable.
+template<typename T> struct CylSplineHess { T dR2, dz2, dphi2, dRdz, dzdphi, dRdphi; };
+
+/// component order of the per-harmonic scratch handed to cylsplineEvalInGrid(): for each
+/// of the 2*mmax+1 slots, six consecutive entries in this order. Call sites index
+/// positionally -- do not reorder.
+enum CylSplineHarmIndex {
+    CYLSPL_PHI = 0, CYLSPL_DR = 1, CYLSPL_DZ = 2,
+    CYLSPL_DR2 = 3, CYLSPL_DRDZ = 4, CYLSPL_DZ2 = 5,
+    CYLSPL_NHARM = 6
+};
+
+/** The whole in-grid evaluation, from the coordinate Jacobian to the final store.
+
+    This is one unit on purpose; see the note above. It reproduces everything
+    CylSpline::evalCyl does after its spline lookups: the asinh Jacobian, the optional
+    log-scaling un-transform of the m=0 term, the axisymmetric short-circuit, the
+    azimuthal Fourier synthesis, and the final un-scaling -- with the expressions
+    character-identical to upstream and in upstream's order.
+
+    \param[in]  R, z, Rscale  are the unscaled position and the scaling radius;
+    \param[in]  mmax          is (spl.size()-1)/2, the achieved azimuthal order;
+    \param[in]  logScaling    selects the m=0 log un-transform and the fused final block;
+    \param[in]  phi           is the azimuthal angle;
+    \param[in]  present       is a bitmask over slots mm=0..2*mmax: bit set iff that
+                harmonic has a spline. Slot mmax (m=0) is handled separately and its bit
+                is ignored. A mask rather than zero-filling, so that an absent harmonic
+                contributes nothing at all -- zero-filling would still add +-0 into
+                grad.dphi and can flip the sign of a zero result;
+    \param[in]  m0            holds the SIX m=0 quantities in CylSplineHarmIndex order,
+                straight from the spline, BEFORE any log un-scaling (this leaf does it);
+    \param[in]  harm          holds CYLSPL_NHARM entries per slot, slot mm at
+                harm[mm*CYLSPL_NHARM + ...], again straight from the spline;
+    \param[in]  trig          holds trigMultiAngle's output for this phi: cos(m phi) at
+                [m-1] for m=1..mmax, then sin(m phi) at [mmax+m-1]. Caller-provided
+                scratch of 2*mmax entries (see below); may be NULL when mmax==0;
+    \param[out] val, der, der2  may each be NULL; GradT/HessT are coord::GradCyl and
+                coord::HessCyl on the host, CylSplineGrad<T>/CylSplineHess<T> on device.
+
+    SCRATCH SIZE -- 2*mmax, unconditionally, NOT mmax*(1+needSine). The dtrig expression
+    below is evaluated without a needGrad guard (upstream does the same) and for m>0 it
+    indexes trig[mmax+m-1], i.e. up to 2*mmax-1. Upstream's narrower alloca was therefore
+    read past its end on any value-only query of a y-reflection-symmetric model -- the
+    ordinary `potential(x,y,z)` call on a bar. The value is discarded when needGrad is
+    false, so nothing computed ever changed; only the out-of-bounds access is removed.
+    (trigMultiAngle still leaves the upper half uninitialised when needSine is false, so
+    that discarded read is of an indeterminate value -- in bounds, but not yet clean.) */
+template<typename T, typename GradT, typename HessT>
+AGAMA_DEVICE_INLINE void cylsplineEvalInGrid(
+    const T R, const T z, const T Rscale, const int mmax, const bool logScaling,
+    const unsigned int* present,
+    const T* m0, const T* harm, const T* trig,
+    T* val, GradT* der, HessT* der2)
+{
+    const bool needGrad = der !=NULL || der2!=NULL;
+    const bool needHess = der2!=NULL;
+
+    T dRscaleddR   = T(1) / std::sqrt(pow_2(R) + pow_2(Rscale));
+    T dzscaleddz   = T(1) / std::sqrt(pow_2(z) + pow_2(Rscale));
+    T d2RscaleddR2 = -R * pow_3(dRscaleddR);
+    T d2zscaleddz2 = -z * pow_3(dzscaleddz);
+
+    // Read only what the caller actually filled. evalDeriv is passed NULL for the slots
+    // that are not needed, so the rest are indeterminate; upstream never read them
+    // because every use sat inside the same if(der)/if(der2) guards. Reading them
+    // unconditionally -- e.g. into by-value parameters -- would be UB on the commonest
+    // call of all, a value-only potential(x,y,z).
+    T Phi0       = m0[CYLSPL_PHI];
+    T dPhi0dR    = needGrad ? m0[CYLSPL_DR]   : T(0);
+    T dPhi0dz    = needGrad ? m0[CYLSPL_DZ]   : T(0);
+    T d2Phi0dR2  = needHess ? m0[CYLSPL_DR2]  : T(0);
+    T d2Phi0dRdz = needHess ? m0[CYLSPL_DRDZ] : T(0);
+    T d2Phi0dz2  = needHess ? m0[CYLSPL_DZ2]  : T(0);
+
+    if(logScaling) {
+        Phi0 = -std::exp(Phi0);
+        if(needHess) {
+            d2Phi0dR2  = Phi0 * (d2Phi0dR2  + pow_2(dPhi0dR));
+            d2Phi0dRdz = Phi0 * (d2Phi0dRdz + dPhi0dR * dPhi0dz);
+            d2Phi0dz2  = Phi0 * (d2Phi0dz2  + pow_2(dPhi0dz));
+        }
+        if(needGrad) {
+            dPhi0dR *= Phi0;
+            dPhi0dz *= Phi0;
+        }
+    }
+
+    // if the potential is axisymmetric, skip the Fourier transform and amplitude scaling
+    if(mmax==0) {
+        if(val)
+            *val = Phi0;
+        if(der) {
+            der->dR   = dPhi0dR * dRscaleddR;
+            der->dz   = dPhi0dz * dzscaleddz;
+            der->dphi = 0;
+        }
+        if(der2) {
+            der2->dR2 = d2Phi0dR2 * pow_2(dRscaleddR) + dPhi0dR * d2RscaleddR2;
+            der2->dz2 = d2Phi0dz2 * pow_2(dzscaleddz) + dPhi0dz * d2zscaleddz2;
+            der2->dRdz= d2Phi0dRdz * dRscaleddR * dzscaleddz;
+            der2->dRdphi = der2->dzdphi = der2->dphi2 = 0;
+        }
+        return;
+    }
+
+    // total scaled potential, gradient and hessian in scaled coordinates:
+    // if using log-scaling, the values of m!=0 coefs are multiplied by the value of the
+    // m=0 term, which we do at the very end, so initialize the sum with the value of the
+    // m=0 term scaled by itself, i.e. unity; otherwise sum all m terms without scaling
+    T Phi = logScaling ? 1 : Phi0;
+    GradT grad;
+    HessT hess;
+    grad.dR  = grad.dz  = grad.dphi  = 0;
+    hess.dR2 = hess.dz2 = hess.dphi2 = hess.dRdz = hess.dRdphi = hess.dzdphi = 0;
+
+    // loop over other (m!=0) azimuthal harmonics and compute the temporary (scaled) values
+    for(int mm=0; mm<=2*mmax; mm++) {
+        int m = mm-mmax;
+        if(!((present[mm>>5] >> (mm&31)) & 1u) || m==0)  // empty harmonic or the m=0 one
+            continue;
+        const T* h = harm + mm*CYLSPL_NHARM;
+        T Phi_m = h[CYLSPL_PHI];
+        T trigv = m>0 ? trig[m-1] : trig[mmax-1-m];  // cos or sin
+        T dtrig = m>0 ? -m*trig[mmax+m-1] : -m*trig[-m-1];
+        T d2trig = -m*m*trigv;
+        Phi += Phi_m * trigv;
+        if(needGrad) {
+            grad.dR   += h[CYLSPL_DR] *  trigv;
+            grad.dz   += h[CYLSPL_DZ] *  trigv;
+            grad.dphi +=  Phi_m       * dtrig;
+        }
+        if(needHess) {
+            hess.dR2    += h[CYLSPL_DR2]  *   trigv;
+            hess.dz2    += h[CYLSPL_DZ2]  *   trigv;
+            hess.dRdz   += h[CYLSPL_DRDZ] *   trigv;
+            hess.dRdphi += h[CYLSPL_DR]   *  dtrig;
+            hess.dzdphi += h[CYLSPL_DZ]   *  dtrig;
+            hess.dphi2  +=  Phi_m         * d2trig;
+        }
+    }
+
+    if(logScaling) {
+        // unscale both amplitude of all quantities and their coordinate derivatives
+        if(val)
+            *val = Phi0 * Phi;
+        if(der) {
+            der->dR   = (Phi0 * grad.dR + dPhi0dR * Phi) * dRscaleddR;
+            der->dz   = (Phi0 * grad.dz + dPhi0dz * Phi) * dzscaleddz;
+            der->dphi =  Phi0 * grad.dphi;
+        }
+        if(der2) {
+            der2->dR2 = (Phi0 * hess.dR2 + 2 * dPhi0dR * grad.dR + d2Phi0dR2 * Phi) *
+                pow_2(dRscaleddR)  +  (Phi0 * grad.dR + dPhi0dR * Phi) * d2RscaleddR2;
+            der2->dz2 = (Phi0 * hess.dz2 + 2 * dPhi0dz * grad.dz + d2Phi0dz2 * Phi) *
+                pow_2(dzscaleddz)  +  (Phi0 * grad.dz + dPhi0dz * Phi) * d2zscaleddz2;
+            der2->dRdz = (Phi0 * hess.dRdz + dPhi0dR * grad.dz + dPhi0dz * grad.dR + d2Phi0dRdz * Phi) *
+                dRscaleddR * dzscaleddz;
+            der2->dRdphi = (Phi0 * hess.dRdphi + dPhi0dR * grad.dphi) * dRscaleddR;
+            der2->dzdphi = (Phi0 * hess.dzdphi + dPhi0dz * grad.dphi) * dzscaleddz;
+            der2->dphi2  =  Phi0 * hess.dphi2;
+        }
+    } else {
+        // unscale just the derivatives according to the coordinate transformation
+        if(val)
+            *val = Phi;
+        if(der) {
+            der->dR   = (grad.dR + dPhi0dR) * dRscaleddR;
+            der->dz   = (grad.dz + dPhi0dz) * dzscaleddz;
+            der->dphi = grad.dphi;
+        }
+        if(der2) {
+            der2->dR2 = (hess.dR2 + d2Phi0dR2) * pow_2(dRscaleddR) + (grad.dR + dPhi0dR) * d2RscaleddR2;
+            der2->dz2 = (hess.dz2 + d2Phi0dz2) * pow_2(dzscaleddz) + (grad.dz + dPhi0dz) * d2zscaleddz2;
+            der2->dRdz = (hess.dRdz + d2Phi0dRdz) * dRscaleddR * dzscaleddz;
+            der2->dRdphi = hess.dRdphi * dRscaleddR;
+            der2->dzdphi = hess.dzdphi * dzscaleddz;
+            der2->dphi2  = hess.dphi2;
+        }
+    }
+}
+
+/// \}
 
 /** Density profile expressed as a Fourier expansion in azimuthal angle (phi)
     with coefficients interpolated on a 2d grid in meridional plane (R,z).
